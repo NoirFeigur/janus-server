@@ -1,0 +1,79 @@
+# ───────────────────────── Python ─────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ───────────────────────── 虚拟环境 ─────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ───────────────────────── 依赖锁 / 包管理 ─────────────────────────
+# uv.lock 必须提交（锁版本+哈希，供应链安全）——不要忽略
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ───────────────────────── 密钥与配置（仅密钥，绝不入库）─────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ───────────────────────── 测试 / 覆盖率 ─────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ───────────────────────── 类型检查 / lint 缓存 ─────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pyre/
+.pytype/
+
+# ───────────────────────── 数据库 / 运行时产物 ─────────────────────────
+*.db
+*.sqlite3
+*.log
+logs/
+
+# ───────────────────────── IDE / 编辑器 ─────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ───────────────────────── 操作系统 ─────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
