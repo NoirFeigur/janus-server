@@ -1,5 +1,18 @@
+"""异常体系与全局拦截器。
+
+所有管理面错误响应统一走 :func:`error_envelope`,与成功响应(:mod:`src.responses`)
+**同构**——都携带 ``code`` 与 ``trace_id``,遵循 i18n 纯 code 路线(不发 message)。
+
+四个拦截器(覆盖全部错误来源):
+- :class:`AppError`            —— 应用级异常,显式抛出,带 ErrorCode + HTTP 状态码。
+- ``RequestValidationError``   —— 入参校验失败(FastAPI),附 ``errors`` 字段明细。
+- ``StarletteHTTPException``   —— 框架 HTTP 异常(404/405 等),按状态码映射 code。
+- ``Exception``                —— 兜底,防未捕获异常泄漏堆栈(仅 debug 附 detail)。
+"""
+
+from __future__ import annotations
+
 from collections.abc import Mapping
-from http import HTTPStatus
 from typing import Any
 from uuid import uuid4
 
@@ -7,63 +20,67 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette import status
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from src.config import get_settings
 from src.enums import ErrorCode
+from src.responses import error_body
+
+# HTTP 状态码 → ErrorCode 映射(框架 HTTP 异常用,无精确匹配时回落)。
+_STATUS_TO_CODE: dict[int, ErrorCode] = {
+    status.HTTP_401_UNAUTHORIZED: ErrorCode.auth_invalid_token,  # 缺失/无效凭据。
+    status.HTTP_403_FORBIDDEN: ErrorCode.auth_forbidden,  # 已认证但无权限。
+    status.HTTP_404_NOT_FOUND: ErrorCode.request_invalid,  # 路由/资源不存在。
+    status.HTTP_405_METHOD_NOT_ALLOWED: ErrorCode.request_invalid,  # 方法不允许。
+}
 
 
-class JanusError(Exception):
+class AppError(Exception):
+    """应用级异常:由 service/router 显式抛出,携带机器可读 code 与 HTTP 状态码。"""
+
     def __init__(
         self,
         code: ErrorCode,
         status_code: int = status.HTTP_400_BAD_REQUEST,
         params: Mapping[str, Any] | None = None,
-        detail: str | None = None,
     ) -> None:
         self.code = code
         self.status_code = status_code
         self.params = dict(params or {})
-        self.detail = detail or code.value
-        super().__init__(self.detail)
+        super().__init__(code.value)
 
 
-def problem_response(
+def _trace_id(request: Request) -> str:
+    """取 TraceIdMiddleware 注入的 trace_id;缺失则即兴生成(防御性)。"""
+    return getattr(request.state, "trace_id", str(uuid4()))
+
+
+def error_envelope(
     request: Request,
     *,
     code: ErrorCode,
     status_code: int,
-    detail: str,
     params: Mapping[str, Any] | None = None,
     errors: list[dict[str, Any]] | None = None,
 ) -> JSONResponse:
-    trace_id = getattr(request.state, "trace_id", str(uuid4()))
-    phrase = HTTPStatus(status_code).phrase
-    body: dict[str, Any] = {
-        "type": f"urn:janus:error:{code.value}",
-        "title": phrase,
-        "status": status_code,
-        "code": code.value,
-        "detail": detail,
-        "params": dict(params or {}),
-        "trace_id": trace_id,
-    }
-    if errors is not None:
-        body["errors"] = errors
-    return JSONResponse(
-        status_code=status_code,
-        content=body,
-        media_type="application/problem+json",
+    """构造统一错误信封响应(与成功响应同构)。"""
+    body = error_body(
+        code=code,
+        trace_id=_trace_id(request),
+        params=dict(params or {}),
+        errors=errors,
     )
+    return JSONResponse(status_code=status_code, content=body)
 
 
-async def janus_error_handler(request: Request, exc: Exception) -> JSONResponse:
+async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
     # Starlette types the handler's second arg as ``Exception``; narrow to the
-    # registered type (the dispatcher only routes JanusError here).
-    assert isinstance(exc, JanusError)
-    return problem_response(
+    # registered type (the dispatcher only routes AppError here).
+    assert isinstance(exc, AppError)
+    return error_envelope(
         request,
         code=exc.code,
         status_code=exc.status_code,
-        detail=exc.detail,
         params=exc.params,
     )
 
@@ -78,15 +95,38 @@ async def validation_error_handler(request: Request, exc: Exception) -> JSONResp
         }
         for error in exc.errors()
     ]
-    return problem_response(
+    return error_envelope(
         request,
         code=ErrorCode.request_invalid,
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail="Request validation failed",
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         errors=errors,
     )
 
 
+async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """接管框架 HTTP 异常(404/405/401/403 等),统一走信封。"""
+    assert isinstance(exc, StarletteHTTPException)
+    code = _STATUS_TO_CODE.get(exc.status_code, ErrorCode.request_invalid)
+    if exc.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+        code = ErrorCode.internal_error
+    return error_envelope(request, code=code, status_code=exc.status_code)
+
+
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """兜底:任何未捕获异常 → 500 信封。绝不泄漏堆栈(仅 debug 附 detail 供排查)。"""
+    params: dict[str, Any] = {}
+    if get_settings().debug:
+        params["detail"] = f"{type(exc).__name__}: {exc}"
+    return error_envelope(
+        request,
+        code=ErrorCode.internal_error,
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        params=params,
+    )
+
+
 def register_exception_handlers(app: FastAPI) -> None:
-    app.add_exception_handler(JanusError, janus_error_handler)
+    app.add_exception_handler(AppError, app_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)

@@ -35,6 +35,8 @@ def create_app() -> FastAPI:
     app.include_router(admin_router, prefix=settings.api_prefix)
     app.include_router(gateway_router, prefix=settings.api_prefix)
 
+    # health 探针走裸格式,不套统一信封——它服务于 k8s/LB 存活探测,约定是
+    # 极简 {"status":"ok"},不属于管理面业务 API,无 i18n / trace 语义需求。
     @app.get("/health/live", tags=["health"])
     async def liveness() -> dict[str, str]:
         return {"status": "ok"}
