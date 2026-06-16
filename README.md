@@ -304,17 +304,31 @@ janus-server/
 - **不写「快照型」测试**（如断言模型目录里有某个具体模型名、断言枚举成员数、断言 config 版本号字面量）——这类测试只在数据例行更新时炸 CI，零行为价值。
 - **断言关系契约**：如「每个 deployment 都能在 Router 里找到」「downgraded_features 非空 ⟺ 响应头带 X-Gateway-Downgraded」「usage_record.cost = tokens × 单价 / 1e6」。
 
-### 门禁
+### 门禁（硬约束）
 
-- 提 PR 前本地必过：`uv run pytest`、`uv run ruff check`、`uv run mypy src`。
-- 覆盖率参考线 **≥ 80%**（service 层应更高）；新增功能/修 bug **必带测试**（先写复现失败的测试，再修）。
-- 禁止删失败测试「让 CI 绿」；禁止硬编码值 / 特判逻辑骗过测试。
+> **必须通过单元测试。** `uv run pytest` 全绿是合并/收工的**前置条件**，不是可选项。
+> 测试红、或新增代码无测试覆盖，一律视为**功能未完成**——不允许「先合后补」。
+
+提 PR 前（以及任何「这块做完了」的判定前）本地三道门**全部必过**：
+
+| 门 | 命令 | 通过标准 |
+|---|---|---|
+| 单元测试 | `uv run pytest` | 全部通过，**0 失败 0 错误**；不得以 `-k`/skip 跳过失败用例 |
+| Lint / 格式 | `uv run ruff check` | 0 告警 |
+| 类型检查 | `uv run mypy src` | 0 error |
+
+规则：
+
+- **新增功能 / 修 bug 必带测试**：先写「能复现问题、当前会失败」的测试，再写让它通过的代码（红 → 绿）。
+- **测试通过必须是「代码正确」的副产物**：禁止硬编码期望值、禁止为骗过断言加特判分支、禁止删/skip 失败测试「让 CI 绿」。
+- **绝不碰共享 PG/Redis 实例**：单测用内存 SQLite（`aiosqlite`）/ `fakeredis` / 临时库；测试间状态零泄漏。
+- **Windows 无 `bash` 脚本**：直接用下方 `uv run ...` 命令（仓库不提供 `run_tests.sh`，跨平台统一走 `uv run`）。
 
 ```bash
-uv run pytest                          # 全量
-uv run pytest tests/gateway/ -q        # 单目录
-uv run pytest tests/gateway/test_service.py::test_quota_exceeded_returns_429
-uv run pytest --cov=src --cov-report=term-missing
+uv run pytest                          # 全量（合并前必过）
+uv run pytest tests/db/ -q             # 单目录
+uv run pytest tests/db/test_repository.py::test_soft_delete_excluded_from_get
+uv run pytest --cov=src --cov-report=term-missing   # 覆盖率（参考线 ≥ 80%，service 层应更高）
 ```
 
 ---
