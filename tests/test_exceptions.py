@@ -54,6 +54,7 @@ def test_app_error_returns_envelope(client: TestClient) -> None:
     resp = client.get("/boom")
     assert resp.status_code == 409
     body = resp.json()
+    assert body["success"] is False
     assert body["code"] == ErrorCode.auth_forbidden.value
     assert body["params"] == {"resource": "user"}
     assert "trace_id" in body
@@ -65,6 +66,7 @@ def test_validation_error_returns_422_envelope_with_field_errors(client: TestCli
     resp = client.post("/validate", json={"name": "x"})  # missing 'age'
     assert resp.status_code == 422
     body = resp.json()
+    assert body["success"] is False
     assert body["code"] == ErrorCode.request_invalid.value
     assert "message" not in body
     assert isinstance(body["errors"], list)
@@ -78,6 +80,7 @@ def test_404_routes_through_envelope(client: TestClient) -> None:
     resp = client.get("/this-route-does-not-exist")
     assert resp.status_code == 404
     body = resp.json()
+    assert body["success"] is False
     assert body["code"] == ErrorCode.request_invalid.value
     assert "trace_id" in body
     # FastAPI 默认会返回 {"detail":"Not Found"};确认已被信封接管。
@@ -88,6 +91,7 @@ def test_405_method_not_allowed_through_envelope(client: TestClient) -> None:
     resp = client.post("/boom")  # /boom is GET-only
     assert resp.status_code == 405
     body = resp.json()
+    assert body["success"] is False
     assert body["code"] == ErrorCode.request_invalid.value
     assert "trace_id" in body
 
@@ -98,6 +102,7 @@ def test_unhandled_exception_returns_500_without_stack_leak() -> None:
     resp = client.get("/crash")
     assert resp.status_code == 500
     body = resp.json()
+    assert body["success"] is False
     assert body["code"] == ErrorCode.internal_error.value
     assert "trace_id" in body
     # 关键安全断言:debug=False(默认)时,绝不把异常细节/堆栈塞进响应。
