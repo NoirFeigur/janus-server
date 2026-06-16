@@ -75,7 +75,7 @@ Hermes / Claude Code / OA系统 / 脚本 / 其他应用
 | G13 | 协议特性匹配 | **B+D 组合**：路由层用 litellm `supports_*()` 能力函数对候选 deployment 做软过滤（优先支持请求特性的渠道，全不支持仍放行），发生降级时回写 `X-Gateway-Downgraded` 响应头 + 记审计。无需给 `model_deployment` 加能力字段 |
 | G14 | 技术栈最佳实践 | **对标 LiteLLM Proxy 等业内标准**：全异步（asyncpg + SQLAlchemy 2.0 async + Pydantic v2）；按领域分包；热路径 DB 写异步批量、不绑请求生命周期；无状态副本 + 共享 Redis；暴露 liveness/readiness。详见第六章 |
 | G15 | 前后端分离 + 前端栈 | **前后端分离**：FastAPI 纯 JSON API + 独立 SPA。前端栈：**React 19 + TS + Vite 7 + Ant Design 5 + Ant Design Pro（ProTable/ProForm/ProLayout）+ Zustand（客户端态）+ TanStack Query（服务端态）+ Axios**。详见 6.10 |
-| G16 | 国际化（i18n） | **展示与逻辑分离，按文本产生位置三七开**：展示型文本（枚举/业务错误/菜单）后端只发 code/key，**前端 i18n 拥有译文**；后端译两类例外——Pydantic 校验错误（exception handler 译）+ 外发消息（邮件/IM，按收件人 `preferred_locale` 译）。业务错误走 **RFC 9457 `problem+json`**（`code`+`params`，前端插值）；翻译栈用 **JSON/YAML 自研 `I18n` 类**（双语够用，Babel 留演进）。**不建字典表、不出 dict 接口**。详见 6.12 |
+| G16 | 国际化（i18n） | **展示与逻辑分离，按文本产生位置三七开**：纯展示文本（业务错误/菜单/字段 label）后端只发 code/key，**前端 i18n 拥有译文**；**枚举 label 例外——后端单源（`locales/{lang}/enums.json`）+ codegen 同步前端**（因服务端导出也要消费 label，遵 Python/Django `TextChoices` 惯例，否决 RuoYi 式 DB 字典表）。后端另译两类例外——Pydantic 校验错误（exception handler 译）+ 外发消息（邮件/IM，按收件人 `preferred_locale` 译）。业务错误走 **RFC 9457 `problem+json`**（`code`+`params`，前端插值）；翻译栈用 **JSON/YAML 自研 `I18n` 类**（双语够用，Babel 留演进）。**不建字典表、不出 dict 接口**。详见 6.12 |
 
 ---
 
@@ -729,14 +729,16 @@ proxy_read_timeout 600s;    # 长连接别被默认 60s 掐断
 
 | 文本类别 | 谁翻译 | 后端发什么 | 出处 |
 |---|---|---|---|
-| 枚举值（状态/类型） | **前端** | StrEnum code | ProComponents `valueEnum` 官方 |
+| 枚举值（状态/类型） | **后端单源 + 同步** | 运行时只发 StrEnum code；label 由后端 `locales/{lang}/enums.json` 定义，codegen 同步前端 | Django `TextChoices`（label 跟 code 走）；服务端导出需消费 label |
 | 业务错误 | **前端** | RFC 9457 `code` + 结构化 `params` | RFC 9457；FastAPI 官方讨论（tiangolo：i18n 归前端） |
 | Pydantic 422 校验错误 | **后端** | 本地化后的 `msg` | pydantic-i18n / fastapi-validation-i18n |
 | 菜单/按钮名 | **前端** | i18n key（`menu.system.user`） | Ant Design Pro + RuoYi-Vue |
 | 字段/表单 label | **前端** | （前端静态资源） | 前端 i18n（key 组织见 6.12.5 ⑥） |
 | 后端外发消息（邮件/IM/通知） | **后端** | 已渲染的本地化正文 | Flask-Babel `force_locale` |
 
-**反字典表声明**：不建 `sys_dict_type`/`sys_dict_data` 表，不出 `/system/dict` 接口。RuoYi 字典表是 Java 生态为**规避「改枚举要重新发版」**而生的产物；Python 侧用 `StrEnum` → OpenAPI schema → 前端 codegen 同步 code，label 走前端 i18n，语义与字典表等价但无运行时表、无额外接口。（与数据模型 0.5 节「枚举怎么存」一致。）
+**反字典表声明**：不建 `sys_dict_type`/`sys_dict_data` 表，不出 `/system/dict` 接口。RuoYi 字典表是 Java 生态为**规避「改枚举要重新发版」**而生的产物（Java 无优雅的 enum + i18n 集成）；Python 侧用 `StrEnum` 定义 code、`locales/{lang}/enums.json` 定义 label，二者皆后端单源，经 OpenAPI schema → 前端 codegen 同步给前端 `valueEnum`。语义与字典表等价但无运行时表、无额外接口。（与数据模型 0.5 节「枚举怎么存」一致。）
+
+> **为何 label 后端单源（而非前端 i18n）**：调研 RuoYi/jeecg-boot（Java=DB 字典表）vs Django/DRF（Python=代码枚举 `TextChoices`，label 跟 code 走、`get_FOO_display()` 取）后定案——本平台是 Python 栈，随 Python 惯例让 label 紧贴 code。**决定性触发点：服务端导出（6.4/6.12.4）**需把枚举列 code→label 写进 Excel/CSV，后端必须能拿到 label；若 label 仅存前端 i18n，导出器无从取值。故枚举 label 升级为后端单源 + codegen 同步，**导出器与前端共享同一份译文，零漂移**。纯展示文本（字段 label/菜单/业务错误）仍归前端 i18n——只有枚举 label 因导出这第二个消费者而上提。
 
 #### 6.12.2 后端：locale 解析与上下文
 
@@ -775,6 +777,7 @@ locales/
     errors.json       # 业务错误码 → 模板
     messages.json     # 邮件/IM 通知模板
     validation.json   # Pydantic 字段错误
+    enums.json        # 枚举 label(后端单源)→ codegen 同步前端 + 服务端导出消费
   en-US/
     errors.json ...
 ```
@@ -853,6 +856,10 @@ def send_quota_alert(user: User, used: int, limit: int):
 
 > Flask-Babel `force_locale()` 上下文管理器即为「按收件人而非请求者翻译」场景设计。
 
+**报表导出同属此例外，且导出在服务端做（非前端 ProTable 浏览器导出）。** 理由：`usage_record` 这类统计常是几万~百万行的全量导出，前端 ProTable 仅能导出当前页/已加载数据且大数据量会卡死浏览器；服务端导出能流式吐全量、统一控权限/脱敏、并复用 `I18n` 渲染本地化表头。locale 取**请求发起者**（导出是请求者自己看的，与外发消息取收件人不同）——从请求 `LocaleMiddleware` 注入的 `get_locale()` 取值，这正是 6.12.2 那套 locale ContextVar 在 API 响应体（纯 code）之外的**第一个正当消费者**。前端 ProTable 的「导出」按钮只触发下载，文件由后端生成。
+
+> **【硬约束】CSV/Excel 公式注入转义。** 导出的每个字符串单元格，若首字符是 `=` `+` `-` `@` 或 `\t`(0x09) `\r`(0x0D)，必须前置 `'`（单引号）或制表符强制文本——否则用户把昵称改成 `=cmd|'/c calc'!A1` 之类，管理员用 Excel/WPS 打开导出文件即触发**命令执行/数据外泄**（OWASP CSV Injection）。实现导出时配一个 ~5 行纯函数 + 单元测试，禁止裸写单元格。值不经此转义直接落表 = 阻塞级缺陷。
+
 #### 6.12.5 前端（Ant Design Pro / umi + react-intl）协作约定
 
 **① 枚举 valueEnum 动态构建**——后端发 code，前端 ProTable/ProForm 用 `valueEnum` 映射 code → 本地化 label：
@@ -864,6 +871,8 @@ const statusEnum = useMemo(() => ({
   disabled: { text: intl.formatMessage({ id: 'status.disabled' }), status: 'Default' },
 }), [intl]);
 ```
+
+> **枚举 label 译文来自 codegen,不手写**：`status.active` 等枚举 label key 由后端 `locales/{lang}/enums.json` 单源定义,经 codegen 生成到前端 locale 文件(见 6.12.1 反字典表声明)。前端只**消费**(`valueEnum` 渲染),不维护枚举译文——与服务端导出共享同一份,零漂移。字段/菜单 label 仍前端手写(见 ⑥)。
 
 **② 动态菜单 i18n**——后端 `sys_menu` 返回 i18n key，前端路由 `name` 经 `formatMessage` 译：
 
@@ -947,10 +956,12 @@ src/locales/{lang}/
 |---|---|---|
 | 原则 | 后端逻辑层 / 前端展示层，按文本产生位置三七开 | ✅ |
 | 字典表 | RuoYi `sys_dict` 表 + `/system/dict` 接口 | ❌ 不做（枚举+codegen 替代） |
+| 枚举 label | 后端单源 `locales/{lang}/enums.json` + codegen 同步前端（Django `TextChoices` 惯例；服务端导出需消费 label） | ✅ |
 | 业务错误 | RFC 9457 `problem+json` + `code`+`params`，前端插值 | ✅ |
 | 错误码目录 | `ErrorCode(StrEnum)` 集中定义（数据模型第 5 批，无新表） | ✅ |
 | 校验错误 | 后端 exception handler 译（例外） | ✅ |
 | 外发消息 | 后端 `I18n` 按收件人 locale 译（例外） | ✅ |
+| 报表导出 | 服务端生成（非前端 ProTable），locale 取请求者 `get_locale()`；CSV 公式注入转义为硬约束 | ✅ |
 | 翻译栈 | JSON/YAML 自研 `I18n` 类（双语够用，Babel 留演进） | ✅ |
 | 菜单存法 | `name` = i18n key + `remark` 开发备注 | ✅ |
 | 字段 label key 组织 | 两层命名空间：`common.*`（通用，中文语境激进共享）+ `pages.{模块}.{字段}`（领域），`dataIndex` = key 末段，3+ 复用才提升 common | ✅ |

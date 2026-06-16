@@ -1,8 +1,8 @@
 # 统一 AI 基础设施平台 — 核心数据模型设计
 
-> 版本：v0.5.4（第〇章 + 第1批 + 第1.5批 + 第2批 + 第3批 全部定稿，含两轮 Oracle 评审 + 全文一致性审查修正 + i18n 落地 + MCP 第4批零新表 + 第5批错误码契约定稿、调用审计表砍掉）
+> 版本：v0.5.5（第〇章 + 第1批 + 第1.5批 + 第2批 + 第3批 全部定稿，含两轮 Oracle 评审 + 全文一致性审查修正 + i18n 落地 + MCP 第4批零新表 + 第5批错误码契约定稿、调用审计表砍掉 + 枚举 label 归属修正）
 > 日期：2026-06-16
-> 定稿说明：v0.5 经全文一致性锁前审查,修正 10 处 must-fix(枚举集中定义、3 张软删表唯一约束改部分唯一索引、quota NULLS NOT DISTINCT + CHECK、cost 公式除百万、cost 单位统一 Decimal、Redis key 补 metric/bucket、api_key scope 锁定、channel_key 列名统一、status 两态化)+ 6 处 should-fix + 全部 ★ 待定点收口。v0.5.1 补:枚举成员强制行内注释约定 + 全枚举注释补齐(枚举转义走纯 Python 规范——后端只出 code,label 由前端 i18n 维护)。v0.5.2 落 i18n(架构稿 G16/6.12):`sys_user` 加 `preferred_locale`、`sys_menu.name` 语义改 i18n key + 加 `remark` 列、第 5 批预告 `ErrorCode` 错误码目录。v0.5.3 定 MCP(架构稿 G11/四之五):平台自身即标准 MCP 服务器、工具是代码,第 4 批**无新表**——复用 `sys_user`/`api_key`(鉴权)、工具内 LLM 调用直调自有网关(复用配额/记账)、MCP 调用平台侧不留痕(下游第三方是业务真相源);删除原计划 `mcp_server`/`mcp_grant`/工具目录/第三方连接表。**v0.5.4 定第 5 批:`call_audit` 调用审计表砍掉**——`usage_record`(第3批)已覆盖审计主要价值(谁/哪把key/何时/什么模型/结果/耗时),源 IP/正文/MCP 调用是合规边际增量、非 v1 必需,将来需合规取证再加 append-only 新表(对存量零迁移);**降级标记 `downgraded_features`(G13)折入 `usage_record`**(per-call,降级率一句查询);**定义 `ErrorCode(StrEnum)`** 业务错误码目录(RFC 9457 problem+json,无新表)。**第〇~3 批锁定,第 4/5 批为零新表增量、不回改本文已定部分。**
+> 定稿说明：v0.5 经全文一致性锁前审查,修正 10 处 must-fix(枚举集中定义、3 张软删表唯一约束改部分唯一索引、quota NULLS NOT DISTINCT + CHECK、cost 公式除百万、cost 单位统一 Decimal、Redis key 补 metric/bucket、api_key scope 锁定、channel_key 列名统一、status 两态化)+ 6 处 should-fix + 全部 ★ 待定点收口。v0.5.1 补:枚举成员强制行内注释约定 + 全枚举注释补齐(枚举转义走纯 Python 规范——后端只出 code,label 由前端 i18n 维护)。v0.5.2 落 i18n(架构稿 G16/6.12):`sys_user` 加 `preferred_locale`、`sys_menu.name` 语义改 i18n key + 加 `remark` 列、第 5 批预告 `ErrorCode` 错误码目录。v0.5.3 定 MCP(架构稿 G11/四之五):平台自身即标准 MCP 服务器、工具是代码,第 4 批**无新表**——复用 `sys_user`/`api_key`(鉴权)、工具内 LLM 调用直调自有网关(复用配额/记账)、MCP 调用平台侧不留痕(下游第三方是业务真相源);删除原计划 `mcp_server`/`mcp_grant`/工具目录/第三方连接表。**v0.5.4 定第 5 批:`call_audit` 调用审计表砍掉**——`usage_record`(第3批)已覆盖审计主要价值(谁/哪把key/何时/什么模型/结果/耗时),源 IP/正文/MCP 调用是合规边际增量、非 v1 必需,将来需合规取证再加 append-only 新表(对存量零迁移);**降级标记 `downgraded_features`(G13)折入 `usage_record`**(per-call,降级率一句查询);**定义 `ErrorCode(StrEnum)`** 业务错误码目录(RFC 9457 problem+json,无新表)。**第〇~3 批锁定,第 4/5 批为零新表增量、不回改本文已定部分。** **v0.5.5 修正枚举 `label` 归属**——调研 RuoYi/jeecg(Java=DB 字典表) vs Django/DRF(Python=代码枚举 `TextChoices`,label 跟 code 走)后,因**服务端导出**需在后端拿到枚举列 label,将 label 定义源从「前端 i18n 维护」上提为「后端 `locales/{lang}/enums.json` 单源 + codegen 同步前端」;运行时 API 仍只发 code(前端 `valueEnum` 渲染),仍否决 DB 字典表(详见架构稿 6.12.1)。
 > 关系：本文是《统一 AI 网关后台-架构决策》（下称**架构稿**，v1.5）第八章「开放问题 4：核心数据模型」的落地。架构稿定方向，本文定 `models.py`（SQLAlchemy ORM）+ `schemas.py`（Pydantic）的具体字段。
 > 方式：**逐层讨论、逐表敲定**。先定贯穿全局的横切约定（第〇章），再按依赖顺序逐张表落。
 
@@ -108,7 +108,8 @@ __table_args__ = (
 #### 全部枚举集中定义（enums.py）
 
 > **约定 1（命名）**：成员名 = 存库字符串值。`StrEnum` 下 `Status.active.value == "active"`，ORM 列存 `.value`，Pydantic schema 直接用枚举类型做字段类型校验。当成员名无法等于字符串值时（如 `global` 是关键字、`self` 易混淆），用显式 `= "..."` 指定值并加注释。
-> **约定 2（注释，强制）**：**每个枚举成员必须带行内注释说明业务语义**——给后端开发者读代码用。code 如 `active`/`disabled` 尚可自解释，但 `dept_and_child_or_self`/`custom`/`cooldown` 这类不写注释，几周后后端自己都得猜。注释是**开发者文档**，与面向终端用户的 `label` 是两回事：**`label` 不在后端、不出 API**，由前端 i18n 维护（详见架构稿「枚举转义约定」）。后端从头到尾只管 code + 注释，不碰中文 label。
+> **约定 2（注释，强制）**：**每个枚举成员必须带行内注释说明业务语义**——给后端开发者读代码用。code 如 `active`/`disabled` 尚可自解释，但 `dept_and_child_or_self`/`custom`/`cooldown` 这类不写注释，几周后后端自己都得猜。注释是**开发者文档**（读代码用），与面向终端用户的 `label`（展示译文）是两回事——**两者都在后端，但分属不同位置**：注释在 `enums.py` 成员旁，`label` 在 `locales/{lang}/enums.json`。
+> **`label` 归属（v0.5.5 修正）**：`label` 由后端 `locales/{lang}/enums.json` **单源定义**，经 codegen 同步前端 `valueEnum`，并供**服务端导出**（Excel/CSV 枚举列 code→label）消费。运行时 **API 响应仍只发 code**（前端 `valueEnum` 渲染 label，不变）——变的是 label 的**定义源从前端 i18n 上提到后端**（因导出需在服务端拿到 label；遵 Python/Django `TextChoices` 惯例，否决 RuoYi 式 DB 字典表）。详见架构稿 6.12.1 反字典表声明。
 
 ```python
 from enum import StrEnum
@@ -358,7 +359,7 @@ class User(BaseEntity):
 - **账密登录走 `username` + `password`**。普通员工纯企微 SSO,不用 username 登录但仍有此字段(唯一标识)。
 - **`password` 列仅后台管理员有**(平台工程师/财务/leader 设密码做 break-glass/SSO 兜底)；普通员工此列 null。**列名叫 `password` 但存的是 argon2/bcrypt 哈希,绝不明文**,**绝不进 `UserRead`**(0.8 铁律)。
 - `status`（active/disabled）保留：离职/停用走它（停登录、留审计）；`is_deleted` 留误建/合并的逻辑删。这是「`status` 按表定」（0.4）下对本表的判断。
-- **`preferred_locale`（语言偏好，架构稿 G16）**：BCP 47 格式（`zh-CN`/`en-US`），NOT NULL 默认 `zh-CN`。两处用途：① **后端外发消息**（邮件/企微推送/通知）按**收件人**此列渲染本地化正文（外发无前端那层，必须后端译）；② 登录后作为**前端默认语言**的种子（前端可再覆盖并回写）。注意：API 响应里的展示文本（枚举/业务错误/菜单）不读这列——那些由前端 i18n 拥有，后端只发 code/key（详见架构稿 6.12 三七开原则）。
+- **`preferred_locale`（语言偏好，架构稿 G16）**：BCP 47 格式（`zh-CN`/`en-US`），NOT NULL 默认 `zh-CN`。两处用途：① **后端外发消息**（邮件/企微推送/通知）按**收件人**此列渲染本地化正文（外发无前端那层，必须后端译）；② 登录后作为**前端默认语言**的种子（前端可再覆盖并回写）。注意：运行时 API 响应不读这列——展示文本（业务错误/菜单）由前端 i18n 拥有，枚举 label 虽后端单源但运行时也只发 code（前端 `valueEnum` 渲染），后端均只发 code/key（详见架构稿 6.12 三七开原则）。
 
 ### 表 1.2：`sys_department`（部门树）
 
