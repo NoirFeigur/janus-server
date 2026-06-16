@@ -38,6 +38,7 @@
 | Lint / 格式化 | **Ruff** | lint + format 一把梭 |
 | 类型检查 | **mypy（strict）** | CI 门禁 |
 | 测试 | **pytest + pytest-asyncio + httpx** | 异步测试 + ASGI 测试客户端 |
+| 定时 / 后台任务 | **ARQ**（Redis 后端） | async 原生，复用已有 Redis；scheduler 单实例 + worker 可 N 个。Celery 为可替换的重型方案 |
 | 编排 | **Docker Compose** | 不上 k8s（该规模过度工程） |
 | 反向代理 | **nginx** | 负载均衡 + TLS 终结 + SSE 流式 |
 
@@ -54,10 +55,20 @@ nginx（反向代理 + 负载均衡 + TLS）
   ├─ 副本 1：全功能（auth + admin + gateway + mcp）
   ├─ 副本 2：全功能（一模一样）
   └─ 副本 N：按并发增减
+旁路进程（不在 nginx upstream 内）：
+  ├─ ARQ scheduler：定时触发器，**必须单实例**（多副本会重复触发）
+  └─ ARQ worker：消费任务队列，**可 N 个**（无状态，水平扩展）
 共享后端（现成实例，本项目不部署）：
   ├─ PostgreSQL
-  └─ Redis
+  └─ Redis（兼作 ARQ 任务队列）
 ```
+
+### 定时/后台任务（ARQ）
+
+重活与周期活从请求热路径剥离，进 ARQ：夜间用量汇总、周期配额重置、账单滚动等。任务函数住在各领域的 `tasks.py`（贴近业务），由 `src/tasks/` 统一注册 + 调度。
+
+- **scheduler 单实例铁律**：cron 触发器只能跑一个进程，多开会让每个周期任务执行 N 次。worker 无此约束，按吞吐加副本。
+- **任务幂等**：worker 可能重试，任务函数按「可安全重跑」写（用 upsert / 状态机，不靠「只执行一次」假设）。
 
 ### 无状态副本
 
@@ -73,7 +84,7 @@ LLM 响应是流式，nginx 必须 `proxy_buffering off` + `proxy_read_timeout 6
 
 **领域驱动布局**（参考 [zhanymkanov/fastapi-best-practices](https://github.com/zhanymkanov/fastapi-best-practices)、Netflix Dispatch；网关分协议入口对齐 LiteLLM 的 provider 分组）。每个领域是一个包，自带 `router / schemas / service / dependencies / constants / exceptions`。
 
-> **关键取舍：ORM 模型集中，不按领域散放。** 我们的数据模型是**一张高内聚的 ERD**（雪花主键基类、三类 Entity 基类、`sys_user`/`api_key`/`logical_model`/`usage_record`/`quota` 间交叉外键密布，枚举强制集中在 `enums.py`）。若把 `models.py` 按领域拆开会立刻撞循环 import。故 **ORM 与枚举集中在 `db/` + `enums.py`，领域包只放 router/service/schema**——这与「数据模型逐表敲定、全局横切约定」的设计一致。
+> **关键取舍：ORM 模型集中，不按领域散放。** 我们的数据模型是**一张高内聚的 ERD**（雪花主键基类、三类 Entity 基类、`sys_user`/`api_key`/`logical_model`/`usage_record`/`quota` 间交叉外键密布，枚举强制集中在 `enums.py`）。集中放 `db/models/` 让 Alembic autogenerate 扫一处即可、跨聚合关系一目了然。**按域散放也能跑**（SQLAlchemy 用字符串形式的关系引用即可避免 import 顺序问题），是另一种合法流派；这里选集中，是与「数据模型逐表敲定、全局横切约定」的设计取向一致，并非唯一正解。
 
 ```
 janus-server/
@@ -82,7 +93,7 @@ janus-server/
 │   └── env.py
 ├── docker/
 │   ├── Dockerfile
-│   ├── compose.yaml              # 开发：app（共享 PG/Redis 连现成实例）
+│   ├── compose.yaml              # 开发：app + arq-worker + arq-scheduler（共享 PG/Redis 连现成实例）
 │   └── nginx/                    # nginx 配置（SSE 流式 + upstream）
 ├── src/
 │   ├── __init__.py
@@ -91,10 +102,11 @@ janus-server/
 │   ├── enums.py                  # 全局 StrEnum 集中（ActiveStatus/UsageStatus/ErrorCode… 成员强制行内注释）
 │   ├── exceptions.py             # 全局异常 + RFC 9457 problem+json handler
 │   │
-│   ├── db/                       # 持久层（集中 ORM —— ERD 高内聚，禁按域拆散）
+│   ├── db/                       # 持久层（ORM 集中 + 基础仓储）
 │   │   ├── __init__.py
 │   │   ├── base.py               # DeclarativeBase + 三类 Entity 基类（雪花主键/软删/审计列）
 │   │   ├── session.py            # AsyncEngine + async_sessionmaker + get_session() 依赖
+│   │   ├── repository.py         # BaseRepository[Model]（通用 get/list/create/update/soft_delete）
 │   │   └── models/               # SQLAlchemy 2.0 模型（按聚合分文件，同一声明基下）
 │   │       ├── __init__.py       # 汇总导出（Alembic autogenerate 扫这里）
 │   │       ├── identity.py       # sys_user / sys_role / sys_department / 关联表
@@ -118,7 +130,8 @@ janus-server/
 │   │   ├── __init__.py
 │   │   ├── router.py             # 登录 / token 校验 / 当前用户
 │   │   ├── schemas.py
-│   │   ├── service.py            # 企微 JWT 校验 / sk-key 解析 / RBAC 判定
+│   │   ├── service.py            # 企微 JWT 校验 / sk-key 解析 / RBAC 判定（编排 repository）
+│   │   ├── repository.py         # 用户/角色/key 查询（继承 BaseRepository）
 │   │   ├── dependencies.py       # CurrentUser / RequireRole / AuthenticatedApiKey
 │   │   ├── constants.py
 │   │   └── exceptions.py
@@ -128,9 +141,11 @@ janus-server/
 │   │   ├── router.py             # 聚合 provider 路由
 │   │   ├── schemas.py
 │   │   ├── service.py            # 路由 / fallback / 配额扣减 / 记账落 usage_record
+│   │   ├── repository.py         # 鉴权+授权+用量的读写（跨聚合查询落点）
 │   │   ├── dependencies.py       # RateLimitGated / QuotaGated
 │   │   ├── constants.py
 │   │   ├── exceptions.py
+│   │   ├── tasks.py              # 定时任务：用量滚动汇总等（被 src/tasks 调度引用）
 │   │   ├── router_factory.py     # litellm.Router 装配（号池→deployment）+ 韧性配置
 │   │   └── providers/            # 客户端协议原生入口（对齐 LiteLLM provider 分组）
 │   │       ├── __init__.py
@@ -150,24 +165,32 @@ janus-server/
 │   │       ├── _base.py
 │   │       └── <domain>_tool.py
 │   │
-│   └── admin/                    # 领域：管理后台 API（资源子包）
+│   ├── admin/                    # 领域：管理后台 API（资源子包）
+│   │   ├── __init__.py
+│   │   ├── router.py             # 挂载各资源子 router
+│   │   ├── schemas.py            # 共享 admin schema
+│   │   ├── dependencies.py       # CurrentAdmin / 资源校验
+│   │   ├── constants.py
+│   │   ├── exceptions.py
+│   │   ├── users/                # 资源：用户/角色/部门（RBAC）
+│   │   │   ├── __init__.py
+│   │   │   ├── router.py
+│   │   │   ├── schemas.py
+│   │   │   ├── service.py
+│   │   │   ├── repository.py
+│   │   │   └── dependencies.py
+│   │   ├── credentials/          # 资源：api_key 管理
+│   │   ├── catalog/              # 资源：逻辑模型 / 渠道 / 号池
+│   │   ├── grants/               # 资源：模型分配（user_model_grant）
+│   │   ├── usage/                # 资源：用量 / 内部账单（读 usage_record 聚合）
+│   │   │                         #   含 tasks.py：夜间用量汇总 / 账单滚动
+│   │   └── quota/                # 资源：配额配置（含 tasks.py：周期配额重置）
+│   │
+│   └── tasks/                    # ARQ 定时/后台任务（调度 + worker 入口）
 │       ├── __init__.py
-│       ├── router.py             # 挂载各资源子 router
-│       ├── schemas.py            # 共享 admin schema
-│       ├── dependencies.py       # CurrentAdmin / 资源校验
-│       ├── constants.py
-│       ├── exceptions.py
-│       ├── users/                # 资源：用户/角色/部门（RBAC）
-│       │   ├── __init__.py
-│       │   ├── router.py
-│       │   ├── schemas.py
-│       │   ├── service.py
-│       │   └── dependencies.py
-│       ├── credentials/          # 资源：api_key 管理
-│       ├── catalog/              # 资源：逻辑模型 / 渠道 / 号池
-│       ├── grants/               # 资源：模型分配（user_model_grant）
-│       ├── usage/                # 资源：用量 / 内部账单（读 usage_record 聚合）
-│       └── quota/                # 资源：配额配置
+│       ├── worker.py             # ARQ WorkerSettings + 进程入口（消费队列）
+│       ├── schedule.py           # cron 调度表（引用各领域 tasks.py 的任务函数）
+│       └── registry.py           # 任务函数注册（领域 tasks.py 在此汇总）
 │
 ├── tests/                        # 镜像 src/ 结构
 │   ├── conftest.py               # 临时 DB/Redis fixture（不碰共享实例）
@@ -175,9 +198,10 @@ janus-server/
 │   ├── gateway/
 │   │   └── test_providers/
 │   ├── mcp/
-│   └── admin/
-│       ├── test_users/
-│       └── test_usage/
+│   ├── admin/
+│   │   ├── test_users/
+│   │   └── test_usage/
+│   └── tasks/                    # 定时/后台任务函数测试（幂等性/重跑安全）
 │
 ├── .env.example                  # 密钥模板（仅密钥）
 ├── pyproject.toml                # uv 项目配置 + ruff/mypy/pytest 配置
@@ -192,12 +216,14 @@ janus-server/
 | `__init__.py` | 包标记；向上暴露 `router` | ✅ |
 | `router.py` | `APIRouter` + 端点定义；薄，只编排 | ✅ |
 | `schemas.py` | Pydantic v2 出入参（API 契约，≠ ORM 模型） | ✅ |
-| `service.py` | 业务逻辑；DB 操作经 `db.session` 注入的 AsyncSession | ✅ |
+| `service.py` | 业务逻辑；编排 `repository` + 跨域协作，不直接写 SQL | ✅ |
+| `repository.py` | 数据访问；继承 `BaseRepository`，封装本域的查询/写入 | ✅ |
 | `dependencies.py` | FastAPI `Depends()` 工厂（鉴权 / 校验 / 资源查找） | ✅ |
+| `tasks.py` | 本域的定时/后台任务函数（被 `src/tasks` 调度引用） | 按需 |
 | `constants.py` | 模块内常量 | 按需 |
 | `exceptions.py` | 领域异常（继承全局基类） | 按需 |
 
-> ORM 模型**不在领域包内**，统一在 `src/db/models/`；枚举统一在 `src/enums.py`。领域 `service.py` import 这两处。
+> ORM 模型**不在领域包内**，统一在 `src/db/models/`；枚举统一在 `src/enums.py`。领域 `repository.py` import 这两处，`service.py` 只依赖本域 `repository`。
 
 ---
 
@@ -215,8 +241,10 @@ janus-server/
 
 ### 分层纪律
 
+- **四层单向依赖**：`router → service → repository → db`，依赖只向下，不反向、不跨层（router 不直接碰 repository，service 不直接写 SQL）。
 - **router 薄、service 厚**：路由只做参数解析 + 调 service + 拼响应；业务逻辑全在 `service.py`。
-- **DB 访问经注入的 `AsyncSession`**，不在 service 里自建 engine/session。
+- **repository 收口数据访问**：所有 ORM 查询/写入封装在 `repository.py`，继承 `BaseRepository` 复用通用 CRUD；service 拿到的是领域对象，不是裸 `select()`。换底层存储只动 repository。
+- **DB 访问经注入的 `AsyncSession`**：session 由 `get_session()` 依赖注入，repository 接收 session，不自建 engine/session。
 - **领域间不互相 import service**：需要跨域协作时经 router 编排或事件，保持边界可移动。
 
 ### 枚举与 i18n（G16）
@@ -363,6 +391,11 @@ uv run alembic upgrade head
 
 # 5. 启动（开发）
 uv run uvicorn src.main:app --reload --port 8000
+
+# 5b. 定时/后台任务（按需，另开终端）
+uv run arq src.tasks.worker.WorkerSettings        # worker：消费队列（可多开）
+uv run arq src.tasks.worker.WorkerSettings --check # 健康检查
+#   scheduler 触发器随 worker 配置启动；生产环境务必只跑一个 scheduler 实例
 
 # 质量门
 uv run pytest && uv run ruff check && uv run mypy src
