@@ -54,7 +54,14 @@ class RoleService:
 
     async def list_roles(self) -> list[RoleDetail]:
         roles = await self.repo.list()
-        return [await self._detail(role) for role in roles]
+        # Two bulk lookups for the whole page (was 1+2R: two queries per role).
+        role_ids = [role.id for role in roles]
+        menu_map = await self.repo.list_menu_ids_for_roles(role_ids)
+        dept_map = await self.repo.list_dept_ids_for_roles(role_ids)
+        return [
+            (role, menu_map.get(role.id, []), dept_map.get(role.id, []))
+            for role in roles
+        ]
 
     async def get_role(self, role_id: int) -> RoleDetail:
         return await self._detail(await self._require(role_id))

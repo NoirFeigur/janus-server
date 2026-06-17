@@ -22,7 +22,7 @@ from starlette import status
 from src.admin.users.repository import UserRepository
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.auth.service import AuthenticatedAccount, AuthService, DataScopeFilter
-from src.core.security import hash_password
+from src.core.security import hash_password_async
 from src.db.models.identity import Department, Role, User
 from src.enums import ErrorCode
 from src.exceptions import AppError
@@ -124,7 +124,9 @@ class UserService:
         users = await self.repo.list_in_scope(
             scope, actor_id=actor.account_id, limit=limit, offset=offset
         )
-        return [await self._detail(u) for u in users]
+        # One bulk role lookup for the whole page (was 1+N: one query per user).
+        role_map = await self.repo.list_role_ids_for_users([u.id for u in users])
+        return [(u, role_map.get(u.id, [])) for u in users]
 
     async def get_user(self, user_id: int, actor: AuthenticatedAccount) -> UserDetail:
         return await self._detail(await self._require_visible(user_id, actor))
@@ -139,10 +141,13 @@ class UserService:
         await self._require_department_in_scope(payload.department_id, actor)
         await self._validate_roles(payload.role_ids)
         await self._require_assignable_roles(payload.role_ids, actor)
+        password_hash = (
+            await hash_password_async(payload.password) if payload.password else None
+        )
         user = User(
             username=payload.username,
             employee_no=payload.employee_no,
-            password=hash_password(payload.password) if payload.password else None,
+            password=password_hash,
             real_name=payload.real_name,
             email=payload.email,
             mobile=payload.mobile,
@@ -166,7 +171,7 @@ class UserService:
             exclude_unset=True, exclude={"role_ids", "password", "status"}
         )
         if payload.password is not None:
-            values["password"] = hash_password(payload.password)
+            values["password"] = await hash_password_async(payload.password)
         if payload.status is not None:
             values["status"] = payload.status.value
         if "department_id" in values:

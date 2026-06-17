@@ -85,6 +85,27 @@ class UserRepository(BaseRepository[User]):
         result = await self.session.scalars(stmt)
         return list(result.all())
 
+    async def list_role_ids_for_users(
+        self, user_ids: Sequence[int]
+    ) -> dict[int, list[int]]:
+        """Role ids for many users in one query (avoids 1+N on listing).
+
+        Returns a ``user_id -> [role_id, ...]`` map. Users with no roles are
+        absent from the map; the caller defaults them to an empty list.
+        """
+        if not user_ids:
+            return {}
+        stmt = (
+            select(UserRole.user_id, UserRole.role_id)
+            .where(UserRole.user_id.in_(user_ids))
+            .order_by(UserRole.user_id, UserRole.role_id)
+        )
+        result = await self.session.execute(stmt)
+        grouped: dict[int, list[int]] = {}
+        for user_id, role_id in result.all():
+            grouped.setdefault(user_id, []).append(role_id)
+        return grouped
+
     async def replace_roles(self, user_id: int, role_ids: Sequence[int]) -> None:
         """Replace the user's role assignments (delete-all then insert, no commit)."""
         await self.session.execute(

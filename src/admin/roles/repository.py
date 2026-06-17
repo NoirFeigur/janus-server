@@ -39,6 +39,48 @@ class RoleRepository(BaseRepository[Role]):
         result = await self.session.scalars(stmt)
         return list(result.all())
 
+    async def list_menu_ids_for_roles(
+        self, role_ids: Sequence[int]
+    ) -> dict[int, list[int]]:
+        """Menu ids for many roles in one query (avoids 1+N on listing).
+
+        Returns a ``role_id -> [menu_id, ...]`` map; roles with no menus are
+        absent (caller defaults to an empty list).
+        """
+        if not role_ids:
+            return {}
+        stmt = (
+            select(RoleMenu.role_id, RoleMenu.menu_id)
+            .where(RoleMenu.role_id.in_(role_ids))
+            .order_by(RoleMenu.role_id, RoleMenu.menu_id)
+        )
+        result = await self.session.execute(stmt)
+        grouped: dict[int, list[int]] = {}
+        for role_id, menu_id in result.all():
+            grouped.setdefault(role_id, []).append(menu_id)
+        return grouped
+
+    async def list_dept_ids_for_roles(
+        self, role_ids: Sequence[int]
+    ) -> dict[int, list[int]]:
+        """Custom-scope dept ids for many roles in one query (avoids 1+N).
+
+        Returns a ``role_id -> [dept_id, ...]`` map; roles with no dept grants
+        are absent (caller defaults to an empty list).
+        """
+        if not role_ids:
+            return {}
+        stmt = (
+            select(RoleDept.role_id, RoleDept.dept_id)
+            .where(RoleDept.role_id.in_(role_ids))
+            .order_by(RoleDept.role_id, RoleDept.dept_id)
+        )
+        result = await self.session.execute(stmt)
+        grouped: dict[int, list[int]] = {}
+        for role_id, dept_id in result.all():
+            grouped.setdefault(role_id, []).append(dept_id)
+        return grouped
+
     async def existing_menu_ids(self, menu_ids: Sequence[int]) -> set[int]:
         """Subset of menu_ids that exist and are non-deleted (FK-less integrity)."""
         if not menu_ids:
