@@ -36,6 +36,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -51,6 +52,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_api_key_create_dept"), "api_key", ["create_dept"], unique=False)
     op.create_index(op.f("ix_api_key_key_hash"), "api_key", ["key_hash"], unique=False)
     op.create_index(op.f("ix_api_key_status"), "api_key", ["status"], unique=False)
     op.create_index(op.f("ix_api_key_user_id"), "api_key", ["user_id"], unique=False)
@@ -71,6 +73,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -86,6 +89,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_channel_key_create_dept"), "channel_key", ["create_dept"], unique=False)
     op.create_index(op.f("ix_channel_key_channel_id"), "channel_key", ["channel_id"], unique=False)
     op.create_index(
         "ix_channel_key_channel_status", "channel_key", ["channel_id", "status"], unique=False
@@ -105,6 +109,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -120,6 +125,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_logical_model_create_dept"), "logical_model", ["create_dept"], unique=False)
     op.create_index(op.f("ix_logical_model_category"), "logical_model", ["category"], unique=False)
     op.create_index(op.f("ix_logical_model_status"), "logical_model", ["status"], unique=False)
     op.create_index(
@@ -141,6 +147,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -156,6 +163,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_model_deployment_create_dept"), "model_deployment", ["create_dept"], unique=False)
     op.create_index(
         "ix_deployment_logical_status",
         "model_deployment",
@@ -195,6 +203,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -214,6 +223,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_quota_create_dept"), "quota", ["create_dept"], unique=False)
     op.create_index(op.f("ix_quota_logical_model_id"), "quota", ["logical_model_id"], unique=False)
     op.create_index(op.f("ix_quota_scope"), "quota", ["scope"], unique=False)
     op.create_index(op.f("ix_quota_scope_id"), "quota", ["scope_id"], unique=False)
@@ -236,6 +246,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -251,6 +262,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_sys_department_create_dept"), "sys_department", ["create_dept"], unique=False)
     op.create_index(
         op.f("ix_sys_department_external_id"), "sys_department", ["external_id"], unique=False
     )
@@ -283,6 +295,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -298,6 +311,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_sys_menu_create_dept"), "sys_menu", ["create_dept"], unique=False)
     op.create_index(op.f("ix_sys_menu_parent_id"), "sys_menu", ["parent_id"], unique=False)
     op.create_index(op.f("ix_sys_menu_perms"), "sys_menu", ["perms"], unique=False)
     op.create_table(
@@ -313,6 +327,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -328,6 +343,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_sys_role_create_dept"), "sys_role", ["create_dept"], unique=False)
     op.create_index(op.f("ix_sys_role_code"), "sys_role", ["code"], unique=False)
     op.create_index(
         "uq_role_code_active",
@@ -384,6 +400,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -399,6 +416,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_sys_user_create_dept"), "sys_user", ["create_dept"], unique=False)
     op.create_index(op.f("ix_sys_user_department_id"), "sys_user", ["department_id"], unique=False)
     op.create_index(op.f("ix_sys_user_email"), "sys_user", ["email"], unique=False)
     op.create_index(op.f("ix_sys_user_employee_no"), "sys_user", ["employee_no"], unique=False)
@@ -441,6 +459,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -456,6 +475,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_sys_user_oauth_create_dept"), "sys_user_oauth", ["create_dept"], unique=False)
     op.create_index(op.f("ix_sys_user_oauth_source"), "sys_user_oauth", ["source"], unique=False)
     op.create_index(op.f("ix_sys_user_oauth_user_id"), "sys_user_oauth", ["user_id"], unique=False)
     op.create_index(op.f("ix_sys_user_oauth_uuid"), "sys_user_oauth", ["uuid"], unique=False)
@@ -501,6 +521,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -516,6 +537,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_upstream_channel_create_dept"), "upstream_channel", ["create_dept"], unique=False)
     op.create_index(
         op.f("ix_upstream_channel_protocol"), "upstream_channel", ["protocol"], unique=False
     )
@@ -589,6 +611,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("is_deleted", sa.Boolean(), nullable=False),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
+        sa.Column("create_dept", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -604,6 +627,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_user_model_grant_create_dept"), "user_model_grant", ["create_dept"], unique=False)
     op.create_index(
         op.f("ix_user_model_grant_logical_model_id"),
         "user_model_grant",
@@ -646,6 +670,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_user_model_grant_scope_id"), table_name="user_model_grant")
     op.drop_index(op.f("ix_user_model_grant_scope"), table_name="user_model_grant")
     op.drop_index(op.f("ix_user_model_grant_logical_model_id"), table_name="user_model_grant")
+    op.drop_index(op.f("ix_user_model_grant_create_dept"), table_name="user_model_grant")
     op.drop_table("user_model_grant")
     op.drop_index("ix_usage_user_created", table_name="usage_record")
     op.drop_index(op.f("ix_usage_record_user_id"), table_name="usage_record")
@@ -664,6 +689,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_upstream_channel_status"), table_name="upstream_channel")
     op.drop_index(op.f("ix_upstream_channel_provider"), table_name="upstream_channel")
     op.drop_index(op.f("ix_upstream_channel_protocol"), table_name="upstream_channel")
+    op.drop_index(op.f("ix_upstream_channel_create_dept"), table_name="upstream_channel")
     op.drop_table("upstream_channel")
     op.drop_index(op.f("ix_sys_user_role_user_id"), table_name="sys_user_role")
     op.drop_index(op.f("ix_sys_user_role_role_id"), table_name="sys_user_role")
@@ -681,6 +707,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_sys_user_oauth_uuid"), table_name="sys_user_oauth")
     op.drop_index(op.f("ix_sys_user_oauth_user_id"), table_name="sys_user_oauth")
     op.drop_index(op.f("ix_sys_user_oauth_source"), table_name="sys_user_oauth")
+    op.drop_index(op.f("ix_sys_user_oauth_create_dept"), table_name="sys_user_oauth")
     op.drop_table("sys_user_oauth")
     op.drop_index(
         "uq_user_username_active",
@@ -703,6 +730,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_sys_user_employee_no"), table_name="sys_user")
     op.drop_index(op.f("ix_sys_user_email"), table_name="sys_user")
     op.drop_index(op.f("ix_sys_user_department_id"), table_name="sys_user")
+    op.drop_index(op.f("ix_sys_user_create_dept"), table_name="sys_user")
     op.drop_table("sys_user")
     op.drop_index(op.f("ix_sys_role_menu_role_id"), table_name="sys_role_menu")
     op.drop_index(op.f("ix_sys_role_menu_menu_id"), table_name="sys_role_menu")
@@ -714,9 +742,11 @@ def downgrade() -> None:
         "uq_role_code_active", table_name="sys_role", postgresql_where=sa.text("is_deleted = false")
     )
     op.drop_index(op.f("ix_sys_role_code"), table_name="sys_role")
+    op.drop_index(op.f("ix_sys_role_create_dept"), table_name="sys_role")
     op.drop_table("sys_role")
     op.drop_index(op.f("ix_sys_menu_perms"), table_name="sys_menu")
     op.drop_index(op.f("ix_sys_menu_parent_id"), table_name="sys_menu")
+    op.drop_index(op.f("ix_sys_menu_create_dept"), table_name="sys_menu")
     op.drop_table("sys_menu")
     op.drop_index(
         "uq_dept_external_active",
@@ -725,6 +755,7 @@ def downgrade() -> None:
     )
     op.drop_index(op.f("ix_sys_department_parent_id"), table_name="sys_department")
     op.drop_index(op.f("ix_sys_department_external_id"), table_name="sys_department")
+    op.drop_index(op.f("ix_sys_department_create_dept"), table_name="sys_department")
     op.drop_table("sys_department")
     op.drop_index(
         "uq_quota_scope_model_period_metric_active",
@@ -736,6 +767,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_quota_scope_id"), table_name="quota")
     op.drop_index(op.f("ix_quota_scope"), table_name="quota")
     op.drop_index(op.f("ix_quota_logical_model_id"), table_name="quota")
+    op.drop_index(op.f("ix_quota_create_dept"), table_name="quota")
     op.drop_table("quota")
     op.drop_index(
         "uq_deployment_logical_model_channel_active",
@@ -746,6 +778,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_model_deployment_logical_model_id"), table_name="model_deployment")
     op.drop_index(op.f("ix_model_deployment_channel_id"), table_name="model_deployment")
     op.drop_index("ix_deployment_logical_status", table_name="model_deployment")
+    op.drop_index(op.f("ix_model_deployment_create_dept"), table_name="model_deployment")
     op.drop_table("model_deployment")
     op.drop_index(
         "uq_logical_model_name_active",
@@ -754,14 +787,17 @@ def downgrade() -> None:
     )
     op.drop_index(op.f("ix_logical_model_status"), table_name="logical_model")
     op.drop_index(op.f("ix_logical_model_category"), table_name="logical_model")
+    op.drop_index(op.f("ix_logical_model_create_dept"), table_name="logical_model")
     op.drop_table("logical_model")
     op.drop_index(op.f("ix_channel_key_status"), table_name="channel_key")
     op.drop_index("ix_channel_key_channel_status", table_name="channel_key")
     op.drop_index(op.f("ix_channel_key_channel_id"), table_name="channel_key")
+    op.drop_index(op.f("ix_channel_key_create_dept"), table_name="channel_key")
     op.drop_table("channel_key")
     op.drop_index("uq_apikey_hash", table_name="api_key")
     op.drop_index(op.f("ix_api_key_user_id"), table_name="api_key")
     op.drop_index(op.f("ix_api_key_status"), table_name="api_key")
     op.drop_index(op.f("ix_api_key_key_hash"), table_name="api_key")
+    op.drop_index(op.f("ix_api_key_create_dept"), table_name="api_key")
     op.drop_table("api_key")
     # ### end Alembic commands ###

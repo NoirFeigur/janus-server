@@ -16,7 +16,7 @@ import pytest
 
 from src.auth.router import login, me
 from src.auth.schemas import LoginRequest
-from src.auth.service import AuthenticatedAccount, AuthService
+from src.auth.service import AuthenticatedUser, AuthService
 
 pytestmark = pytest.mark.asyncio
 
@@ -45,17 +45,17 @@ async def test_login_endpoint_returns_token_envelope() -> None:
 
 
 async def test_me_endpoint_serializes_principal() -> None:
-    account = AuthenticatedAccount(
-        account_id=123456789,
+    current_user = AuthenticatedUser(
+        user_id=123456789,
         username="alice",
         department_id=42,
         permissions=frozenset({"system:user:list", "*:*:*"}),
     )
-    envelope = await me(account, TRACE)
+    envelope = await me(current_user, TRACE)
     assert envelope.success is True
     assert envelope.data is not None
     # Snowflake ids serialize as strings on the wire.
-    assert envelope.data.account_id == "123456789"
+    assert envelope.data.user_id == "123456789"
     assert envelope.data.department_id == "42"
     assert envelope.data.username == "alice"
     assert envelope.data.is_superuser is True
@@ -63,13 +63,13 @@ async def test_me_endpoint_serializes_principal() -> None:
 
 
 async def test_me_endpoint_null_department() -> None:
-    account = AuthenticatedAccount(
-        account_id=1,
+    current_user = AuthenticatedUser(
+        user_id=1,
         username="bob",
         department_id=None,
         permissions=frozenset(),
     )
-    envelope = await me(account, TRACE)
+    envelope = await me(current_user, TRACE)
     assert envelope.data is not None
     assert envelope.data.department_id is None
     assert envelope.data.is_superuser is False

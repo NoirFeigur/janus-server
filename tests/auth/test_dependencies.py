@@ -6,20 +6,22 @@ from typing import cast
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import Request
 
+from src.auth.credentials import CredentialKind, extract_credential
 from src.auth.dependencies import (
     RequiredPerms,
-    _extract_credential,
     get_auth_service,
-    get_current_account,
+    get_current_jwt_user,
+    get_current_user,
 )
-from src.auth.service import AuthenticatedAccount, AuthService
+from src.auth.service import AuthenticatedUser, AuthService
 from src.exceptions import AppError
 
 
-def _account(perms: set[str]) -> AuthenticatedAccount:
-    return AuthenticatedAccount(
-        account_id=1,
+def _user(perms: set[str]) -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=1,
         username="alice",
         department_id=None,
         permissions=frozenset(perms),
@@ -27,55 +29,61 @@ def _account(perms: set[str]) -> AuthenticatedAccount:
 
 
 def test_extract_bearer_jwt() -> None:
-    cred, is_api_key = _extract_credential("Bearer abc.def.ghi", None)
-    assert cred == "abc.def.ghi"
-    assert is_api_key is False
+    cred = extract_credential("Bearer abc.def.ghi", None, allow_api_key=True)
+    assert cred.value == "abc.def.ghi"
+    assert cred.kind == CredentialKind.jwt
 
 
 def test_extract_bearer_sk_key_is_api_key() -> None:
-    cred, is_api_key = _extract_credential("Bearer sk-12345", None)
-    assert cred == "sk-12345"
-    assert is_api_key is True
+    cred = extract_credential("Bearer sk-12345", None, allow_api_key=True)
+    assert cred.value == "sk-12345"
+    assert cred.kind == CredentialKind.api_key
 
 
 def test_extract_x_api_key_header_takes_precedence() -> None:
-    cred, is_api_key = _extract_credential("Bearer jwt-token", "sk-from-header")
-    assert cred == "sk-from-header"
-    assert is_api_key is True
+    cred = extract_credential("Bearer jwt-token", "sk-from-header", allow_api_key=True)
+    assert cred.value == "sk-from-header"
+    assert cred.kind == CredentialKind.api_key
+
+
+def test_extract_api_key_disallowed_raises_401() -> None:
+    with pytest.raises(AppError) as exc:
+        extract_credential("Bearer sk-12345", None, allow_api_key=False)
+    assert exc.value.status_code == 401
 
 
 def test_extract_missing_credential_raises_401() -> None:
     with pytest.raises(AppError) as exc:
-        _extract_credential(None, None)
+        extract_credential(None, None, allow_api_key=True)
     assert exc.value.status_code == 401
 
 
 def test_extract_malformed_authorization_raises_401() -> None:
     with pytest.raises(AppError) as exc:
-        _extract_credential("Basic foo", None)
+        extract_credential("Basic foo", None, allow_api_key=True)
     assert exc.value.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_required_perms_allows_holder() -> None:
     gate = RequiredPerms("system:user:add")
-    account = _account({"system:user:add"})
-    assert await gate(account) is account
+    current_user = _user({"system:user:add"})
+    assert await gate(current_user) is current_user
 
 
 @pytest.mark.asyncio
 async def test_required_perms_allows_superuser() -> None:
     gate = RequiredPerms("system:user:add")
-    account = _account({"*:*:*"})
-    assert await gate(account) is account
+    current_user = _user({"*:*:*"})
+    assert await gate(current_user) is current_user
 
 
 @pytest.mark.asyncio
 async def test_required_perms_denies_missing_403() -> None:
     gate = RequiredPerms("system:user:remove")
-    account = _account({"system:user:add"})
+    current_user = _user({"system:user:add"})
     with pytest.raises(AppError) as exc:
-        await gate(account)
+        await gate(current_user)
     assert exc.value.status_code == 403
 
 
@@ -88,46 +96,72 @@ def test_get_auth_service_binds_session() -> None:
 
 
 class _StubAuthService:
-    """Records which resolution path ``get_current_account`` dispatched to."""
+    """Records which resolution path ``get_current_user`` dispatched to."""
 
     def __init__(self) -> None:
         self.api_key_calls: list[str] = []
         self.token_calls: list[str] = []
 
-    async def resolve_api_key(self, plaintext: str) -> AuthenticatedAccount:
+    async def resolve_api_key(self, plaintext: str) -> AuthenticatedUser:
         self.api_key_calls.append(plaintext)
-        return _account({"via:api_key"})
+        return _user({"via:api_key"})
 
-    async def resolve_access_token(self, token: str) -> AuthenticatedAccount:
+    async def resolve_access_token(self, token: str) -> AuthenticatedUser:
         self.token_calls.append(token)
-        return _account({"via:jwt"})
+        return _user({"via:jwt"})
 
 
 @pytest.mark.asyncio
-async def test_get_current_account_routes_sk_key_to_api_key_path() -> None:
+async def test_get_current_user_routes_sk_key_to_api_key_path() -> None:
     stub = _StubAuthService()
-    account = await get_current_account(
+    current_user = await get_current_user(
         cast(AuthService, stub), authorization="Bearer sk-live-123"
     )
     assert stub.api_key_calls == ["sk-live-123"]
     assert stub.token_calls == []
-    assert account.has_permission("via:api_key")
+    assert current_user.has_permission("via:api_key")
 
 
 @pytest.mark.asyncio
-async def test_get_current_account_routes_jwt_to_access_token_path() -> None:
+async def test_get_current_user_routes_jwt_to_access_token_path() -> None:
     stub = _StubAuthService()
-    account = await get_current_account(
+    current_user = await get_current_user(
         cast(AuthService, stub), authorization="Bearer header.payload.sig"
     )
     assert stub.token_calls == ["header.payload.sig"]
     assert stub.api_key_calls == []
-    assert account.has_permission("via:jwt")
+    assert current_user.has_permission("via:jwt")
 
 
 @pytest.mark.asyncio
-async def test_get_current_account_missing_credential_raises_401() -> None:
+async def test_get_current_user_missing_credential_raises_401() -> None:
     stub = _StubAuthService()
     with pytest.raises(AppError) as exc:
-        await get_current_account(cast(AuthService, stub))
+        await get_current_user(cast(AuthService, stub))
     assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_current_jwt_user_rejects_sk_key() -> None:
+    stub = _StubAuthService()
+    request = Request({"type": "http", "headers": []})
+    with pytest.raises(AppError) as exc:
+        await get_current_jwt_user(
+            request,
+            cast(AuthService, stub),
+            authorization="Bearer sk-live-123",
+        )
+    assert exc.value.status_code == 401
+    assert stub.api_key_calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_current_jwt_user_uses_request_state_user() -> None:
+    stub = _StubAuthService()
+    request = Request({"type": "http", "headers": []})
+    user = _user({"via:state"})
+    request.state.user = user
+    resolved = await get_current_jwt_user(request, cast(AuthService, stub))
+    assert resolved is user
+    assert stub.api_key_calls == []
+    assert stub.token_calls == []

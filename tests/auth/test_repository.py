@@ -66,7 +66,7 @@ async def test_list_role_department_ids_returns_grants(
     assert dept_ids == frozenset({10, 20})
 
 
-async def test_list_active_roles_for_account(auth_session: AsyncSession) -> None:
+async def test_list_active_roles_for_user(auth_session: AsyncSession) -> None:
     """Sanity that the active-roles query returns the user's role rows."""
     from src.db.models.identity import UserRole
 

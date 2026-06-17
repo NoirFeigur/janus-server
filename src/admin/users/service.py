@@ -21,7 +21,7 @@ from starlette import status
 
 from src.admin.users.repository import UserRepository
 from src.admin.users.schemas import UserCreate, UserUpdate
-from src.auth.service import AuthenticatedAccount, AuthService, DataScopeFilter
+from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.core.security import hash_password_async
 from src.db.models.identity import Department, Role, User
 from src.enums import ErrorCode
@@ -36,17 +36,17 @@ class UserService:
         self.repo = UserRepository(session)
         self.auth = AuthService(session)
 
-    async def _scope(self, actor: AuthenticatedAccount) -> DataScopeFilter:
+    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
         return await self.auth.resolve_data_scope(actor)
 
     async def _require_visible(
-        self, user_id: int, actor: AuthenticatedAccount
+        self, user_id: int, actor: AuthenticatedUser
     ) -> User:
         """Fetch a user the actor is allowed to see, else opaque 403."""
         user = await self.repo.get(user_id)
         scope = await self._scope(actor)
         if user is None or not self.repo.is_visible(
-            user, scope, actor_id=actor.account_id
+            user, scope, actor_id=actor.user_id
         ):
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
         return user
@@ -63,7 +63,7 @@ class UserService:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
     async def _require_department_in_scope(
-        self, department_id: int | None, actor: AuthenticatedAccount
+        self, department_id: int | None, actor: AuthenticatedUser
     ) -> None:
         """A non-unrestricted actor may only place a user in a department they
         can see. ``department_id IS NULL`` (no department) is allowed only for
@@ -88,7 +88,7 @@ class UserService:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
     async def _require_assignable_roles(
-        self, role_ids: Sequence[int], actor: AuthenticatedAccount
+        self, role_ids: Sequence[int], actor: AuthenticatedUser
     ) -> None:
         """Privilege-escalation guard: an actor may only assign roles whose
         conferred permissions are a subset of the actor's own. Super-admin may
@@ -115,24 +115,24 @@ class UserService:
 
     async def list_users(
         self,
-        actor: AuthenticatedAccount,
+        actor: AuthenticatedUser,
         *,
         limit: int | None = None,
         offset: int | None = None,
     ) -> list[UserDetail]:
         scope = await self._scope(actor)
         users = await self.repo.list_in_scope(
-            scope, actor_id=actor.account_id, limit=limit, offset=offset
+            scope, actor_id=actor.user_id, limit=limit, offset=offset
         )
         # One bulk role lookup for the whole page (was 1+N: one query per user).
         role_map = await self.repo.list_role_ids_for_users([u.id for u in users])
         return [(u, role_map.get(u.id, [])) for u in users]
 
-    async def get_user(self, user_id: int, actor: AuthenticatedAccount) -> UserDetail:
+    async def get_user(self, user_id: int, actor: AuthenticatedUser) -> UserDetail:
         return await self._detail(await self._require_visible(user_id, actor))
 
     async def create_user(
-        self, payload: UserCreate, actor: AuthenticatedAccount
+        self, payload: UserCreate, actor: AuthenticatedUser
     ) -> UserDetail:
         if await self.repo.get_by_username(payload.username) is not None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
@@ -155,8 +155,9 @@ class UserService:
             status=payload.status.value,
             preferred_locale=payload.preferred_locale,
             remark=payload.remark,
-            created_by=actor.account_id,
-            updated_by=actor.account_id,
+            created_by=actor.user_id,
+            create_dept=actor.department_id,
+            updated_by=actor.user_id,
         )
         await self.repo.create(user)
         await self.repo.replace_roles(user.id, payload.role_ids)
@@ -164,7 +165,7 @@ class UserService:
         return await self._detail(user)
 
     async def update_user(
-        self, user_id: int, payload: UserUpdate, actor: AuthenticatedAccount
+        self, user_id: int, payload: UserUpdate, actor: AuthenticatedUser
     ) -> UserDetail:
         user = await self._require_visible(user_id, actor)
         values = payload.model_dump(
@@ -177,7 +178,7 @@ class UserService:
         if "department_id" in values:
             await self._validate_department(values["department_id"])
             await self._require_department_in_scope(values["department_id"], actor)
-        values["updated_by"] = actor.account_id
+        values["updated_by"] = actor.user_id
         await self.repo.update(user, **values)
 
         if payload.role_ids is not None:
@@ -188,9 +189,9 @@ class UserService:
         await self.session.commit()
         return await self._detail(user)
 
-    async def delete_user(self, user_id: int, actor: AuthenticatedAccount) -> None:
+    async def delete_user(self, user_id: int, actor: AuthenticatedUser) -> None:
         user = await self._require_visible(user_id, actor)
         await self.repo.replace_roles(user_id, [])
-        user.updated_by = actor.account_id
+        user.updated_by = actor.user_id
         await self.repo.soft_delete(user)
         await self.session.commit()

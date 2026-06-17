@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.admin.departments.schemas import DepartmentUpdate
 from src.admin.departments.service import DepartmentService
 from src.auth.service import (
-    AuthenticatedAccount,
+    AuthenticatedUser,
     AuthService,
     invalidate_department_tree,
 )
@@ -68,10 +68,10 @@ async def test_resolve_access_token_builds_principal_with_perms(
     await grant_permission(auth_session, user=user, perm="system:user:list")
     service = AuthService(auth_session)
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
-    assert account.account_id == user.id
-    assert account.has_permission("system:user:list")
-    assert not account.has_permission("system:user:remove")
+    current_user = await service.resolve_access_token(token)
+    assert current_user.user_id == user.id
+    assert current_user.has_permission("system:user:list")
+    assert not current_user.has_permission("system:user:remove")
 
 
 async def test_resolve_access_token_invalid_raises(auth_session: AsyncSession) -> None:
@@ -88,9 +88,9 @@ async def test_superuser_wildcard_grants_everything(
     await grant_permission(auth_session, user=user, perm="*:*:*")
     service = AuthService(auth_session)
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
-    assert account.is_superuser
-    assert account.has_permission("anything:at:all")
+    current_user = await service.resolve_access_token(token)
+    assert current_user.is_superuser
+    assert current_user.has_permission("anything:at:all")
 
 
 async def test_resolve_api_key_success(auth_session: AsyncSession) -> None:
@@ -107,8 +107,8 @@ async def test_resolve_api_key_success(auth_session: AsyncSession) -> None:
     )
     await auth_session.flush()
     service = AuthService(auth_session)
-    account = await service.resolve_api_key(plaintext)
-    assert account.account_id == user.id
+    current_user = await service.resolve_api_key(plaintext)
+    assert current_user.user_id == user.id
 
 
 async def test_resolve_api_key_expired_raises(auth_session: AsyncSession) -> None:
@@ -142,10 +142,10 @@ async def test_require_permission_passes_and_fails(auth_session: AsyncSession) -
     await grant_permission(auth_session, user=user, perm="system:role:add")
     service = AuthService(auth_session)
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
-    service.require_permission(account, "system:role:add")  # no raise
+    current_user = await service.resolve_access_token(token)
+    service.require_permission(current_user, "system:role:add")  # no raise
     with pytest.raises(AppError) as exc:
-        service.require_permission(account, "system:role:remove")
+        service.require_permission(current_user, "system:role:remove")
     assert exc.value.status_code == 403
 
 
@@ -155,7 +155,7 @@ async def test_require_permission_passes_and_fails(auth_session: AsyncSession) -
 async def _principal_with_role(
     session: AsyncSession, *, data_scope: str, department_id: int | None
 ) -> tuple[AuthService, int]:
-    """Seed a user with one role of the given scope; return (service, account_id)."""
+    """Seed a user with one role of the given scope; return (service, user_id)."""
     user = await seed_user(session, department_id=department_id)
     role = Role(name="ds", code="ds", data_scope=data_scope, status="active")
     session.add(role)
@@ -168,37 +168,37 @@ async def _principal_with_role(
 async def test_data_scope_no_roles_is_self_only(auth_session: AsyncSession) -> None:
     user = await seed_user(auth_session)
     service = AuthService(auth_session)
-    account = AuthenticatedAccount(
-        account_id=user.id,
+    current_user = AuthenticatedUser(
+        user_id=user.id,
         username="alice",
         department_id=None,
         permissions=frozenset({"system:user:list"}),  # not superuser
     )
-    scope = await service.resolve_data_scope(account)
+    scope = await service.resolve_data_scope(current_user)
     assert not scope.unrestricted
     assert scope.include_self
     assert scope.department_ids == frozenset()
 
 
 async def test_data_scope_all_is_unrestricted(auth_session: AsyncSession) -> None:
-    service, account_id = await _principal_with_role(
+    service, user_id = await _principal_with_role(
         auth_session, data_scope="all", department_id=1
     )
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
-    scope = await service.resolve_data_scope(account)
+    current_user = await service.resolve_access_token(token)
+    scope = await service.resolve_data_scope(current_user)
     assert scope.unrestricted
 
 
 async def test_data_scope_dept_only_includes_own_dept(
     auth_session: AsyncSession,
 ) -> None:
-    service, account_id = await _principal_with_role(
+    service, user_id = await _principal_with_role(
         auth_session, data_scope="dept", department_id=42
     )
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
-    scope = await service.resolve_data_scope(account)
+    current_user = await service.resolve_access_token(token)
+    scope = await service.resolve_data_scope(current_user)
     assert scope.department_ids == frozenset({42})
     assert not scope.unrestricted
 
@@ -220,8 +220,8 @@ async def test_data_scope_dept_and_child_includes_subtree(
         auth_session, data_scope="dept_and_child", department_id=1
     )
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
-    scope = await service.resolve_data_scope(account)
+    current_user = await service.resolve_access_token(token)
+    scope = await service.resolve_data_scope(current_user)
     assert scope.department_ids == frozenset({1, 2, 3})
     assert 9 not in scope.department_ids
 
@@ -242,22 +242,22 @@ async def test_data_scope_caches_dept_tree_until_invalidated(
         auth_session, data_scope="dept_and_child", department_id=1
     )
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
+    current_user = await service.resolve_access_token(token)
 
     # Prime the cache with the {1, 2} tree.
-    first = await service.resolve_data_scope(account)
+    first = await service.resolve_data_scope(current_user)
     assert first.department_ids == frozenset({1, 2})
 
     # Add a grandchild straight into the DB, bypassing DepartmentService (so no
     # invalidation fires). The cached tree must still be served — proves caching.
     auth_session.add(Department(id=3, name="grandchild", parent_id=2))
     await auth_session.flush()
-    stale = await service.resolve_data_scope(account)
+    stale = await service.resolve_data_scope(current_user)
     assert stale.department_ids == frozenset({1, 2})  # 3 not visible: cache hit
 
     # Invalidate (what every dept mutation does after commit) → fresh read.
     await invalidate_department_tree()
-    fresh = await service.resolve_data_scope(account)
+    fresh = await service.resolve_data_scope(current_user)
     assert fresh.department_ids == frozenset({1, 2, 3})
 
 
@@ -277,31 +277,38 @@ async def test_department_mutation_invalidates_scope_cache(
         auth_session, data_scope="dept_and_child", department_id=1
     )
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
+    current_user = await service.resolve_access_token(token)
 
-    primed = await service.resolve_data_scope(account)
+    primed = await service.resolve_data_scope(current_user)
     assert primed.department_ids == frozenset({1, 2})
 
     # Reparent dept 2 to be a sibling of root via the real service path.
     dept_service = DepartmentService(auth_session)
     await dept_service.update_department(
-        2, DepartmentUpdate(parent_id=None), actor_id=1
+        2,
+        DepartmentUpdate(parent_id=None),
+        actor=AuthenticatedUser(
+            user_id=1,
+            username="admin",
+            department_id=None,
+            permissions=frozenset({"*:*:*"}),
+        ),
     )
 
     # Cache was invalidated on commit → dept 2 no longer in dept 1's subtree.
-    after = await service.resolve_data_scope(account)
+    after = await service.resolve_data_scope(current_user)
     assert after.department_ids == frozenset({1})
 
 
-# ---- _build_principal: credential valid but account gone --------------------
+# ---- _build_user: credential valid but user gone ----------------------------
 
 
-async def test_build_principal_missing_account_raises_401(
+async def test_build_user_missing_user_raises_401(
     auth_session: AsyncSession,
 ) -> None:
     service = AuthService(auth_session)
     with pytest.raises(AppError) as exc:
-        await service._build_principal(999999)  # no such user
+        await service._build_user(999999)  # no such user
     assert exc.value.status_code == 401
 
 
@@ -325,13 +332,13 @@ async def test_data_scope_custom_includes_granted_depts(
     )
     await auth_session.flush()
     service = AuthService(auth_session)
-    account = AuthenticatedAccount(
-        account_id=user.id,
+    current_user = AuthenticatedUser(
+        user_id=user.id,
         username="alice",
         department_id=None,
         permissions=frozenset({"x:y:z"}),  # not superuser
     )
-    scope = await service.resolve_data_scope(account)
+    scope = await service.resolve_data_scope(current_user)
     assert scope.department_ids == frozenset({71, 72})
     assert not scope.unrestricted
 
@@ -344,8 +351,8 @@ async def test_data_scope_self_only_role_sets_include_self(
         auth_session, data_scope=DataScope.self_only.value, department_id=5
     )
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
-    scope = await service.resolve_data_scope(account)
+    current_user = await service.resolve_access_token(token)
+    scope = await service.resolve_data_scope(current_user)
     assert scope.include_self
     assert scope.department_ids == frozenset()
     assert not scope.unrestricted
@@ -368,8 +375,8 @@ async def test_data_scope_dept_and_child_or_self_combines(
         department_id=1,
     )
     token, _ = await service.authenticate_password("alice", "secret123")
-    account = await service.resolve_access_token(token)
-    scope = await service.resolve_data_scope(account)
+    current_user = await service.resolve_access_token(token)
+    scope = await service.resolve_data_scope(current_user)
     assert scope.department_ids == frozenset({1, 2})
     assert scope.include_self
     assert not scope.unrestricted

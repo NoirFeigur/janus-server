@@ -2,7 +2,7 @@
 
 Append-only per-call ledger (``LogEntity``): the authoritative source for
 billing, usage reports, and downgrade-rate statistics. Real-time quota counting
-lives in Redis; this table is the durable account of record.
+lives in Redis; this table is the durable user-level ledger of record.
 """
 
 from __future__ import annotations

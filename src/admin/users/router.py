@@ -2,7 +2,7 @@
 
 CRUD over users + role assignment, each gated by a ``system:user:*`` permission.
 The data-scope filter is applied inside the service using the authenticated
-actor (injected by :class:`RequiredPerms`, which returns the account). The
+actor (injected by :class:`RequiredPerms`, which returns the user). The
 service returns ``(user, role_ids)``; ``_to_read`` assembles the wire model.
 """
 
@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.admin.users.schemas import UserCreate, UserRead, UserUpdate
 from src.admin.users.service import UserDetail, UserService
 from src.auth.dependencies import RequiredPerms, TraceId
-from src.auth.service import AuthenticatedAccount
+from src.auth.service import AuthenticatedUser
 from src.db.session import get_session
 from src.responses import SuccessEnvelope, success
 
@@ -43,11 +43,11 @@ def _to_read(detail: UserDetail) -> UserRead:
 async def list_users(
     service: ServiceDep,
     trace_id: TraceId,
-    account: Annotated[AuthenticatedAccount, Depends(RequiredPerms("system:user:list"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:user:list"))],
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> SuccessEnvelope[list[UserRead]]:
-    details = await service.list_users(account, limit=limit, offset=offset)
+    details = await service.list_users(user, limit=limit, offset=offset)
     return success([_to_read(d) for d in details], trace_id=trace_id)
 
 
@@ -56,9 +56,9 @@ async def create_user(
     payload: UserCreate,
     service: ServiceDep,
     trace_id: TraceId,
-    account: Annotated[AuthenticatedAccount, Depends(RequiredPerms("system:user:add"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:user:add"))],
 ) -> SuccessEnvelope[UserRead]:
-    detail = await service.create_user(payload, account)
+    detail = await service.create_user(payload, user)
     return success(_to_read(detail), trace_id=trace_id)
 
 
@@ -68,9 +68,9 @@ async def update_user(
     payload: UserUpdate,
     service: ServiceDep,
     trace_id: TraceId,
-    account: Annotated[AuthenticatedAccount, Depends(RequiredPerms("system:user:edit"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:user:edit"))],
 ) -> SuccessEnvelope[UserRead]:
-    detail = await service.update_user(user_id, payload, account)
+    detail = await service.update_user(user_id, payload, user)
     return success(_to_read(detail), trace_id=trace_id)
 
 
@@ -79,9 +79,9 @@ async def delete_user(
     user_id: int,
     service: ServiceDep,
     trace_id: TraceId,
-    account: Annotated[
-        AuthenticatedAccount, Depends(RequiredPerms("system:user:remove"))
+    user: Annotated[
+        AuthenticatedUser, Depends(RequiredPerms("system:user:remove"))
     ],
 ) -> SuccessEnvelope[None]:
-    await service.delete_user(user_id, account)
+    await service.delete_user(user_id, user)
     return success(None, trace_id=trace_id)

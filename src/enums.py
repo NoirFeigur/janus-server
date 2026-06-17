@@ -13,8 +13,8 @@ class UsageStatus(StrEnum):
 
 
 class UserStatus(StrEnum):
-    active = "active"  # Active employee account.
-    disabled = "disabled"  # Disabled or departed employee account.
+    active = "active"  # Active employee user.
+    disabled = "disabled"  # Disabled or departed employee user.
 
 
 class OAuthSource(StrEnum):
@@ -76,7 +76,7 @@ class QuotaMetric(StrEnum):
 
 class ErrorCode(StrEnum):
     auth_invalid_token = "auth.invalid_token"  # JWT or sk-key is invalid or expired.
-    auth_account_disabled = "auth.account_disabled"  # Authenticated account is disabled.
+    auth_user_disabled = "auth.user_disabled"  # Authenticated user is disabled.
     auth_forbidden = "auth.forbidden"  # Authenticated principal lacks permission.
     model_not_granted = "model.not_granted"  # Principal is not granted the logical model.
     model_not_found = "model.not_found"  # Logical model does not exist or is disabled.

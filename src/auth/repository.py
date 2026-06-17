@@ -66,8 +66,8 @@ class AuthRepository:
         api_key: ApiKey | None = await self.session.scalar(stmt)
         return api_key
 
-    async def list_permission_codes(self, account_id: int) -> frozenset[str]:
-        """Aggregate the account's effective permission codes in one query.
+    async def list_permission_codes(self, user_id: int) -> frozenset[str]:
+        """Aggregate the user's effective permission codes in one query.
 
         Walk user → roles → menus, collecting ``Menu.perms``. Filters active +
         non-deleted on Role/Menu (link tables have no such columns). Menus with a
@@ -79,7 +79,7 @@ class AuthRepository:
             .join(RoleMenu, RoleMenu.menu_id == Menu.id)
             .join(Role, Role.id == RoleMenu.role_id)
             .join(UserRole, UserRole.role_id == Role.id)
-            .where(UserRole.user_id == account_id)
+            .where(UserRole.user_id == user_id)
             .where(Role.is_deleted.is_(False))
             .where(Role.status == ActiveStatus.active.value)
             .where(Menu.is_deleted.is_(False))
@@ -96,7 +96,7 @@ class AuthRepository:
 
         Used by the user-admin layer to enforce that an actor cannot assign a
         role granting permissions the actor does not itself hold (privilege-
-        escalation guard). Same active/not-deleted filters as the per-account
+        escalation guard). Same active/not-deleted filters as the per-user
         aggregation; the link table (RoleMenu) is not filtered (no is_deleted).
         """
         if not role_ids:
@@ -115,12 +115,12 @@ class AuthRepository:
         result = await self.session.scalars(stmt)
         return frozenset(code for code in result.all() if code)
 
-    async def list_active_roles(self, account_id: int) -> Sequence[Role]:
-        """Account's active, non-deleted roles (for data-scope resolution)."""
+    async def list_active_roles(self, user_id: int) -> Sequence[Role]:
+        """User's active, non-deleted roles (for data-scope resolution)."""
         stmt = (
             select(Role)
             .join(UserRole, UserRole.role_id == Role.id)
-            .where(UserRole.user_id == account_id)
+            .where(UserRole.user_id == user_id)
             .where(Role.is_deleted.is_(False))
             .where(Role.status == ActiveStatus.active.value)
         )

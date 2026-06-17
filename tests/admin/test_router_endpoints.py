@@ -24,16 +24,16 @@ from src.admin.roles.service import RoleService
 from src.admin.users import router as user_router
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.admin.users.service import UserService
-from src.auth.service import AuthenticatedAccount
+from src.auth.service import AuthenticatedUser
 
 pytestmark = pytest.mark.asyncio
 
 TRACE = "trace-xyz"
 
 
-def _actor() -> AuthenticatedAccount:
-    return AuthenticatedAccount(
-        account_id=1000,
+def _actor() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=1000,
         username="admin",
         department_id=None,
         permissions=frozenset({"*:*:*"}),

@@ -19,6 +19,7 @@ from starlette import status
 from src.admin.departments.repository import DepartmentRepository
 from src.admin.departments.schemas import DepartmentCreate, DepartmentUpdate
 from src.auth.dept_tree_cache import invalidate_department_tree
+from src.auth.service import AuthenticatedUser
 from src.db.models.identity import Department
 from src.enums import ErrorCode
 from src.exceptions import AppError
@@ -46,7 +47,7 @@ class DepartmentService:
         return await self._require(dept_id)
 
     async def create_department(
-        self, payload: DepartmentCreate, *, actor_id: int
+        self, payload: DepartmentCreate, *, actor: AuthenticatedUser
     ) -> Department:
         await self._require_parent_exists(payload.parent_id)
         dept = Department(
@@ -54,8 +55,9 @@ class DepartmentService:
             parent_id=payload.parent_id,
             sort_order=payload.sort_order,
             remark=payload.remark,
-            created_by=actor_id,
-            updated_by=actor_id,
+            created_by=actor.user_id,
+            create_dept=actor.department_id,
+            updated_by=actor.user_id,
         )
         await self.repo.create(dept)
         await self.session.commit()
@@ -63,25 +65,25 @@ class DepartmentService:
         return dept
 
     async def update_department(
-        self, dept_id: int, payload: DepartmentUpdate, *, actor_id: int
+        self, dept_id: int, payload: DepartmentUpdate, *, actor: AuthenticatedUser
     ) -> Department:
         dept = await self._require(dept_id)
         values = payload.model_dump(exclude_unset=True)
         if "parent_id" in values:
             await self._validate_reparent(dept_id, values["parent_id"])
-        values["updated_by"] = actor_id
+        values["updated_by"] = actor.user_id
         await self.repo.update(dept, **values)
         await self.session.commit()
         await invalidate_department_tree()
         return dept
 
-    async def delete_department(self, dept_id: int, *, actor_id: int) -> None:
+    async def delete_department(self, dept_id: int, *, actor: AuthenticatedUser) -> None:
         dept = await self._require(dept_id)
         if await self.repo.has_active_children(dept_id):
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
         if await self.repo.has_active_members(dept_id):
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
-        dept.updated_by = actor_id
+        dept.updated_by = actor.user_id
         await self.repo.soft_delete(dept)
         await self.session.commit()
         await invalidate_department_tree()

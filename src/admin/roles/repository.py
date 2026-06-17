@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
+from sqlalchemy.sql.elements import ColumnElement
 
+from src.auth.service import DataScopeFilter
 from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, UserRole
 from src.db.repository import BaseRepository
 
@@ -26,6 +28,43 @@ class RoleRepository(BaseRepository[Role]):
         )
         role: Role | None = await self.session.scalar(stmt)
         return role
+
+    def _scope_predicate(
+        self, scope: DataScopeFilter, *, actor_id: int
+    ) -> ColumnElement[bool] | None:
+        """Build the generic management-resource data-scope predicate."""
+        if scope.unrestricted:
+            return None
+        clauses: list[ColumnElement[bool]] = []
+        if scope.department_ids:
+            clauses.append(Role.create_dept.in_(scope.department_ids))
+        if scope.include_self:
+            clauses.append(Role.created_by == actor_id)
+        if not clauses:
+            return Role.id == -1
+        return or_(*clauses)
+
+    async def list_in_scope(
+        self,
+        scope: DataScopeFilter,
+        *,
+        actor_id: int,
+    ) -> Sequence[Role]:
+        """List non-deleted roles visible under generic data scope."""
+        stmt = select(Role).where(Role.is_deleted.is_(False))
+        predicate = self._scope_predicate(scope, actor_id=actor_id)
+        if predicate is not None:
+            stmt = stmt.where(predicate)
+        result = await self.session.scalars(stmt)
+        return result.all()
+
+    def is_visible(self, role: Role, scope: DataScopeFilter, *, actor_id: int) -> bool:
+        """In-Python scope check for one role."""
+        if scope.unrestricted:
+            return True
+        if role.create_dept is not None and role.create_dept in scope.department_ids:
+            return True
+        return bool(scope.include_self and role.created_by == actor_id)
 
     async def list_menu_ids(self, role_id: int) -> list[int]:
         """Menu ids currently granted to the role."""

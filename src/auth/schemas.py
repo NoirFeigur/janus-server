@@ -1,7 +1,7 @@
 """Auth domain DTOs (router layer contracts).
 
 Request/response shapes for the auth endpoints. Wire-facing models only — the
-service layer speaks domain objects (``AuthenticatedAccount``), these are the
+service layer speaks domain objects (``AuthenticatedUser``), these are the
 HTTP boundary.
 
 ``UserRead`` never carries ``password`` (§0.8 iron rule): the column stores a
@@ -34,12 +34,12 @@ class TokenRead(BaseModel):
 class CurrentUserRead(BaseModel):
     """The authenticated principal's own profile + effective permissions.
 
-    Snowflake ids are serialized as **strings** (``account_id``/``department_id``):
+    Snowflake ids are serialized as **strings** (``user_id``/``department_id``):
     they are int64 and the janus-web client is JS, whose ``Number`` loses
     precision past 2^53. String on the wire is the project-wide id convention.
     """
 
-    account_id: str
+    user_id: str
     username: str
     department_id: str | None
     permissions: list[str]  # Sorted effective permission codes (``*:*:*`` = admin).

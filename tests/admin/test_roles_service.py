@@ -16,13 +16,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.roles.schemas import RoleCreate, RoleUpdate
 from src.admin.roles.service import RoleService
-from src.db.models.identity import Menu, RoleDept, RoleMenu, UserRole
+from src.auth.service import AuthenticatedUser
+from src.db.models.identity import Menu, Role, RoleDept, RoleMenu, UserRole
 from src.enums import DataScope
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
 
-ACTOR = 1000
+ACTOR_ID = 1000
+
+
+def _actor(
+    *,
+    user_id: int = ACTOR_ID,
+    department_id: int | None = 10,
+    permissions: set[str] | None = None,
+) -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=user_id,
+        username="admin",
+        department_id=department_id,
+        permissions=frozenset(permissions or {"*:*:*"}),
+    )
 
 
 async def _seed_menu(session: AsyncSession, perm: str) -> int:
@@ -36,18 +51,20 @@ async def test_create_role_with_menus(admin_session: AsyncSession) -> None:
     menu_id = await _seed_menu(admin_session, "system:user:list")
     svc = RoleService(admin_session)
     role, menu_ids, dept_ids = await svc.create_role(
-        RoleCreate(name="Viewer", code="viewer", menu_ids=[menu_id]), actor_id=ACTOR
+        RoleCreate(name="Viewer", code="viewer", menu_ids=[menu_id]), actor=_actor()
     )
     assert role.code == "viewer"
+    assert role.created_by == ACTOR_ID
+    assert role.create_dept == 10
     assert menu_ids == [menu_id]
     assert dept_ids == []
 
 
 async def test_create_role_duplicate_code_rejected(admin_session: AsyncSession) -> None:
     svc = RoleService(admin_session)
-    await svc.create_role(RoleCreate(name="R", code="dup"), actor_id=ACTOR)
+    await svc.create_role(RoleCreate(name="R", code="dup"), actor=_actor())
     with pytest.raises(AppError) as exc:
-        await svc.create_role(RoleCreate(name="R2", code="dup"), actor_id=ACTOR)
+        await svc.create_role(RoleCreate(name="R2", code="dup"), actor=_actor())
     assert exc.value.status_code == 400
 
 
@@ -55,7 +72,7 @@ async def test_create_role_unknown_menu_rejected(admin_session: AsyncSession) ->
     svc = RoleService(admin_session)
     with pytest.raises(AppError) as exc:
         await svc.create_role(
-            RoleCreate(name="Bad", code="bad", menu_ids=[88888]), actor_id=ACTOR
+            RoleCreate(name="Bad", code="bad", menu_ids=[88888]), actor=_actor()
         )
     assert exc.value.status_code == 400
 
@@ -77,7 +94,7 @@ async def test_create_custom_scope_role_with_depts(
             data_scope=DataScope.custom,
             dept_ids=[111, 222],
         ),
-        actor_id=ACTOR,
+        actor=_actor(),
     )
     assert set(dept_ids) == {111, 222}
 
@@ -94,7 +111,7 @@ async def test_create_custom_scope_unknown_dept_rejected(
                 data_scope=DataScope.custom,
                 dept_ids=[99999],
             ),
-            actor_id=ACTOR,
+            actor=_actor(),
         )
     assert exc.value.status_code == 400
 
@@ -108,7 +125,7 @@ async def test_create_custom_scope_role_empty_depts(
         RoleCreate(
             name="EmptyCustom", code="emptycustom", data_scope=DataScope.custom
         ),
-        actor_id=ACTOR,
+        actor=_actor(),
     )
     assert dept_ids == []
 
@@ -116,7 +133,7 @@ async def test_create_custom_scope_role_empty_depts(
 async def test_get_role_not_found_raises(admin_session: AsyncSession) -> None:
     svc = RoleService(admin_session)
     with pytest.raises(AppError) as exc:
-        await svc.get_role(123456)
+        await svc.get_role(123456, _actor())
     assert exc.value.status_code == 404
 
 
@@ -125,10 +142,10 @@ async def test_update_role_replaces_menus(admin_session: AsyncSession) -> None:
     m2 = await _seed_menu(admin_session, "system:user:add")
     svc = RoleService(admin_session)
     role, _, _ = await svc.create_role(
-        RoleCreate(name="R", code="rr", menu_ids=[m1]), actor_id=ACTOR
+        RoleCreate(name="R", code="rr", menu_ids=[m1]), actor=_actor()
     )
     _, menu_ids, _ = await svc.update_role(
-        role.id, RoleUpdate(menu_ids=[m2]), actor_id=ACTOR
+        role.id, RoleUpdate(menu_ids=[m2]), actor=_actor()
     )
     assert menu_ids == [m2]
 
@@ -136,10 +153,10 @@ async def test_update_role_replaces_menus(admin_session: AsyncSession) -> None:
 async def test_update_role_unknown_menu_rejected(admin_session: AsyncSession) -> None:
     svc = RoleService(admin_session)
     role, _, _ = await svc.create_role(
-        RoleCreate(name="R", code="rmenu"), actor_id=ACTOR
+        RoleCreate(name="R", code="rmenu"), actor=_actor()
     )
     with pytest.raises(AppError) as exc:
-        await svc.update_role(role.id, RoleUpdate(menu_ids=[55555]), actor_id=ACTOR)
+        await svc.update_role(role.id, RoleUpdate(menu_ids=[55555]), actor=_actor())
     assert exc.value.status_code == 400
 
 
@@ -153,12 +170,12 @@ async def test_leaving_custom_scope_clears_depts(admin_session: AsyncSession) ->
         RoleCreate(
             name="C", code="cc", data_scope=DataScope.custom, dept_ids=[111]
         ),
-        actor_id=ACTOR,
+        actor=_actor(),
     )
     assert dept_ids == [111]
     # Switch away from custom → dept grants must be cleared.
     _, _, after = await svc.update_role(
-        role.id, RoleUpdate(data_scope=DataScope.dept_only), actor_id=ACTOR
+        role.id, RoleUpdate(data_scope=DataScope.dept_only), actor=_actor()
     )
     assert after == []
     remaining = await admin_session.scalars(
@@ -179,10 +196,10 @@ async def test_update_custom_scope_replaces_depts(admin_session: AsyncSession) -
         RoleCreate(
             name="Cust", code="custupd", data_scope=DataScope.custom, dept_ids=[300]
         ),
-        actor_id=ACTOR,
+        actor=_actor(),
     )
     _, _, dept_ids = await svc.update_role(
-        role.id, RoleUpdate(dept_ids=[301]), actor_id=ACTOR
+        role.id, RoleUpdate(dept_ids=[301]), actor=_actor()
     )
     assert dept_ids == [301]
 
@@ -193,7 +210,7 @@ async def test_delete_role_cascades_links(admin_session: AsyncSession) -> None:
     m1 = await _seed_menu(admin_session, "system:role:list")
     svc = RoleService(admin_session)
     role, _, _ = await svc.create_role(
-        RoleCreate(name="Doomed", code="doomed", menu_ids=[m1]), actor_id=ACTOR
+        RoleCreate(name="Doomed", code="doomed", menu_ids=[m1]), actor=_actor()
     )
     # Assign the role to a user so the delete cascade has something to clear.
     admin_session.add(
@@ -202,11 +219,11 @@ async def test_delete_role_cascades_links(admin_session: AsyncSession) -> None:
     admin_session.add(UserRole(user_id=5555, role_id=role.id))
     await admin_session.commit()
 
-    await svc.delete_role(role.id, actor_id=ACTOR)
+    await svc.delete_role(role.id, actor=_actor())
 
     # Soft-deleted role no longer fetchable; all link rows physically gone.
     with pytest.raises(AppError):
-        await svc.get_role(role.id)
+        await svc.get_role(role.id, _actor())
     menus = await admin_session.scalars(
         select(RoleMenu.menu_id).where(RoleMenu.role_id == role.id)
     )
@@ -220,7 +237,7 @@ async def test_delete_role_cascades_links(admin_session: AsyncSession) -> None:
 async def test_delete_role_not_found_raises(admin_session: AsyncSession) -> None:
     svc = RoleService(admin_session)
     with pytest.raises(AppError) as exc:
-        await svc.delete_role(999999, actor_id=ACTOR)
+        await svc.delete_role(999999, actor=_actor())
     assert exc.value.status_code == 404
 
 
@@ -228,10 +245,52 @@ async def test_list_roles_bulk_grants(admin_session: AsyncSession) -> None:
     m1 = await _seed_menu(admin_session, "a:b:c")
     svc = RoleService(admin_session)
     await svc.create_role(
-        RoleCreate(name="R1", code="r1", menu_ids=[m1]), actor_id=ACTOR
+        RoleCreate(name="R1", code="r1", menu_ids=[m1]), actor=_actor()
     )
-    await svc.create_role(RoleCreate(name="R2", code="r2"), actor_id=ACTOR)
-    listing = await svc.list_roles()
+    await svc.create_role(RoleCreate(name="R2", code="r2"), actor=_actor())
+    listing = await svc.list_roles(_actor())
     by_code = {r.code: (menus, depts) for r, menus, depts in listing}
     assert by_code["r1"][0] == [m1]
     assert by_code["r2"][0] == []  # role with no menus defaults to empty list
+
+
+async def test_scoped_actor_only_sees_roles_in_scope(
+    admin_session: AsyncSession,
+) -> None:
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:list"})
+    visible = Role(
+        name="visible",
+        code="visible",
+        data_scope="self",
+        status="active",
+        created_by=123,
+        create_dept=10,
+    )
+    own = Role(
+        name="own",
+        code="own",
+        data_scope="self",
+        status="active",
+        created_by=2000,
+        create_dept=None,
+    )
+    hidden = Role(
+        name="hidden",
+        code="hidden",
+        data_scope="self",
+        status="active",
+        created_by=9999,
+        create_dept=99,
+    )
+    scope_role = Role(name="scope", code="scope", data_scope="dept", status="active")
+    admin_session.add_all([visible, own, hidden, scope_role])
+    await admin_session.flush()
+    admin_session.add(UserRole(user_id=2000, role_id=scope_role.id))
+    await admin_session.commit()
+
+    svc = RoleService(admin_session)
+    listing = await svc.list_roles(actor)
+    assert {role.code for role, _, _ in listing} == {"visible"}
+    with pytest.raises(AppError) as exc:
+        await svc.delete_role(hidden.id, actor=actor)
+    assert exc.value.status_code == 403

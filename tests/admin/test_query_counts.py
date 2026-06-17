@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import (
 
 from src.admin.roles.service import RoleService
 from src.admin.users.service import UserService
-from src.auth.service import AuthenticatedAccount
+from src.auth.service import AuthenticatedUser
 from src.db.base import Base
 from src.db.models.credential import ApiKey
 from src.db.models.identity import (
@@ -114,9 +114,9 @@ async def _seed_roles_with_grants(
     await session.flush()
 
 
-def _superuser() -> AuthenticatedAccount:
-    return AuthenticatedAccount(
-        account_id=999,
+def _superuser() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=999,
         username="root",
         department_id=None,
         permissions=frozenset({"*:*:*"}),  # unrestricted scope, no scope queries
@@ -158,15 +158,16 @@ async def test_list_roles_query_count_is_constant(
     """list_roles must issue the same number of SELECTs for 2 roles as for 5
     (menu + dept ids each fetched in one bulk query, not two-per-role)."""
     service = RoleService(db_session)
+    actor = _superuser()
 
     await _seed_roles_with_grants(db_session, 2)
     with count_selects(sqlite_engine) as small:
-        result_small = await service.list_roles()
+        result_small = await service.list_roles(actor)
     assert len(result_small) == 2
 
     await _seed_roles_with_grants(db_session, 3, start=2)
     with count_selects(sqlite_engine) as large:
-        result_large = await service.list_roles()
+        result_large = await service.list_roles(actor)
     assert len(result_large) == 5
 
     assert small[0] == large[0], (

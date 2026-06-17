@@ -8,13 +8,14 @@ from sqlalchemy import text
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.admin.router import router as admin_router
+from src.auth.middleware import AuthMiddleware
 from src.auth.router import router as auth_router
 from src.config import get_settings
 from src.core.i18n.middleware import LocaleMiddleware
 from src.core.logging import bind_trace_id, clear_context, configure_logging, get_logger
 from src.core.redis import close_redis
 from src.core.redis import ping as redis_ping
-from src.db.session import engine
+from src.db.session import async_session_factory, engine
 from src.exceptions import register_exception_handlers
 from src.gateway.router import router as gateway_router
 
@@ -54,7 +55,10 @@ class TraceIdMiddleware(BaseHTTPMiddleware):
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
+    app.state.session_factory = async_session_factory
+    app.state.api_prefix = settings.api_prefix
 
+    app.add_middleware(AuthMiddleware)
     app.add_middleware(TraceIdMiddleware)
     app.add_middleware(LocaleMiddleware)
     register_exception_handlers(app)

@@ -15,6 +15,7 @@ from starlette import status
 
 from src.admin.roles.repository import RoleRepository
 from src.admin.roles.schemas import RoleCreate, RoleUpdate
+from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.db.models.identity import Role
 from src.enums import DataScope, ErrorCode
 from src.exceptions import AppError
@@ -26,11 +27,22 @@ class RoleService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.repo = RoleRepository(session)
+        self.auth = AuthService(session)
+
+    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
+        return await self.auth.resolve_data_scope(actor)
 
     async def _require(self, role_id: int) -> Role:
         role = await self.repo.get(role_id)
         if role is None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_404_NOT_FOUND)
+        return role
+
+    async def _require_visible(self, role_id: int, actor: AuthenticatedUser) -> Role:
+        role = await self._require(role_id)
+        scope = await self._scope(actor)
+        if not self.repo.is_visible(role, scope, actor_id=actor.user_id):
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
         return role
 
     async def _validate_menus(self, menu_ids: Sequence[int]) -> None:
@@ -52,8 +64,9 @@ class RoleService:
         dept_ids = await self.repo.list_dept_ids(role.id)
         return role, menu_ids, dept_ids
 
-    async def list_roles(self) -> list[RoleDetail]:
-        roles = await self.repo.list()
+    async def list_roles(self, actor: AuthenticatedUser) -> list[RoleDetail]:
+        scope = await self._scope(actor)
+        roles = await self.repo.list_in_scope(scope, actor_id=actor.user_id)
         # Two bulk lookups for the whole page (was 1+2R: two queries per role).
         role_ids = [role.id for role in roles]
         menu_map = await self.repo.list_menu_ids_for_roles(role_ids)
@@ -63,10 +76,10 @@ class RoleService:
             for role in roles
         ]
 
-    async def get_role(self, role_id: int) -> RoleDetail:
-        return await self._detail(await self._require(role_id))
+    async def get_role(self, role_id: int, actor: AuthenticatedUser) -> RoleDetail:
+        return await self._detail(await self._require_visible(role_id, actor))
 
-    async def create_role(self, payload: RoleCreate, *, actor_id: int) -> RoleDetail:
+    async def create_role(self, payload: RoleCreate, *, actor: AuthenticatedUser) -> RoleDetail:
         if await self.repo.get_by_code(payload.code) is not None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
         await self._validate_menus(payload.menu_ids)
@@ -77,8 +90,9 @@ class RoleService:
             sort_order=payload.sort_order,
             status=payload.status.value,
             remark=payload.remark,
-            created_by=actor_id,
-            updated_by=actor_id,
+            created_by=actor.user_id,
+            create_dept=actor.department_id,
+            updated_by=actor.user_id,
         )
         await self.repo.create(role)
         await self.repo.replace_menus(role.id, payload.menu_ids)
@@ -89,15 +103,15 @@ class RoleService:
         return await self._detail(role)
 
     async def update_role(
-        self, role_id: int, payload: RoleUpdate, *, actor_id: int
+        self, role_id: int, payload: RoleUpdate, *, actor: AuthenticatedUser
     ) -> RoleDetail:
-        role = await self._require(role_id)
+        role = await self._require_visible(role_id, actor)
         scalar_values = payload.model_dump(
             exclude_unset=True, exclude={"menu_ids", "dept_ids", "data_scope"}
         )
         if payload.data_scope is not None:
             scalar_values["data_scope"] = payload.data_scope.value
-        scalar_values["updated_by"] = actor_id
+        scalar_values["updated_by"] = actor.user_id
         await self.repo.update(role, **scalar_values)
 
         if payload.menu_ids is not None:
@@ -119,13 +133,13 @@ class RoleService:
         await self.session.commit()
         return await self._detail(role)
 
-    async def delete_role(self, role_id: int, *, actor_id: int) -> None:
-        role = await self._require(role_id)
+    async def delete_role(self, role_id: int, *, actor: AuthenticatedUser) -> None:
+        role = await self._require_visible(role_id, actor)
         # Drop all association rows (physical) — including user assignments so no
         # stale role id lingers on users — then soft-delete the role itself.
         await self.repo.replace_menus(role_id, [])
         await self.repo.replace_depts(role_id, [])
         await self.repo.delete_user_links(role_id)
-        role.updated_by = actor_id
+        role.updated_by = actor.user_id
         await self.repo.soft_delete(role)
         await self.session.commit()

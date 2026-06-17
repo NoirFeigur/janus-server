@@ -145,7 +145,7 @@ def rsa_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[Settings]:
 
 
 def test_issue_then_decode_roundtrip(rsa_settings: Settings) -> None:
-    token, ttl = issue_access_token(account_id=12345)
+    token, ttl = issue_access_token(user_id=12345)
     assert ttl == 3600
     claims = decode_access_token(token)
     assert isinstance(claims, PlatformAccessClaims)
@@ -158,7 +158,7 @@ def test_issue_without_private_key_raises(monkeypatch: pytest.MonkeyPatch) -> No
     settings = get_settings()
     monkeypatch.setattr(settings, "platform_jwt_private_key", None)
     with pytest.raises(TokenError):
-        issue_access_token(account_id=1)
+        issue_access_token(user_id=1)
 
 
 def test_decode_expired_token_raises(rsa_settings: Settings) -> None:
@@ -190,7 +190,7 @@ def test_decode_wrong_token_use_raises(rsa_settings: Settings) -> None:
 
 
 def test_decode_tampered_token_raises(rsa_settings: Settings) -> None:
-    token, _ = issue_access_token(account_id=1)
+    token, _ = issue_access_token(user_id=1)
     tampered = token[:-4] + ("AAAA" if not token.endswith("AAAA") else "BBBB")
     with pytest.raises(TokenError):
         decode_access_token(tampered)
@@ -272,7 +272,7 @@ def test_decode_uses_configured_public_key(
     monkeypatch.setattr(settings, "platform_jwt_public_key", pub_pem)  # 配置公钥分支
     monkeypatch.setattr(settings, "platform_access_token_ttl_seconds", 3600)
 
-    token, _ = issue_access_token(account_id=7)
+    token, _ = issue_access_token(user_id=7)
     claims = decode_access_token(token)
     assert claims.sub == "7"
 
@@ -288,7 +288,7 @@ def test_issue_with_invalid_private_key_raises(
         SecretStr("-----BEGIN PRIVATE KEY-----\nnot-a-valid-key\n-----END PRIVATE KEY-----"),
     )
     with pytest.raises(TokenError):
-        issue_access_token(account_id=1)
+        issue_access_token(user_id=1)
 
 
 def test_decode_non_dict_payload_raises(
@@ -299,7 +299,7 @@ def test_decode_non_dict_payload_raises(
     正常 JWT 规范下 payload 必是对象,pyjwt 也会拦截非对象 payload;这里直接
     打桩 ``jwt.decode`` 返回一个列表,验证服务层的 isinstance 守卫确实生效。
     """
-    token, _ = issue_access_token(account_id=1)
+    token, _ = issue_access_token(user_id=1)
     monkeypatch.setattr(
         security.jwt, "decode", lambda *_a, **_k: ["not", "a", "dict"]
     )

@@ -19,7 +19,7 @@ from src.admin.departments.schemas import (
 )
 from src.admin.departments.service import DepartmentService
 from src.auth.dependencies import RequiredPerms, TraceId
-from src.auth.service import AuthenticatedAccount
+from src.auth.service import AuthenticatedUser
 from src.db.session import get_session
 from src.responses import SuccessEnvelope, success
 
@@ -39,7 +39,7 @@ ServiceDep = Annotated[DepartmentService, Depends(get_department_service)]
 async def list_departments(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedAccount, Depends(RequiredPerms("system:dept:list"))],
+    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:dept:list"))],
 ) -> SuccessEnvelope[list[DepartmentRead]]:
     departments = await service.list_departments()
     return success(
@@ -52,9 +52,9 @@ async def create_department(
     payload: DepartmentCreate,
     service: ServiceDep,
     trace_id: TraceId,
-    account: Annotated[AuthenticatedAccount, Depends(RequiredPerms("system:dept:add"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:dept:add"))],
 ) -> SuccessEnvelope[DepartmentRead]:
-    dept = await service.create_department(payload, actor_id=account.account_id)
+    dept = await service.create_department(payload, actor=user)
     return success(DepartmentRead.model_validate(dept), trace_id=trace_id)
 
 
@@ -64,9 +64,9 @@ async def update_department(
     payload: DepartmentUpdate,
     service: ServiceDep,
     trace_id: TraceId,
-    account: Annotated[AuthenticatedAccount, Depends(RequiredPerms("system:dept:edit"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:dept:edit"))],
 ) -> SuccessEnvelope[DepartmentRead]:
-    dept = await service.update_department(dept_id, payload, actor_id=account.account_id)
+    dept = await service.update_department(dept_id, payload, actor=user)
     return success(DepartmentRead.model_validate(dept), trace_id=trace_id)
 
 
@@ -75,9 +75,9 @@ async def delete_department(
     dept_id: int,
     service: ServiceDep,
     trace_id: TraceId,
-    account: Annotated[
-        AuthenticatedAccount, Depends(RequiredPerms("system:dept:remove"))
+    user: Annotated[
+        AuthenticatedUser, Depends(RequiredPerms("system:dept:remove"))
     ],
 ) -> SuccessEnvelope[None]:
-    await service.delete_department(dept_id, actor_id=account.account_id)
+    await service.delete_department(dept_id, actor=user)
     return success(None, trace_id=trace_id)

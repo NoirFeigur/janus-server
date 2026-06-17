@@ -121,7 +121,7 @@ class PlatformAccessClaims(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    sub: str  # 账户 id(字符串形式)
+    sub: str  # sys_user.id (stringified)
     iat: int  # 签发时刻(unix 秒)
     exp: int  # 过期时刻(unix 秒)
     token_use: str  # 固定 "access";为 M6 加 refresh 留前向兼容判别位
@@ -154,13 +154,13 @@ def _load_public_key_pem() -> str:
     return public_pem.decode("utf-8")
 
 
-def issue_access_token(account_id: int) -> tuple[str, int]:
-    """为账户签发 access token,返回 (token, 有效秒数)。RS256 私钥签名。"""
+def issue_access_token(user_id: int) -> tuple[str, int]:
+    """为用户签发 access token,返回 (token, 有效秒数)。RS256 私钥签名。"""
     settings = get_settings()
     ttl = settings.platform_access_token_ttl_seconds
     now = int(time.time())
     claims = {
-        "sub": str(account_id),
+        "sub": str(user_id),
         "iat": now,
         "exp": now + ttl,
         "token_use": "access",

@@ -1,17 +1,8 @@
 """Auth FastAPI dependencies (README: router layer wiring).
 
-Bridges HTTP → the auth domain. Extracts the bearer credential, resolves it to
-an :class:`AuthenticatedAccount` via :class:`AuthService`, and exposes a
-permission-gate factory for routes.
-
-Two credential surfaces share one resolution path:
-- **Platform JWT** (admin console) — ``Authorization: Bearer <jwt>``.
-- **sk-key** (programmatic) — ``Authorization: Bearer sk-...`` or the
-  ``X-API-Key`` header. The ``sk-`` prefix routes to sk-key resolution.
-
-``RequiredPerms("system:user:add")`` is the gate factory: it depends on the
-current account and raises 403 (``auth_forbidden``) unless the permission is
-held (super-admin ``*:*:*`` bypasses).
+Bridges HTTP → the auth domain. The admin console uses JWT-only dependencies;
+gateway/MCP can opt into the broader JWT-or-sk-key dependency. ``RequiredPerms``
+is the admin gate factory and therefore always uses a JWT user.
 """
 
 from __future__ import annotations
@@ -22,12 +13,11 @@ from fastapi import Depends, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
-from src.auth.service import AuthenticatedAccount, AuthService
+from src.auth.credentials import CredentialKind, extract_credential
+from src.auth.service import AuthenticatedUser, AuthService
 from src.db.session import get_session
 from src.enums import ErrorCode
 from src.exceptions import AppError
-
-_SK_PREFIX = "sk-"
 
 
 def get_auth_service(
@@ -37,37 +27,42 @@ def get_auth_service(
     return AuthService(session)
 
 
-def _extract_credential(
-    authorization: str | None, x_api_key: str | None
-) -> tuple[str, bool]:
-    """Pull the raw credential and whether it's an sk-key.
-
-    Precedence: ``X-API-Key`` (always sk-key) → ``Authorization: Bearer``. A
-    bearer value starting with ``sk-`` is treated as an sk-key, otherwise a JWT.
-    Missing/malformed → 401.
-    """
-    if x_api_key:
-        return x_api_key, True
-    if authorization:
-        scheme, _, value = authorization.partition(" ")
-        if scheme.lower() == "bearer" and value:
-            return value, value.startswith(_SK_PREFIX)
-    raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
-
-
-async def get_current_account(
+async def get_current_user(
     service: Annotated[AuthService, Depends(get_auth_service)],
     authorization: Annotated[str | None, Header()] = None,
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
-) -> AuthenticatedAccount:
-    """Resolve the request's credential to an authenticated principal (401 else)."""
-    credential, is_api_key = _extract_credential(authorization, x_api_key)
-    if is_api_key:
-        return await service.resolve_api_key(credential)
-    return await service.resolve_access_token(credential)
+) -> AuthenticatedUser:
+    """Resolve JWT or sk-key to a user (gateway/MCP surface)."""
+    credential = extract_credential(authorization, x_api_key, allow_api_key=True)
+    if credential.kind == CredentialKind.api_key:
+        return await service.resolve_api_key(credential.value)
+    return await service.resolve_access_token(credential.value)
 
 
-CurrentAccount = Annotated[AuthenticatedAccount, Depends(get_current_account)]
+async def get_current_jwt_user(
+    request: Request,
+    service: Annotated[AuthService, Depends(get_auth_service)],
+    authorization: Annotated[str | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+) -> AuthenticatedUser:
+    """Resolve the current admin user.
+
+    Admin routes intentionally reject sk-key credentials. The middleware usually
+    pre-populates ``request.state.user``; the header fallback keeps direct
+    dependency calls and tests simple.
+    """
+    state_user = getattr(request.state, "user", None)
+    if isinstance(state_user, AuthenticatedUser):
+        if state_user.credential_kind == CredentialKind.api_key:
+            raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
+        return state_user
+
+    credential = extract_credential(authorization, x_api_key, allow_api_key=False)
+    return await service.resolve_access_token(credential.value)
+
+
+CurrentUser = Annotated[AuthenticatedUser, Depends(get_current_user)]
+CurrentJwtUser = Annotated[AuthenticatedUser, Depends(get_current_jwt_user)]
 
 
 def get_trace_id(request: Request) -> str:
@@ -87,13 +82,13 @@ class RequiredPerms:
         @router.post("/users", dependencies=[Depends(RequiredPerms("system:user:add"))])
 
     Super-admin (``*:*:*``) bypasses; lacking the code raises 403
-    (``auth_forbidden``). Returns the account so routes can also inject it.
+    (``auth_forbidden``). Returns the user so routes can also inject it.
     """
 
     def __init__(self, permission: str) -> None:
         self.permission = permission
 
-    async def __call__(self, account: CurrentAccount) -> AuthenticatedAccount:
-        if not account.has_permission(self.permission):
+    async def __call__(self, user: CurrentJwtUser) -> AuthenticatedUser:
+        if not user.has_permission(self.permission):
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-        return account
+        return user

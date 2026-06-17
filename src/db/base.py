@@ -3,7 +3,7 @@
 - ``Base``       — the single declarative base; Alembic autogenerate scans its
   ``metadata``.
 - ``BaseEntity`` — config/business tables: snowflake PK + soft-delete + audit
-  columns (6 public fields).
+  columns (creator + creator-department + timestamps).
 - ``LogEntity``  — append-only streams (usage/audit): snowflake PK + created_at
   only (never updated, never soft-deleted).
 - ``LinkEntity`` — many-to-many association tables: snowflake PK + created_at,
@@ -39,6 +39,9 @@ class BaseEntity(Base):
     created_by: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )  # sys_user.id soft reference; null = system action.
+    create_dept: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, index=True
+    )  # sys_department.id soft reference for generic data-scope filtering.
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

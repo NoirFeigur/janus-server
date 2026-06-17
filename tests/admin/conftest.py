@@ -1,12 +1,12 @@
 """Shared fixtures for admin route-level tests.
 
 Drives the real app through ``httpx.AsyncClient`` + ``ASGITransport`` (same event
-loop as the test, so the shared in-memory SQLite session is safe). Two
-dependencies are overridden:
+loop as the test, so the shared in-memory SQLite session is safe). One
+dependency is overridden:
 
 - ``get_session`` → one shared session (tables created, persists across requests).
-- ``get_current_account`` → a configurable principal; tests mutate ``state`` to
-  change the actor's permissions / id / department without minting real tokens.
+The auth middleware still runs; requests carry a test JWT and the middleware uses
+the same SQLite session factory.
 
 An admin user (id 1000) with a ``data_scope=all`` role is seeded so user listing
 is unrestricted by default; data-scope tests override the actor's department.
@@ -19,11 +19,16 @@ from dataclasses import dataclass, field
 
 import httpx
 import pytest_asyncio
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from src.auth.dependencies import get_current_account
-from src.auth.service import AuthenticatedAccount
+from src.auth.dependencies import get_current_jwt_user
+from src.auth.service import AuthenticatedUser
+from src.config import get_settings
+from src.core.security import issue_access_token
 from src.db.base import Base
 from src.db.models.credential import ApiKey
 from src.db.models.identity import (
@@ -51,7 +56,7 @@ class AdminState:
     """Mutable actor state the override reads on each request."""
 
     perms: set[str] = field(default_factory=lambda: {"*:*:*"})
-    account_id: int = ADMIN_ID
+    user_id: int = ADMIN_ID
     department_id: int | None = None
 
 
@@ -90,12 +95,23 @@ async def admin_session(
 async def admin_ctx(
     sqlite_engine: AsyncEngine,
     sqlite_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
 ) -> AsyncIterator[AdminCtx]:
     async with sqlite_engine.begin() as conn:
         await conn.run_sync(
             lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_TABLES)
         )
     session = sqlite_session_factory()
+
+    settings = get_settings()
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("utf-8")
+    monkeypatch.setattr(settings, "platform_jwt_private_key", SecretStr(priv_pem))
+    monkeypatch.setattr(settings, "platform_jwt_public_key", None)
 
     # Seed the admin actor + an all-scope role so user listing is unrestricted.
     role = Role(name="admin", code="admin", data_scope="all", status="active")
@@ -112,9 +128,9 @@ async def admin_ctx(
     async def _override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
-    async def _override_account() -> AuthenticatedAccount:
-        return AuthenticatedAccount(
-            account_id=state.account_id,
+    async def _override_user() -> AuthenticatedUser:
+        return AuthenticatedUser(
+            user_id=state.user_id,
             username="admin",
             department_id=state.department_id,
             permissions=frozenset(state.perms),
@@ -122,11 +138,15 @@ async def admin_ctx(
 
     app = create_app()
     app.dependency_overrides[get_session] = _override_session
-    app.dependency_overrides[get_current_account] = _override_account
+    app.dependency_overrides[get_current_jwt_user] = _override_user
+    app.state.session_factory = sqlite_session_factory
 
     transport = ASGITransport(app=app)
+    token, _ = issue_access_token(user_id=ADMIN_ID)
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://test"
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {token}"},
     ) as client:
         yield AdminCtx(client=client, state=state, session=session)
 

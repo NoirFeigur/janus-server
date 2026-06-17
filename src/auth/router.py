@@ -16,7 +16,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 
-from src.auth.dependencies import CurrentAccount, TraceId, get_auth_service
+from src.auth.dependencies import CurrentJwtUser, TraceId, get_auth_service
 from src.auth.schemas import CurrentUserRead, LoginRequest, TokenRead
 from src.auth.service import AuthService
 from src.responses import SuccessEnvelope, success
@@ -39,17 +39,17 @@ async def login(
 
 
 @router.get("/me", response_model=SuccessEnvelope[CurrentUserRead])
-async def me(account: CurrentAccount, trace_id: TraceId) -> SuccessEnvelope[CurrentUserRead]:
-    """Return the authenticated principal's profile + effective permissions."""
+async def me(user: CurrentJwtUser, trace_id: TraceId) -> SuccessEnvelope[CurrentUserRead]:
+    """Return the authenticated user's profile + effective permissions."""
     return success(
         CurrentUserRead(
-            account_id=str(account.account_id),
-            username=account.username,
-            department_id=str(account.department_id)
-            if account.department_id is not None
+            user_id=str(user.user_id),
+            username=user.username,
+            department_id=str(user.department_id)
+            if user.department_id is not None
             else None,
-            permissions=sorted(account.permissions),
-            is_superuser=account.is_superuser,
+            permissions=sorted(user.permissions),
+            is_superuser=user.is_superuser,
         ),
         trace_id=trace_id,
     )

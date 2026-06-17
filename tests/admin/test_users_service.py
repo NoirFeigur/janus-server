@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.admin.users.service import UserService
-from src.auth.service import AuthenticatedAccount
+from src.auth.service import AuthenticatedUser
 from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
 from src.enums import UserStatus
 from src.exceptions import AppError
@@ -26,18 +26,18 @@ pytestmark = pytest.mark.asyncio
 ADMIN_ID = 1000
 
 
-def _superuser() -> AuthenticatedAccount:
-    return AuthenticatedAccount(
-        account_id=ADMIN_ID,
+def _superuser() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=ADMIN_ID,
         username="admin",
         department_id=None,
         permissions=frozenset({"*:*:*"}),
     )
 
 
-def _scoped_actor(account_id: int, *, dept: int | None, perms: set[str]) -> AuthenticatedAccount:
-    return AuthenticatedAccount(
-        account_id=account_id,
+def _scoped_actor(user_id: int, *, dept: int | None, perms: set[str]) -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=user_id,
         username="scoped",
         department_id=dept,
         permissions=frozenset(perms),
