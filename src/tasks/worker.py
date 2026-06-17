@@ -1,10 +1,6 @@
 from src.config import get_settings
-from src.tasks.registry import TASKS
+from src.tasks.registry import TASKS, noop
 from src.tasks.schedule import cron_jobs
-
-
-async def noop(_ctx: dict[str, object]) -> None:
-    return None
 
 
 class WorkerSettings:
