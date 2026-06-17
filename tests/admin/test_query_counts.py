@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import (
 
 from src.admin.roles.service import RoleService
 from src.admin.users.service import UserService
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.db.base import Base
 from src.db.models.credential import ApiKey
@@ -120,6 +121,7 @@ def _superuser() -> AuthenticatedUser:
         username="root",
         department_id=None,
         permissions=frozenset({"*:*:*"}),  # unrestricted scope, no scope queries
+        role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
     )
 
 

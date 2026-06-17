@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.departments.schemas import DepartmentCreate, DepartmentUpdate
 from src.admin.departments.service import DepartmentService
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.db.models.identity import User
 from src.exceptions import AppError
@@ -30,6 +31,7 @@ ACTOR = AuthenticatedUser(
     username="admin",
     department_id=10,
     permissions=frozenset({"*:*:*"}),
+    role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
 )
 
 

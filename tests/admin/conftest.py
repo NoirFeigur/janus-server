@@ -25,6 +25,7 @@ from httpx import ASGITransport
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.dependencies import get_current_jwt_user
 from src.auth.service import AuthenticatedUser
 from src.config import get_settings
@@ -129,11 +130,20 @@ async def admin_ctx(
         yield session
 
     async def _override_user() -> AuthenticatedUser:
+        # Convention: an actor carrying the ``*:*:*`` perm represents the
+        # super-admin. Production now keys super-admin off the role *code*, so
+        # translate that convention into the ``superadmin`` role code here.
+        role_codes = (
+            frozenset({SUPERADMIN_ROLE_CODE})
+            if "*:*:*" in state.perms
+            else frozenset()
+        )
         return AuthenticatedUser(
             user_id=state.user_id,
             username="admin",
             department_id=state.department_id,
             permissions=frozenset(state.perms),
+            role_codes=role_codes,
         )
 
     app = create_app()

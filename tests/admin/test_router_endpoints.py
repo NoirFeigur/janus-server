@@ -24,6 +24,7 @@ from src.admin.roles.service import RoleService
 from src.admin.users import router as user_router
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.admin.users.service import UserService
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 
 pytestmark = pytest.mark.asyncio
@@ -37,6 +38,7 @@ def _actor() -> AuthenticatedUser:
         username="admin",
         department_id=None,
         permissions=frozenset({"*:*:*"}),
+        role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
     )
 
 

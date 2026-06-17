@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.admin.users.service import UserService
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
 from src.enums import UserStatus
@@ -32,6 +33,7 @@ def _superuser() -> AuthenticatedUser:
         username="admin",
         department_id=None,
         permissions=frozenset({"*:*:*"}),
+        role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
     )
 
 

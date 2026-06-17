@@ -62,5 +62,5 @@ class CurrentUserRead(BaseModel):
     mobile: str | None = None
     department_id: str | None
     preferred_locale: str
-    permissions: list[str]  # Sorted effective permission codes (``*:*:*`` = admin).
-    is_superuser: bool
+    permissions: list[str]  # Sorted effective permission codes (granular grants).
+    is_superuser: bool  # True iff holding an active role with the superadmin code.

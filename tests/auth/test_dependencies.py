@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.credentials import CredentialKind, extract_credential
 from src.auth.dependencies import (
     RequiredPerms,
@@ -19,12 +20,13 @@ from src.auth.service import AuthenticatedUser, AuthService
 from src.exceptions import AppError
 
 
-def _user(perms: set[str]) -> AuthenticatedUser:
+def _user(perms: set[str], role_codes: set[str] | None = None) -> AuthenticatedUser:
     return AuthenticatedUser(
         user_id=1,
         username="alice",
         department_id=None,
         permissions=frozenset(perms),
+        role_codes=frozenset(role_codes or set()),
     )
 
 
@@ -74,7 +76,7 @@ async def test_required_perms_allows_holder() -> None:
 @pytest.mark.asyncio
 async def test_required_perms_allows_superuser() -> None:
     gate = RequiredPerms("system:user:add")
-    current_user = _user({"*:*:*"})
+    current_user = _user(set(), role_codes={SUPERADMIN_ROLE_CODE})
     assert await gate(current_user) is current_user
 
 

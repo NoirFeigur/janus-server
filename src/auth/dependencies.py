@@ -82,7 +82,7 @@ class RequiredPerms:
 
         @router.post("/users", dependencies=[Depends(RequiredPerms("system:user:add"))])
 
-    Super-admin (``*:*:*``) bypasses; lacking the code raises 403
+    Super-admin (``superadmin`` role code) bypasses; lacking the code raises 403
     (``auth_forbidden``). Returns the user so routes can also inject it.
     """
 

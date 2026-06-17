@@ -5,8 +5,8 @@ Three responsibilities, all on top of :class:`AuthRepository` + the
 
 - **Authentication** — password login (issues a platform RS256 access token) and
   sk-key resolution (hash → lookup → expiry).
-- **Authorization (RBAC)** — per-request permission-code aggregation; a wildcard
-  ``*:*:*`` grant is super-admin.
+- **Authorization (RBAC)** — per-request permission-code aggregation; holding an
+  active role with the ``superadmin`` code is super-admin.
 - **Data scope** — resolve a user's effective department-id set (RuoYi
   6-tier), the primitive applied by admin user list + mutation queries.
 
@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
 from src.auth import dept_tree_cache
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.credentials import CredentialKind
 from src.auth.dept_tree_cache import DeptPair, invalidate_department_tree
 from src.auth.repository import AuthRepository
@@ -51,8 +52,6 @@ __all__ = [
     "invalidate_department_tree",
 ]
 
-_SUPERUSER_PERM = "*:*:*"  # Wildcard grant: bypasses every permission check.
-
 
 @dataclass(frozen=True, slots=True)
 class AuthenticatedUser:
@@ -67,6 +66,7 @@ class AuthenticatedUser:
     username: str
     department_id: int | None
     permissions: frozenset[str]
+    role_codes: frozenset[str] = frozenset()
     real_name: str | None = None
     email: str | None = None
     mobile: str | None = None
@@ -76,7 +76,13 @@ class AuthenticatedUser:
 
     @property
     def is_superuser(self) -> bool:
-        return _SUPERUSER_PERM in self.permissions
+        """Super-admin iff holding an active role with the ``superadmin`` code.
+
+        Code-based and bootstrap-safe: the marker is the role identity itself,
+        not a ``menu -> role_menu -> perm`` chain that can be half-seeded. There
+        is intentionally no wildcard-permission fallback.
+        """
+        return SUPERADMIN_ROLE_CODE in self.role_codes
 
     def has_permission(self, required: str) -> bool:
         return self.is_superuser or required in self.permissions
@@ -187,11 +193,13 @@ class AuthService:
             # Credential was valid but the user is gone/disabled since issue.
             raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
         permissions = await self.repo.list_permission_codes(user_id)
+        role_codes = await self.repo.list_active_role_codes(user_id)
         return AuthenticatedUser(
             user_id=user_id,
             username=user.username,
             department_id=user.department_id,
             permissions=permissions,
+            role_codes=role_codes,
             real_name=user.real_name,
             email=user.email,
             mobile=user.mobile,
@@ -250,10 +258,11 @@ class AuthService:
     async def resolve_data_scope(self, user: AuthenticatedUser) -> DataScopeFilter:
         """Resolve the user's effective data scope (broadest role wins).
 
-        Super-admin (``*:*:*``) is unconditionally unrestricted regardless of
-        roles. Otherwise union semantics across all active roles: ``all`` beats
-        everything; the rest accumulate department ids and/or the self flag. No
-        active role → the most restrictive scope (self only).
+        Super-admin (``superadmin`` role code) is unconditionally unrestricted
+        regardless of other roles. Otherwise union semantics across all active
+        roles: ``all`` beats everything; the rest accumulate department ids
+        and/or the self flag. No active role → the most restrictive scope (self
+        only).
         """
         if user.is_superuser:
             return DataScopeFilter(

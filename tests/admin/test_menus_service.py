@@ -6,6 +6,7 @@ import pytest
 
 from src.admin.menus.schemas import MenuCreate, MenuUpdate
 from src.admin.menus.service import MenuService
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.db.models.identity import Menu, Role, RoleMenu, UserRole
 from src.exceptions import AppError
@@ -19,6 +20,7 @@ def _actor() -> AuthenticatedUser:
         username="admin",
         department_id=10,
         permissions=frozenset({"*:*:*"}),
+        role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
     )
 
 

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.departments.schemas import DepartmentUpdate
 from src.admin.departments.service import DepartmentService
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import (
     AuthenticatedUser,
     AuthService,
@@ -189,16 +190,32 @@ async def test_resolve_access_token_invalid_raises(auth_session: AsyncSession) -
     assert exc.value.status_code == 401
 
 
-async def test_superuser_wildcard_grants_everything(
+async def test_superuser_by_role_code_grants_everything(
     auth_session: AsyncSession,
 ) -> None:
     user = await seed_user(auth_session)
-    await grant_permission(auth_session, user=user, perm="*:*:*")
+    # A role whose code is the super-admin marker — no wildcard perm involved.
+    await grant_permission(
+        auth_session, user=user, perm="some:narrow:perm", role_code=SUPERADMIN_ROLE_CODE
+    )
     service = AuthService(auth_session)
     token, _ = await service.authenticate_password("alice", "secret123")
     current_user = await service.resolve_access_token(token)
     assert current_user.is_superuser
     assert current_user.has_permission("anything:at:all")
+
+
+async def test_wildcard_perm_is_not_superuser(auth_session: AsyncSession) -> None:
+    """A plain ``*:*:*`` permission no longer confers super-admin (code-only)."""
+    user = await seed_user(auth_session)
+    await grant_permission(auth_session, user=user, perm="*:*:*", role_code="ops")
+    service = AuthService(auth_session)
+    token, _ = await service.authenticate_password("alice", "secret123")
+    current_user = await service.resolve_access_token(token)
+    assert current_user.is_superuser is False
+    # The literal code still matches itself, but it is not a god-mode wildcard.
+    assert current_user.has_permission("*:*:*")
+    assert current_user.has_permission("other:perm") is False
 
 
 async def test_resolve_api_key_success(auth_session: AsyncSession) -> None:
@@ -399,7 +416,8 @@ async def test_department_mutation_invalidates_scope_cache(
             user_id=1,
             username="admin",
             department_id=None,
-            permissions=frozenset({"*:*:*"}),
+            permissions=frozenset(),
+            role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
         ),
     )
 

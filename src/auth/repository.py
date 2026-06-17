@@ -115,6 +115,23 @@ class AuthRepository:
         result = await self.session.scalars(stmt)
         return frozenset(code for code in result.all() if code)
 
+    async def list_active_role_codes(self, user_id: int) -> frozenset[str]:
+        """Codes of the user's active, non-deleted roles (super-admin marker).
+
+        Drives ``AuthenticatedUser.is_superuser`` (code-based super-admin). Same
+        active/not-deleted filters as the other RBAC aggregations; the link
+        table (UserRole) has no such columns.
+        """
+        stmt = (
+            select(Role.code)
+            .join(UserRole, UserRole.role_id == Role.id)
+            .where(UserRole.user_id == user_id)
+            .where(Role.is_deleted.is_(False))
+            .where(Role.status == ActiveStatus.active.value)
+        )
+        result = await self.session.scalars(stmt)
+        return frozenset(result.all())
+
     async def list_active_roles(self, user_id: int) -> Sequence[Role]:
         """User's active, non-deleted roles (for data-scope resolution)."""
         stmt = (

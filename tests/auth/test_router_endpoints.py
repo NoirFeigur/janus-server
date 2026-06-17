@@ -14,6 +14,7 @@ from typing import cast
 
 import pytest
 
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.router import change_password, login, me, update_me
 from src.auth.schemas import ChangePasswordRequest, CurrentUserUpdate, LoginRequest
 from src.auth.service import AuthenticatedUser, AuthService
@@ -71,7 +72,8 @@ async def test_me_endpoint_serializes_principal() -> None:
         user_id=123456789,
         username="alice",
         department_id=42,
-        permissions=frozenset({"system:user:list", "*:*:*"}),
+        permissions=frozenset({"system:user:list"}),
+        role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
         real_name="Alice",
         email="alice@example.com",
         mobile="13800000000",
@@ -89,7 +91,7 @@ async def test_me_endpoint_serializes_principal() -> None:
     assert envelope.data.mobile == "13800000000"
     assert envelope.data.preferred_locale == "zh-CN"
     assert envelope.data.is_superuser is True
-    assert envelope.data.permissions == sorted(["system:user:list", "*:*:*"])
+    assert envelope.data.permissions == ["system:user:list"]
 
 
 async def test_me_endpoint_null_department() -> None:

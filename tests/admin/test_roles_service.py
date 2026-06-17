@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.roles.schemas import RoleCreate, RoleUpdate
 from src.admin.roles.service import RoleService
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.db.models.identity import Menu, Role, RoleDept, RoleMenu, UserRole
 from src.enums import DataScope
@@ -32,11 +33,16 @@ def _actor(
     department_id: int | None = 10,
     permissions: set[str] | None = None,
 ) -> AuthenticatedUser:
+    perms = permissions or {"*:*:*"}
+    role_codes = (
+        frozenset({SUPERADMIN_ROLE_CODE}) if "*:*:*" in perms else frozenset()
+    )
     return AuthenticatedUser(
         user_id=user_id,
         username="admin",
         department_id=department_id,
-        permissions=frozenset(permissions or {"*:*:*"}),
+        permissions=frozenset(perms),
+        role_codes=role_codes,
     )
 
 
