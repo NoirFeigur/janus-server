@@ -26,6 +26,15 @@ class Settings(BaseSettings):
     jwt_jwks_url: str | None = None
     fernet_key: SecretStr | None = None
 
+    # 平台自签 JWT（本地账密登录换发）。与上面 jwt_public_key/jwt_jwks_url 正交：
+    # 那两个是给 M6 企微外部 JWT 验签预留的,本组是平台自己作为签发方用的。
+    # RS256:签发权(私钥,.env 密钥)与热路径验签(公钥)分离——副本只需公钥即可验签,
+    # 不必持有签发密钥(对齐'无状态副本,公钥验签'的横向扩前提)。
+    platform_jwt_private_key: SecretStr | None = None  # PKCS8 PEM;仅签发方(登录)需要
+    platform_jwt_public_key: str | None = None  # 缺省时启动期从私钥推导
+    platform_jwt_algorithm: str = "RS256"  # 解码时显式限定,不信任 token header 的 alg
+    platform_access_token_ttl_seconds: int = 7200  # access token 有效期(2h)
+
     default_locale: str = "zh-CN"
     supported_locales: tuple[str, ...] = ("zh-CN", "en-US")
 
