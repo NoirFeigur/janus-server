@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
-import pytest
+from typing import cast
 
-from src.auth.dependencies import RequiredPerms, _extract_credential
-from src.auth.service import AuthenticatedAccount
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.auth.dependencies import (
+    RequiredPerms,
+    _extract_credential,
+    get_auth_service,
+    get_current_account,
+)
+from src.auth.service import AuthenticatedAccount, AuthService
 from src.exceptions import AppError
 
 
@@ -69,3 +77,57 @@ async def test_required_perms_denies_missing_403() -> None:
     with pytest.raises(AppError) as exc:
         await gate(account)
     assert exc.value.status_code == 403
+
+
+def test_get_auth_service_binds_session() -> None:
+    """The factory constructs an AuthService bound to the request session."""
+    sentinel = object()
+    service = get_auth_service(cast(AsyncSession, sentinel))
+    assert isinstance(service, AuthService)
+    assert service.repo.session is sentinel
+
+
+class _StubAuthService:
+    """Records which resolution path ``get_current_account`` dispatched to."""
+
+    def __init__(self) -> None:
+        self.api_key_calls: list[str] = []
+        self.token_calls: list[str] = []
+
+    async def resolve_api_key(self, plaintext: str) -> AuthenticatedAccount:
+        self.api_key_calls.append(plaintext)
+        return _account({"via:api_key"})
+
+    async def resolve_access_token(self, token: str) -> AuthenticatedAccount:
+        self.token_calls.append(token)
+        return _account({"via:jwt"})
+
+
+@pytest.mark.asyncio
+async def test_get_current_account_routes_sk_key_to_api_key_path() -> None:
+    stub = _StubAuthService()
+    account = await get_current_account(
+        cast(AuthService, stub), authorization="Bearer sk-live-123"
+    )
+    assert stub.api_key_calls == ["sk-live-123"]
+    assert stub.token_calls == []
+    assert account.has_permission("via:api_key")
+
+
+@pytest.mark.asyncio
+async def test_get_current_account_routes_jwt_to_access_token_path() -> None:
+    stub = _StubAuthService()
+    account = await get_current_account(
+        cast(AuthService, stub), authorization="Bearer header.payload.sig"
+    )
+    assert stub.token_calls == ["header.payload.sig"]
+    assert stub.api_key_calls == []
+    assert account.has_permission("via:jwt")
+
+
+@pytest.mark.asyncio
+async def test_get_current_account_missing_credential_raises_401() -> None:
+    stub = _StubAuthService()
+    with pytest.raises(AppError) as exc:
+        await get_current_account(cast(AuthService, stub))
+    assert exc.value.status_code == 401

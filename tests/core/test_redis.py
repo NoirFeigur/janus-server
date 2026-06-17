@@ -36,3 +36,20 @@ async def test_close_redis_resets_singleton(fake_redis: object) -> None:
     assert redis_module._client is not None
     await redis_module.close_redis()
     assert redis_module._client is None
+
+
+async def test_get_redis_lazily_builds_client_when_unset(fake_redis: object) -> None:
+    """_client 为 None 时,get_redis() 走懒建分支(建连接池 + Redis 实例)。
+
+    autouse fixture 平时把 _client 设成 double;这里显式清空以触发真正的懒建路径,
+    断言返回的是 redis.asyncio.Redis 实例,然后立即回收以免泄漏到后续测试。
+    """
+    from redis.asyncio import Redis
+
+    redis_module._client = None
+    built = get_redis()
+    try:
+        assert isinstance(built, Redis)
+        assert redis_module._client is built  # 缓存为单例
+    finally:
+        await redis_module.close_redis()  # 回收懒建出来的真实 client

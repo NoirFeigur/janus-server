@@ -30,7 +30,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "aiosqlite>=0.21,<1",
-    "fakeredis>=2.36,<3",
     "mypy>=1.16,<2",
     "pytest>=8.4,<9",
     "pytest-asyncio>=1.0,<2",

@@ -247,3 +247,61 @@ def test_decode_rejects_extra_claims(rsa_settings: Settings) -> None:
     )
     with pytest.raises(TokenError):
         decode_access_token(bloated)
+
+
+def test_decode_uses_configured_public_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """配置了独立验签公钥时,decode 走配置公钥分支(而非从私钥推导)。"""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("utf-8")
+    pub_pem = (
+        key.public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("utf-8")
+    )
+    settings = get_settings()
+    monkeypatch.setattr(settings, "platform_jwt_private_key", SecretStr(priv_pem))
+    monkeypatch.setattr(settings, "platform_jwt_public_key", pub_pem)  # 配置公钥分支
+    monkeypatch.setattr(settings, "platform_access_token_ttl_seconds", 3600)
+
+    token, _ = issue_access_token(account_id=7)
+    claims = decode_access_token(token)
+    assert claims.sub == "7"
+
+
+def test_issue_with_invalid_private_key_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """私钥串存在但无法解析为有效 PEM 时,签名失败必须转成 TokenError。"""
+    settings = get_settings()
+    monkeypatch.setattr(
+        settings,
+        "platform_jwt_private_key",
+        SecretStr("-----BEGIN PRIVATE KEY-----\nnot-a-valid-key\n-----END PRIVATE KEY-----"),
+    )
+    with pytest.raises(TokenError):
+        issue_access_token(account_id=1)
+
+
+def test_decode_non_dict_payload_raises(
+    rsa_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """防御性分支:jwt 解出的 payload 不是 JSON object 时必须拒绝。
+
+    正常 JWT 规范下 payload 必是对象,pyjwt 也会拦截非对象 payload;这里直接
+    打桩 ``jwt.decode`` 返回一个列表,验证服务层的 isinstance 守卫确实生效。
+    """
+    token, _ = issue_access_token(account_id=1)
+    monkeypatch.setattr(
+        security.jwt, "decode", lambda *_a, **_k: ["not", "a", "dict"]
+    )
+    with pytest.raises(TokenError):
+        decode_access_token(token)

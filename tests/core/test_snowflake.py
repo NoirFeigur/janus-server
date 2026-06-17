@@ -82,3 +82,27 @@ def test_sequence_rollover_advances_to_next_ms(monkeypatch: pytest.MonkeyPatch) 
     next_value = snowflake.next_id()
     extracted_ms = (next_value >> snowflake._TIMESTAMP_SHIFT) + snowflake._EPOCH_MS
     assert extracted_ms == original + 1
+
+
+def test_clock_rollback_spins_until_caught_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the wall clock moves backwards, next_id spins until it catches up
+    (never silently reuses a timestamp → never risks a duplicate id)."""
+    base = 2_000_000_000_000
+    snowflake._last_ms = base
+    snowflake._sequence = 0
+
+    # First read is *behind* _last_ms (rollback), then it catches up.
+    readings = iter([base - 5, base - 2, base])
+
+    def rolling_now_ms() -> int:
+        try:
+            return next(readings)
+        except StopIteration:
+            return base
+
+    monkeypatch.setattr(snowflake, "_now_ms", rolling_now_ms)
+    value = snowflake.next_id()
+    # Caught up to base (== _last_ms) → same-ms path → sequence advances to 1.
+    extracted_ms = (value >> snowflake._TIMESTAMP_SHIFT) + snowflake._EPOCH_MS
+    assert extracted_ms == base
+    assert value & snowflake._MAX_SEQUENCE == 1

@@ -12,10 +12,10 @@ from __future__ import annotations
 import json
 
 import pytest
-from fakeredis.aioredis import FakeRedis
 from redis.exceptions import RedisError
 
 from src.core import cache
+from tests._async_redis_double import AsyncRedisDouble
 
 pytestmark = pytest.mark.asyncio
 
@@ -24,7 +24,7 @@ def _int_codec() -> tuple:
     return (lambda v: json.dumps(v), lambda s: int(json.loads(s)))
 
 
-async def test_miss_then_hit_runs_loader_once(fake_redis: FakeRedis) -> None:
+async def test_miss_then_hit_runs_loader_once(fake_redis: AsyncRedisDouble) -> None:
     calls = {"n": 0}
 
     async def loader() -> int:
@@ -45,7 +45,7 @@ async def test_miss_then_hit_runs_loader_once(fake_redis: FakeRedis) -> None:
     assert calls["n"] == 1  # second read served from cache, loader not re-run
 
 
-async def test_value_actually_stored_in_redis(fake_redis: FakeRedis) -> None:
+async def test_value_actually_stored_in_redis(fake_redis: AsyncRedisDouble) -> None:
     dumps, loads = _int_codec()
 
     async def loader() -> int:
@@ -58,7 +58,7 @@ async def test_value_actually_stored_in_redis(fake_redis: FakeRedis) -> None:
     assert int(json.loads(raw)) == 7
 
 
-async def test_ttl_applied(fake_redis: FakeRedis) -> None:
+async def test_ttl_applied(fake_redis: AsyncRedisDouble) -> None:
     dumps, loads = _int_codec()
 
     async def loader() -> int:
@@ -70,7 +70,7 @@ async def test_ttl_applied(fake_redis: FakeRedis) -> None:
     assert 0 < ttl <= 123
 
 
-async def test_invalidate_forces_reload(fake_redis: FakeRedis) -> None:
+async def test_invalidate_forces_reload(fake_redis: AsyncRedisDouble) -> None:
     calls = {"n": 0}
 
     async def loader() -> int:
@@ -88,7 +88,7 @@ async def test_invalidate_forces_reload(fake_redis: FakeRedis) -> None:
     assert calls["n"] == 2
 
 
-async def test_corrupt_entry_dropped_and_reloads(fake_redis: FakeRedis) -> None:
+async def test_corrupt_entry_dropped_and_reloads(fake_redis: AsyncRedisDouble) -> None:
     # Poison the cache with a value that the codec cannot decode.
     await fake_redis.set("k:bad", "not-json")
     calls = {"n": 0}
@@ -112,7 +112,7 @@ async def test_corrupt_entry_dropped_and_reloads(fake_redis: FakeRedis) -> None:
 
 
 async def test_get_failure_fails_open_to_loader(
-    fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+    fake_redis: AsyncRedisDouble, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def boom(*_args: object, **_kwargs: object) -> object:
         raise RedisError("redis down")
@@ -132,7 +132,7 @@ async def test_get_failure_fails_open_to_loader(
 
 
 async def test_set_failure_still_returns_value(
-    fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+    fake_redis: AsyncRedisDouble, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def boom(*_args: object, **_kwargs: object) -> object:
         raise RedisError("write failed")
@@ -149,7 +149,7 @@ async def test_set_failure_still_returns_value(
 
 
 async def test_invalidate_failure_is_swallowed(
-    fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+    fake_redis: AsyncRedisDouble, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def boom(*_args: object, **_kwargs: object) -> object:
         raise RedisError("delete failed")
@@ -160,6 +160,6 @@ async def test_invalidate_failure_is_swallowed(
     await cache.invalidate("k:whatever")
 
 
-async def test_invalidate_noop_on_empty(fake_redis: FakeRedis) -> None:
+async def test_invalidate_noop_on_empty(fake_redis: AsyncRedisDouble) -> None:
     # No keys → no Redis call, no error.
     await cache.invalidate()

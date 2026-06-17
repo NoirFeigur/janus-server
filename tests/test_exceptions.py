@@ -8,13 +8,21 @@ error source through TestClient to assert the unified envelope contract
 
 from __future__ import annotations
 
+import json
+
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.enums import ErrorCode
-from src.exceptions import AppError, register_exception_handlers
+from src.exceptions import (
+    AppError,
+    http_exception_handler,
+    register_exception_handlers,
+    unhandled_exception_handler,
+)
 
 
 class _Payload(BaseModel):
@@ -110,3 +118,45 @@ def test_unhandled_exception_returns_500_without_stack_leak() -> None:
     assert "super secret internal detail leak" not in serialized
     assert "Traceback" not in serialized
     assert body["params"] == {}
+
+
+def _request_with_trace(trace_id: str = "trace-direct") -> Request:
+    """Minimal ASGI ``Request`` carrying a trace id in ``state`` (as the
+    middleware would set it)."""
+    request = Request({"type": "http", "headers": []})
+    request.state.trace_id = trace_id
+    return request
+
+
+@pytest.mark.asyncio
+async def test_http_exception_500_maps_to_internal_error() -> None:
+    """A framework HTTP exception with a 5xx status maps to internal_error
+    (not the request_invalid fallback) — covers the >=500 branch."""
+    resp = await http_exception_handler(
+        _request_with_trace(), StarletteHTTPException(status_code=503)
+    )
+    assert resp.status_code == 503
+    body = json.loads(resp.body)
+    assert body["code"] == ErrorCode.internal_error.value
+    assert body["trace_id"] == "trace-direct"
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_includes_detail_when_debug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With debug=True the bottom-line handler attaches a detail param (the
+    branch the default-config TestClient tests never hit)."""
+    import src.exceptions as exc_module
+
+    class _DebugSettings:
+        debug = True
+
+    monkeypatch.setattr(exc_module, "get_settings", lambda: _DebugSettings())
+    resp = await unhandled_exception_handler(
+        _request_with_trace(), RuntimeError("boom detail")
+    )
+    assert resp.status_code == 500
+    body = json.loads(resp.body)
+    assert body["code"] == ErrorCode.internal_error.value
+    assert body["params"]["detail"] == "RuntimeError: boom detail"

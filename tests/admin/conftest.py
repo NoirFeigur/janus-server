@@ -63,6 +63,30 @@ class AdminCtx:
 
 
 @pytest_asyncio.fixture
+async def admin_session(
+    sqlite_engine: AsyncEngine,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncSession]:
+    """A bare session with the admin tables created, for *direct* service tests.
+
+    Route tests (``admin_ctx``) prove behaviour end-to-end, but their handlers run
+    under httpx ``ASGITransport`` / anyio, which corrupts coverage.py's C tracer on
+    CPython 3.11 — service bodies execute but read back as uncovered. Driving the
+    service directly with a plain ``await`` keeps the tracer armed, so coverage of
+    the service layer is honest (and the tests are faster + branch-focused).
+    """
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_TABLES)
+        )
+    session = sqlite_session_factory()
+    try:
+        yield session
+    finally:
+        await session.close()
+
+
+@pytest_asyncio.fixture
 async def admin_ctx(
     sqlite_engine: AsyncEngine,
     sqlite_session_factory: async_sessionmaker[AsyncSession],

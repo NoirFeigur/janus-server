@@ -9,9 +9,10 @@ not created here.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import cast
 
 import pytest_asyncio
-from fakeredis.aioredis import FakeRedis
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 import src.core.redis as redis_module
+from tests._async_redis_double import AsyncRedisDouble
 
 
 @pytest_asyncio.fixture
@@ -41,23 +43,29 @@ async def sqlite_session_factory(
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def fake_redis() -> AsyncIterator[FakeRedis]:
-    """In-process fake Redis wired into ``src.core.redis``'s module singleton.
+async def fake_redis() -> AsyncIterator[AsyncRedisDouble]:
+    """In-process async Redis double wired into ``src.core.redis``'s singleton.
 
     Overrides the module-global ``_client`` so ``get_redis()`` / ``ping()`` resolve
-    to this fake — tests never touch the shared Redis instance. The original
+    to this double — tests never touch the shared Redis instance. The original
     singleton is restored on teardown to prevent cross-test leakage.
 
     Autouse: enforces the no-shared-Redis invariant for *every* test, so any code
     path that lazily reaches ``get_redis()`` (e.g. the dept-tree cache inside
     ``resolve_data_scope``, or a mutation calling ``cache.invalidate``) hits the
-    fake instead of the real instance. Tests that need a handle still request it.
+    double instead of the real instance. Tests that need a handle still request it.
+
+    Why a hand-rolled double instead of ``fakeredis``: ``fakeredis`` resolves its
+    awaits on a background thread, which corrupts coverage.py's C tracer on
+    CPython 3.11 (lines after every ``await redis.*`` are dropped). This double
+    awaits nothing off-loop, so coverage of cache/redis paths reflects reality.
+    See ``tests/_async_redis_double.py``.
     """
-    fake = FakeRedis(decode_responses=True)
+    double = AsyncRedisDouble(decode_responses=True)
     original = redis_module._client
-    redis_module._client = fake
+    redis_module._client = cast(Redis, double)
     try:
-        yield fake
+        yield double
     finally:
         redis_module._client = original
-        await fake.aclose()
+        await double.aclose()

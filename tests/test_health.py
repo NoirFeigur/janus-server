@@ -16,7 +16,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import src.main as main_module
-from src.main import app
+from src.main import app, create_app, lifespan
 
 
 @pytest_asyncio.fixture
@@ -95,3 +95,40 @@ async def test_readiness_postgres_down_returns_503(
     assert body["status"] == "unavailable"
     assert body["checks"]["postgres"] == "down"
     assert body["checks"]["redis"] == "ok"
+
+
+async def test_lifespan_startup_and_shutdown_run() -> None:
+    """The lifespan context configures logging on entry and closes Redis on
+    exit. The autouse ``fake_redis`` fixture backs ``close_redis`` so no shared
+    instance is touched."""
+    test_app = create_app()
+    async with lifespan(test_app):
+        # Inside the context the app is "started"; nothing to assert beyond
+        # the body having executed without raising (yield reached).
+        pass
+    # Exiting the context ran the shutdown branch (await close_redis()).
+
+
+async def test_readiness_success_path_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drive the readiness handler directly (not via ASGITransport) so the C
+    tracer stays armed and the ``SELECT 1`` execution line is covered."""
+    sqlite = create_async_engine("sqlite+aiosqlite:///:memory:")
+
+    async def _ok_ping() -> bool:
+        return True
+
+    monkeypatch.setattr(main_module, "engine", sqlite)
+    monkeypatch.setattr(main_module, "redis_ping", _ok_ping)
+
+    # Pull the readiness closure off a freshly built app and call it directly.
+    test_app = create_app()
+    readiness = next(
+        r.endpoint
+        for r in test_app.routes
+        if getattr(r, "path", None) == "/health/ready"
+    )
+    try:
+        resp = await readiness()
+    finally:
+        await sqlite.dispose()
+    assert resp.status_code == 200

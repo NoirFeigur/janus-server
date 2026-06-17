@@ -9,10 +9,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.departments.schemas import DepartmentUpdate
 from src.admin.departments.service import DepartmentService
-from src.auth.service import AuthenticatedAccount, AuthService, invalidate_department_tree
+from src.auth.service import (
+    AuthenticatedAccount,
+    AuthService,
+    invalidate_department_tree,
+)
 from src.core.security import decode_access_token, generate_api_key
 from src.db.models.credential import ApiKey
-from src.db.models.identity import Department, Role, UserRole
+from src.db.models.identity import Department, Role, RoleDept, UserRole
+from src.enums import DataScope
 from src.exceptions import AppError
 from tests.auth.conftest import grant_permission, seed_user
 
@@ -286,3 +291,85 @@ async def test_department_mutation_invalidates_scope_cache(
     # Cache was invalidated on commit → dept 2 no longer in dept 1's subtree.
     after = await service.resolve_data_scope(account)
     assert after.department_ids == frozenset({1})
+
+
+# ---- _build_principal: credential valid but account gone --------------------
+
+
+async def test_build_principal_missing_account_raises_401(
+    auth_session: AsyncSession,
+) -> None:
+    service = AuthService(auth_session)
+    with pytest.raises(AppError) as exc:
+        await service._build_principal(999999)  # no such user
+    assert exc.value.status_code == 401
+
+
+# ---- accumulate-scope branch coverage ---------------------------------------
+
+
+async def test_data_scope_custom_includes_granted_depts(
+    auth_session: AsyncSession,
+) -> None:
+    """custom-scope role contributes its sys_role_dept grants to the scope."""
+    auth_session.add_all(
+        [Department(id=d, name=f"d{d}", parent_id=None) for d in (71, 72)]
+    )
+    user = await seed_user(auth_session, department_id=None)
+    role = Role(name="cu", code="cu", data_scope=DataScope.custom.value, status="active")
+    auth_session.add(role)
+    await auth_session.flush()
+    auth_session.add(UserRole(user_id=user.id, role_id=role.id))
+    auth_session.add_all(
+        [RoleDept(role_id=role.id, dept_id=71), RoleDept(role_id=role.id, dept_id=72)]
+    )
+    await auth_session.flush()
+    service = AuthService(auth_session)
+    account = AuthenticatedAccount(
+        account_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset({"x:y:z"}),  # not superuser
+    )
+    scope = await service.resolve_data_scope(account)
+    assert scope.department_ids == frozenset({71, 72})
+    assert not scope.unrestricted
+
+
+async def test_data_scope_self_only_role_sets_include_self(
+    auth_session: AsyncSession,
+) -> None:
+    """A self-scope role (with other roles present) sets include_self via accumulate."""
+    service, _ = await _principal_with_role(
+        auth_session, data_scope=DataScope.self_only.value, department_id=5
+    )
+    token, _ = await service.authenticate_password("alice", "secret123")
+    account = await service.resolve_access_token(token)
+    scope = await service.resolve_data_scope(account)
+    assert scope.include_self
+    assert scope.department_ids == frozenset()
+    assert not scope.unrestricted
+
+
+async def test_data_scope_dept_and_child_or_self_combines(
+    auth_session: AsyncSession,
+) -> None:
+    """dept_and_child_or_self adds the own-dept subtree AND sets include_self."""
+    auth_session.add_all(
+        [
+            Department(id=1, name="root", parent_id=None),
+            Department(id=2, name="child", parent_id=1),
+        ]
+    )
+    await auth_session.flush()
+    service, _ = await _principal_with_role(
+        auth_session,
+        data_scope=DataScope.dept_and_child_or_self.value,
+        department_id=1,
+    )
+    token, _ = await service.authenticate_password("alice", "secret123")
+    account = await service.resolve_access_token(token)
+    scope = await service.resolve_data_scope(account)
+    assert scope.department_ids == frozenset({1, 2})
+    assert scope.include_self
+    assert not scope.unrestricted
