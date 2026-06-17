@@ -70,8 +70,7 @@ def hash_api_key(plaintext: str) -> str:
 # ---- 平台 JWT(RS256) -------------------------------------------------------
 
 # 算法在代码里**硬锁** RS256,绝不从配置/token header 读取——防算法混淆攻击
-# (如攻击者把 alg 改成 HS256 用公钥当 HMAC 密钥伪造)。config 的 platform_jwt_algorithm
-# 仅作展示/文档,签名与验签一律用本常量。
+# (如攻击者把 alg 改成 HS256 用公钥当 HMAC 密钥伪造)。签名与验签一律用本常量。
 _PLATFORM_JWT_ALGORITHM = "RS256"
 
 
