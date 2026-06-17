@@ -40,13 +40,18 @@ async def sqlite_session_factory(
     return async_sessionmaker(bind=sqlite_engine, expire_on_commit=False, autoflush=False)
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(autouse=True)
 async def fake_redis() -> AsyncIterator[FakeRedis]:
     """In-process fake Redis wired into ``src.core.redis``'s module singleton.
 
     Overrides the module-global ``_client`` so ``get_redis()`` / ``ping()`` resolve
     to this fake — tests never touch the shared Redis instance. The original
     singleton is restored on teardown to prevent cross-test leakage.
+
+    Autouse: enforces the no-shared-Redis invariant for *every* test, so any code
+    path that lazily reaches ``get_redis()`` (e.g. the dept-tree cache inside
+    ``resolve_data_scope``, or a mutation calling ``cache.invalidate``) hits the
+    fake instead of the real instance. Tests that need a handle still request it.
     """
     fake = FakeRedis(decode_responses=True)
     original = redis_module._client
