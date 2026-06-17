@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.sql.elements import ColumnElement
 
 from src.auth.service import DataScopeFilter
@@ -68,6 +68,20 @@ class UserRepository(BaseRepository[User]):
             stmt = stmt.limit(limit)
         result = await self.session.scalars(stmt)
         return result.all()
+
+    async def count_in_scope(
+        self,
+        scope: DataScopeFilter,
+        *,
+        actor_id: int,
+    ) -> int:
+        """Count non-deleted users visible under the data scope."""
+        stmt = select(func.count()).select_from(User).where(User.is_deleted.is_(False))
+        predicate = self._scope_predicate(scope, actor_id=actor_id)
+        if predicate is not None:
+            stmt = stmt.where(predicate)
+        total = await self.session.scalar(stmt)
+        return int(total or 0)
 
     def is_visible(
         self, user: User, scope: DataScopeFilter, *, actor_id: int

@@ -22,6 +22,22 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class CurrentUserUpdate(BaseModel):
+    """Self-service profile fields the current user may update."""
+
+    real_name: str | None = Field(default=None, max_length=64)
+    email: str | None = Field(default=None, max_length=255)
+    mobile: str | None = Field(default=None, max_length=32)
+    preferred_locale: str | None = Field(default=None, max_length=16)
+
+
+class ChangePasswordRequest(BaseModel):
+    """Current-user password change payload."""
+
+    old_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=1, max_length=128)
+
+
 class TokenRead(BaseModel):
     """Issued platform access token (+ forward-compat refresh slot)."""
 
@@ -41,6 +57,10 @@ class CurrentUserRead(BaseModel):
 
     user_id: str
     username: str
+    real_name: str | None = None
+    email: str | None = None
+    mobile: str | None = None
     department_id: str | None
+    preferred_locale: str
     permissions: list[str]  # Sorted effective permission codes (``*:*:*`` = admin).
     is_superuser: bool

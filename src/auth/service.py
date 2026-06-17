@@ -20,7 +20,7 @@ to the same opaque ``auth_invalid_token`` (401).
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -36,6 +36,7 @@ from src.core.security import (
     TokenError,
     decode_access_token,
     hash_api_key,
+    hash_password_async,
     issue_access_token,
     verify_password_async,
 )
@@ -66,6 +67,10 @@ class AuthenticatedUser:
     username: str
     department_id: int | None
     permissions: frozenset[str]
+    real_name: str | None = None
+    email: str | None = None
+    mobile: str | None = None
+    preferred_locale: str = "zh-CN"
     credential_kind: CredentialKind = CredentialKind.jwt
     api_key_id: int | None = None
 
@@ -187,9 +192,48 @@ class AuthService:
             username=user.username,
             department_id=user.department_id,
             permissions=permissions,
+            real_name=user.real_name,
+            email=user.email,
+            mobile=user.mobile,
+            preferred_locale=user.preferred_locale,
             credential_kind=credential_kind,
             api_key_id=api_key_id,
         )
+
+    async def update_current_user(
+        self,
+        user: AuthenticatedUser,
+        values: Mapping[str, str | None],
+    ) -> AuthenticatedUser:
+        """Update self-service profile fields and return a fresh principal."""
+        row = await self.repo.get_user_by_id(user.user_id)
+        if row is None:
+            raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
+        if values.get("preferred_locale") is None and "preferred_locale" in values:
+            raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+        for field in ("real_name", "email", "mobile", "preferred_locale"):
+            if field in values:
+                setattr(row, field, values[field])
+        row.updated_by = user.user_id
+        await self.repo.session.flush()
+        await self.repo.session.commit()
+        return await self._build_user(user.user_id, credential_kind=user.credential_kind)
+
+    async def change_current_password(
+        self, user: AuthenticatedUser, *, old_password: str, new_password: str
+    ) -> None:
+        """Change the current user's password after verifying the old one."""
+        row = await self.repo.get_user_by_id(user.user_id)
+        if row is None:
+            raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
+        if row.password is None or not await verify_password_async(
+            row.password, old_password
+        ):
+            raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
+        row.password = await hash_password_async(new_password)
+        row.updated_by = user.user_id
+        await self.repo.session.flush()
+        await self.repo.session.commit()
 
     # ---- authorization ------------------------------------------------------
 

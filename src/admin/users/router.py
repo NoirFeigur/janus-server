@@ -17,6 +17,7 @@ from src.admin.users.schemas import UserCreate, UserRead, UserUpdate
 from src.admin.users.service import UserDetail, UserService
 from src.auth.dependencies import RequiredPerms, TraceId
 from src.auth.service import AuthenticatedUser
+from src.core.pagination import Page, page
 from src.db.session import get_session
 from src.responses import SuccessEnvelope, success
 
@@ -39,16 +40,24 @@ def _to_read(detail: UserDetail) -> UserRead:
     return read
 
 
-@router.get("", response_model=SuccessEnvelope[list[UserRead]])
+@router.get("", response_model=SuccessEnvelope[Page[UserRead]])
 async def list_users(
     service: ServiceDep,
     trace_id: TraceId,
     user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:user:list"))],
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> SuccessEnvelope[list[UserRead]]:
-    details = await service.list_users(user, limit=limit, offset=offset)
-    return success([_to_read(d) for d in details], trace_id=trace_id)
+) -> SuccessEnvelope[Page[UserRead]]:
+    result = await service.list_users(user, limit=limit, offset=offset)
+    return success(
+        page(
+            [_to_read(d) for d in result.items],
+            total=result.total,
+            limit=result.limit,
+            offset=result.offset,
+        ),
+        trace_id=trace_id,
+    )
 
 
 @router.post("", response_model=SuccessEnvelope[UserRead])

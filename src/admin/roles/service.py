@@ -16,11 +16,13 @@ from starlette import status
 from src.admin.roles.repository import RoleRepository
 from src.admin.roles.schemas import RoleCreate, RoleUpdate
 from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.core.pagination import PageResult, page_result
 from src.db.models.identity import Role
 from src.enums import DataScope, ErrorCode
 from src.exceptions import AppError
 
 RoleDetail = tuple[Role, list[int], list[int]]
+RolePage = PageResult[RoleDetail]
 
 
 class RoleService:
@@ -64,17 +66,23 @@ class RoleService:
         dept_ids = await self.repo.list_dept_ids(role.id)
         return role, menu_ids, dept_ids
 
-    async def list_roles(self, actor: AuthenticatedUser) -> list[RoleDetail]:
+    async def list_roles(
+        self, actor: AuthenticatedUser, *, limit: int = 50, offset: int = 0
+    ) -> RolePage:
         scope = await self._scope(actor)
-        roles = await self.repo.list_in_scope(scope, actor_id=actor.user_id)
+        total = await self.repo.count_in_scope(scope, actor_id=actor.user_id)
+        roles = await self.repo.list_in_scope(
+            scope, actor_id=actor.user_id, limit=limit, offset=offset
+        )
         # Two bulk lookups for the whole page (was 1+2R: two queries per role).
         role_ids = [role.id for role in roles]
         menu_map = await self.repo.list_menu_ids_for_roles(role_ids)
         dept_map = await self.repo.list_dept_ids_for_roles(role_ids)
-        return [
+        items = [
             (role, menu_map.get(role.id, []), dept_map.get(role.id, []))
             for role in roles
         ]
+        return page_result(items, total=total, limit=limit, offset=offset)
 
     async def get_role(self, role_id: int, actor: AuthenticatedUser) -> RoleDetail:
         return await self._detail(await self._require_visible(role_id, actor))

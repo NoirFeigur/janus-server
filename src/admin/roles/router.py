@@ -9,13 +9,14 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.roles.schemas import RoleCreate, RoleRead, RoleUpdate
 from src.admin.roles.service import RoleDetail, RoleService
 from src.auth.dependencies import RequiredPerms, TraceId
 from src.auth.service import AuthenticatedUser
+from src.core.pagination import Page, page
 from src.db.session import get_session
 from src.responses import SuccessEnvelope, success
 
@@ -39,14 +40,24 @@ def _to_read(detail: RoleDetail) -> RoleRead:
     return read
 
 
-@router.get("", response_model=SuccessEnvelope[list[RoleRead]])
+@router.get("", response_model=SuccessEnvelope[Page[RoleRead]])
 async def list_roles(
     service: ServiceDep,
     trace_id: TraceId,
     user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:role:list"))],
-) -> SuccessEnvelope[list[RoleRead]]:
-    details = await service.list_roles(user)
-    return success([_to_read(d) for d in details], trace_id=trace_id)
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> SuccessEnvelope[Page[RoleRead]]:
+    result = await service.list_roles(user, limit=limit, offset=offset)
+    return success(
+        page(
+            [_to_read(d) for d in result.items],
+            total=result.total,
+            limit=result.limit,
+            offset=result.offset,
+        ),
+        trace_id=trace_id,
+    )
 
 
 @router.post("", response_model=SuccessEnvelope[RoleRead])

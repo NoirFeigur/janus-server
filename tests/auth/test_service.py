@@ -14,7 +14,7 @@ from src.auth.service import (
     AuthService,
     invalidate_department_tree,
 )
-from src.core.security import decode_access_token, generate_api_key
+from src.core.security import decode_access_token, generate_api_key, verify_password_async
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Role, RoleDept, UserRole
 from src.enums import DataScope
@@ -65,13 +65,121 @@ async def test_resolve_access_token_builds_principal_with_perms(
     auth_session: AsyncSession,
 ) -> None:
     user = await seed_user(auth_session)
+    user.real_name = "Alice"
+    user.email = "alice@example.com"
+    user.mobile = "13800000000"
+    user.preferred_locale = "en-US"
+    await auth_session.flush()
     await grant_permission(auth_session, user=user, perm="system:user:list")
     service = AuthService(auth_session)
     token, _ = await service.authenticate_password("alice", "secret123")
     current_user = await service.resolve_access_token(token)
     assert current_user.user_id == user.id
+    assert current_user.real_name == "Alice"
+    assert current_user.email == "alice@example.com"
+    assert current_user.mobile == "13800000000"
+    assert current_user.preferred_locale == "en-US"
     assert current_user.has_permission("system:user:list")
     assert not current_user.has_permission("system:user:remove")
+
+
+async def test_update_current_user_changes_profile(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session)
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+    updated = await service.update_current_user(
+        current_user,
+        {
+            "real_name": "Alice R.",
+            "email": "alice@example.com",
+            "mobile": None,
+            "preferred_locale": "en-US",
+        },
+    )
+    assert updated.real_name == "Alice R."
+    assert updated.email == "alice@example.com"
+    assert updated.mobile is None
+    assert updated.preferred_locale == "en-US"
+    assert user.updated_by == user.id
+
+
+async def test_update_current_user_rejects_null_locale(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session)
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+    with pytest.raises(AppError) as exc:
+        await service.update_current_user(current_user, {"preferred_locale": None})
+    assert exc.value.status_code == 400
+
+
+async def test_change_current_password_rehashes_password(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session, password="old-secret")
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+    await service.change_current_password(
+        current_user, old_password="old-secret", new_password="new-secret"
+    )
+    assert user.password is not None
+    assert await verify_password_async(user.password, "new-secret")
+    assert not await verify_password_async(user.password, "old-secret")
+    assert user.updated_by == user.id
+
+
+async def test_change_current_password_wrong_old_password_raises(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session, password="old-secret")
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+    with pytest.raises(AppError) as exc:
+        await service.change_current_password(
+            current_user, old_password="bad", new_password="new-secret"
+        )
+    assert exc.value.status_code == 401
+
+
+async def test_change_current_password_sso_only_user_raises(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session, password=None)
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+    with pytest.raises(AppError) as exc:
+        await service.change_current_password(
+            current_user, old_password="old", new_password="new-secret"
+        )
+    assert exc.value.status_code == 401
 
 
 async def test_resolve_access_token_invalid_raises(auth_session: AsyncSession) -> None:

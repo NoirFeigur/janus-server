@@ -22,12 +22,14 @@ from starlette import status
 from src.admin.users.repository import UserRepository
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.core.pagination import PageResult, page_result
 from src.core.security import hash_password_async
 from src.db.models.identity import Department, Role, User
 from src.enums import ErrorCode
 from src.exceptions import AppError
 
 UserDetail = tuple[User, list[int]]
+UserPage = PageResult[UserDetail]
 
 
 class UserService:
@@ -117,16 +119,18 @@ class UserService:
         self,
         actor: AuthenticatedUser,
         *,
-        limit: int | None = None,
-        offset: int | None = None,
-    ) -> list[UserDetail]:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> UserPage:
         scope = await self._scope(actor)
+        total = await self.repo.count_in_scope(scope, actor_id=actor.user_id)
         users = await self.repo.list_in_scope(
             scope, actor_id=actor.user_id, limit=limit, offset=offset
         )
         # One bulk role lookup for the whole page (was 1+N: one query per user).
         role_map = await self.repo.list_role_ids_for_users([u.id for u in users])
-        return [(u, role_map.get(u.id, [])) for u in users]
+        items = [(u, role_map.get(u.id, [])) for u in users]
+        return page_result(items, total=total, limit=limit, offset=offset)
 
     async def get_user(self, user_id: int, actor: AuthenticatedUser) -> UserDetail:
         return await self._detail(await self._require_visible(user_id, actor))

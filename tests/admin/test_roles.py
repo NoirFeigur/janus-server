@@ -126,7 +126,13 @@ async def test_delete_role(admin_ctx: AdminCtx) -> None:
     resp = await admin_ctx.client.delete(f"/admin/roles/{role_id}")
     assert resp.status_code == 200
     listing = await admin_ctx.client.get("/admin/roles")
-    codes = [r["code"] for r in listing.json()["data"]]
+    body = listing.json()
+    assert body["success"] is True
+    assert "items" not in body
+    assert "total" not in body
+    page = body["data"]
+    assert {"items", "total", "limit", "offset"} <= page.keys()
+    codes = [r["code"] for r in page["items"]]
     assert "tmp" not in codes
 
 

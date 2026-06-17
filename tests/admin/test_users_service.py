@@ -300,7 +300,8 @@ async def test_list_users_bulk_roles(admin_session: AsyncSession) -> None:
         UserCreate(username="a", employee_no="E-a", role_ids=[role.id]), _superuser()
     )
     await svc.create_user(UserCreate(username="b", employee_no="E-b"), _superuser())
-    listing = await svc.list_users(_superuser())
-    by_name = {u.username: roles for u, roles in listing}
+    listing = await svc.list_users(_superuser(), limit=50, offset=0)
+    by_name = {u.username: roles for u, roles in listing.items}
+    assert listing.total == 2
     assert by_name["a"] == [role.id]
     assert by_name["b"] == []  # user with no roles defaults to empty list

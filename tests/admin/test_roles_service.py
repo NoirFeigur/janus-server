@@ -249,7 +249,8 @@ async def test_list_roles_bulk_grants(admin_session: AsyncSession) -> None:
     )
     await svc.create_role(RoleCreate(name="R2", code="r2"), actor=_actor())
     listing = await svc.list_roles(_actor())
-    by_code = {r.code: (menus, depts) for r, menus, depts in listing}
+    by_code = {r.code: (menus, depts) for r, menus, depts in listing.items}
+    assert listing.total == 2
     assert by_code["r1"][0] == [m1]
     assert by_code["r2"][0] == []  # role with no menus defaults to empty list
 
@@ -290,7 +291,7 @@ async def test_scoped_actor_only_sees_roles_in_scope(
 
     svc = RoleService(admin_session)
     listing = await svc.list_roles(actor)
-    assert {role.code for role, _, _ in listing} == {"visible"}
+    assert {role.code for role, _, _ in listing.items} == {"visible"}
     with pytest.raises(AppError) as exc:
         await svc.delete_role(hidden.id, actor=actor)
     assert exc.value.status_code == 403

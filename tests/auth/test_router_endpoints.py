@@ -14,8 +14,8 @@ from typing import cast
 
 import pytest
 
-from src.auth.router import login, me
-from src.auth.schemas import LoginRequest
+from src.auth.router import change_password, login, me, update_me
+from src.auth.schemas import ChangePasswordRequest, CurrentUserUpdate, LoginRequest
 from src.auth.service import AuthenticatedUser, AuthService
 
 pytestmark = pytest.mark.asyncio
@@ -28,6 +28,28 @@ class _StubAuthService:
         assert username == "alice"
         assert password == "secret123"
         return "issued.jwt.token", 7200
+
+    async def update_current_user(
+        self, user: AuthenticatedUser, values: dict[str, str | None]
+    ) -> AuthenticatedUser:
+        assert values == {"real_name": "Alice R.", "email": None}
+        return AuthenticatedUser(
+            user_id=user.user_id,
+            username=user.username,
+            department_id=user.department_id,
+            permissions=user.permissions,
+            real_name="Alice R.",
+            email=None,
+            mobile=user.mobile,
+            preferred_locale=user.preferred_locale,
+        )
+
+    async def change_current_password(
+        self, user: AuthenticatedUser, *, old_password: str, new_password: str
+    ) -> None:
+        assert user.user_id == 123456789
+        assert old_password == "old-secret"
+        assert new_password == "new-secret"
 
 
 async def test_login_endpoint_returns_token_envelope() -> None:
@@ -50,6 +72,10 @@ async def test_me_endpoint_serializes_principal() -> None:
         username="alice",
         department_id=42,
         permissions=frozenset({"system:user:list", "*:*:*"}),
+        real_name="Alice",
+        email="alice@example.com",
+        mobile="13800000000",
+        preferred_locale="zh-CN",
     )
     envelope = await me(current_user, TRACE)
     assert envelope.success is True
@@ -58,6 +84,10 @@ async def test_me_endpoint_serializes_principal() -> None:
     assert envelope.data.user_id == "123456789"
     assert envelope.data.department_id == "42"
     assert envelope.data.username == "alice"
+    assert envelope.data.real_name == "Alice"
+    assert envelope.data.email == "alice@example.com"
+    assert envelope.data.mobile == "13800000000"
+    assert envelope.data.preferred_locale == "zh-CN"
     assert envelope.data.is_superuser is True
     assert envelope.data.permissions == sorted(["system:user:list", "*:*:*"])
 
@@ -73,3 +103,45 @@ async def test_me_endpoint_null_department() -> None:
     assert envelope.data is not None
     assert envelope.data.department_id is None
     assert envelope.data.is_superuser is False
+
+
+async def test_update_me_endpoint_returns_updated_profile() -> None:
+    current_user = AuthenticatedUser(
+        user_id=123456789,
+        username="alice",
+        department_id=42,
+        permissions=frozenset({"system:user:list"}),
+        real_name="Alice",
+        email="old@example.com",
+        mobile="13800000000",
+        preferred_locale="zh-CN",
+    )
+    envelope = await update_me(
+        CurrentUserUpdate(real_name="Alice R.", email=None),
+        current_user,
+        cast(AuthService, _StubAuthService()),
+        TRACE,
+    )
+    assert envelope.success is True
+    assert envelope.trace_id == TRACE
+    assert envelope.data is not None
+    assert envelope.data.real_name == "Alice R."
+    assert envelope.data.email is None
+
+
+async def test_change_password_endpoint_returns_empty_success() -> None:
+    current_user = AuthenticatedUser(
+        user_id=123456789,
+        username="alice",
+        department_id=42,
+        permissions=frozenset({"system:user:list"}),
+    )
+    envelope = await change_password(
+        ChangePasswordRequest(old_password="old-secret", new_password="new-secret"),
+        current_user,
+        cast(AuthService, _StubAuthService()),
+        TRACE,
+    )
+    assert envelope.success is True
+    assert envelope.data is None
+    assert envelope.trace_id == TRACE

@@ -121,7 +121,14 @@ async def test_list_users_respects_data_scope(admin_ctx: AdminCtx) -> None:
 
     resp = await admin_ctx.client.get("/admin/users")
     assert resp.status_code == 200
-    usernames = {u["username"] for u in resp.json()["data"]}
+    body = resp.json()
+    assert body["success"] is True
+    assert "items" not in body
+    assert "total" not in body
+    page = body["data"]
+    assert {"items", "total", "limit", "offset"} <= page.keys()
+    usernames = {u["username"] for u in page["items"]}
+    assert page["total"] >= 1
     assert "in500" in usernames
     assert "in600" not in usernames  # out of scope
 

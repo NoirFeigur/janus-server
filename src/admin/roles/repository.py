@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.sql.elements import ColumnElement
 
 from src.auth.service import DataScopeFilter
@@ -49,14 +49,35 @@ class RoleRepository(BaseRepository[Role]):
         scope: DataScopeFilter,
         *,
         actor_id: int,
+        limit: int | None = None,
+        offset: int | None = None,
     ) -> Sequence[Role]:
         """List non-deleted roles visible under generic data scope."""
         stmt = select(Role).where(Role.is_deleted.is_(False))
         predicate = self._scope_predicate(scope, actor_id=actor_id)
         if predicate is not None:
             stmt = stmt.where(predicate)
+        stmt = stmt.order_by(Role.sort_order, Role.id)
+        if offset is not None:
+            stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
         result = await self.session.scalars(stmt)
         return result.all()
+
+    async def count_in_scope(
+        self,
+        scope: DataScopeFilter,
+        *,
+        actor_id: int,
+    ) -> int:
+        """Count non-deleted roles visible under generic data scope."""
+        stmt = select(func.count()).select_from(Role).where(Role.is_deleted.is_(False))
+        predicate = self._scope_predicate(scope, actor_id=actor_id)
+        if predicate is not None:
+            stmt = stmt.where(predicate)
+        total = await self.session.scalar(stmt)
+        return int(total or 0)
 
     def is_visible(self, role: Role, scope: DataScopeFilter, *, actor_id: int) -> bool:
         """In-Python scope check for one role."""

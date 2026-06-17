@@ -134,13 +134,13 @@ async def test_list_users_query_count_is_constant(
     await _seed_users_with_roles(db_session, 2)
     with count_selects(sqlite_engine) as small:
         result_small = await service.list_users(actor)
-    assert len(result_small) == 2
+    assert len(result_small.items) == 2
 
     # Add three more users (5 total).
     await _seed_users_with_roles(db_session, 3, start=2)
     with count_selects(sqlite_engine) as large:
         result_large = await service.list_users(actor)
-    assert len(result_large) == 5
+    assert len(result_large.items) == 5
 
     # The invariant: query count did NOT grow with row count (no 1+N).
     assert small[0] == large[0], (
@@ -149,7 +149,7 @@ async def test_list_users_query_count_is_constant(
     )
 
     # And each user still carries its role ids (correctness preserved).
-    assert all(len(role_ids) == 1 for _user, role_ids in result_large)
+    assert all(len(role_ids) == 1 for _user, role_ids in result_large.items)
 
 
 async def test_list_roles_query_count_is_constant(
@@ -163,12 +163,12 @@ async def test_list_roles_query_count_is_constant(
     await _seed_roles_with_grants(db_session, 2)
     with count_selects(sqlite_engine) as small:
         result_small = await service.list_roles(actor)
-    assert len(result_small) == 2
+    assert len(result_small.items) == 2
 
     await _seed_roles_with_grants(db_session, 3, start=2)
     with count_selects(sqlite_engine) as large:
         result_large = await service.list_roles(actor)
-    assert len(result_large) == 5
+    assert len(result_large.items) == 5
 
     assert small[0] == large[0], (
         f"list_roles query count scaled with rows: {small[0]} (2 roles) "
@@ -178,5 +178,5 @@ async def test_list_roles_query_count_is_constant(
     # Each role still carries its menu + dept ids (correctness preserved).
     assert all(
         len(menu_ids) == 1 and len(dept_ids) == 1
-        for _role, menu_ids, dept_ids in result_large
+        for _role, menu_ids, dept_ids in result_large.items
     )
