@@ -31,6 +31,9 @@ class Settings(BaseSettings):
 
     cors_allow_origins: list[str] = Field(default_factory=list)
 
+    log_level: str = "INFO"  # 根 logger 级别（DEBUG/INFO/WARNING/ERROR）
+    log_json: bool = True  # True=JSON 行（生产/采集）；False=彩色控制台（本地开发）
+
 
 @lru_cache
 def get_settings() -> Settings:
