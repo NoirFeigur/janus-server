@@ -8,6 +8,7 @@ inject a throwaway RSA keypair into the cached Settings via monkeypatch (auto
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Iterator
 
@@ -18,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import SecretStr
 
 from src.config import Settings, get_settings
+from src.core import security
 from src.core.security import (
     PlatformAccessClaims,
     TokenError,
@@ -25,8 +27,10 @@ from src.core.security import (
     generate_api_key,
     hash_api_key,
     hash_password,
+    hash_password_async,
     issue_access_token,
     verify_password,
+    verify_password_async,
 )
 
 # ---- password (argon2) ------------------------------------------------------
@@ -51,6 +55,53 @@ def test_verify_password_malformed_hash_returns_false() -> None:
 def test_hash_password_is_salted() -> None:
     """同一密码两次哈希应不同(盐随机)。"""
     assert hash_password("same") != hash_password("same")
+
+
+# ---- password (async wrappers + concurrency gate) --------------------------
+
+
+async def test_hash_password_async_roundtrip() -> None:
+    """异步包装产出的哈希,同步 verify 能验过(等价于同步路径)。"""
+    h = await hash_password_async("async-pw")
+    assert h != "async-pw"
+    assert await verify_password_async(h, "async-pw") is True
+    assert await verify_password_async(h, "nope") is False
+
+
+async def test_argon2_concurrency_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """并发 ``hash_password_async`` 同时在跑的数量不超过配置上限。
+
+    把上限压到 2,用一个计数 + 锁记录峰值在飞数;替换 ``security.hash_password`` 为带短
+    暂停的探针(在线程池里跑),并发发起 6 个,断言观察到的峰值 ≤ 2。
+    """
+    import threading
+    import time as _time
+
+    monkeypatch.setattr(get_settings(), "argon2_max_concurrency", 2)
+    # 清掉可能已按当前 loop 建好的旧信号量,确保用上面压低的上限重建。
+    security._argon2_semaphores.clear()
+
+    lock = threading.Lock()
+    state = {"current": 0, "peak": 0}
+
+    def _probe(_plain: str) -> str:
+        with lock:
+            state["current"] += 1
+            state["peak"] = max(state["peak"], state["current"])
+        _time.sleep(0.02)  # 拉长窗口,逼并发真正叠加
+        with lock:
+            state["current"] -= 1
+        return "h"
+
+    monkeypatch.setattr(security, "hash_password", _probe)
+
+    await asyncio.gather(*(hash_password_async(f"p{i}") for i in range(6)))
+
+    assert state["peak"] <= 2, f"argon2 并发峰值 {state['peak']} 超过上限 2"
+    assert state["peak"] >= 2, "探针未真正并发,测试无意义"
+
 
 
 # ---- sk-key (sha256) --------------------------------------------------------

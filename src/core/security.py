@@ -13,9 +13,11 @@ dependency)翻译成带 ``ErrorCode`` 的 ``AppError``。
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 import time
+import weakref
 
 import jwt
 from argon2 import PasswordHasher
@@ -28,6 +30,23 @@ from src.config import get_settings
 # ---- 密码(argon2,低熵人造密码) ---------------------------------------------
 
 _password_hasher = PasswordHasher()
+
+# 限制并发 argon2 操作数(见 config.argon2_max_concurrency 注释:memory-hard 哈希的
+# DoS 护栏)。信号量与事件循环绑定,而测试每个用例各自起循环,故按 loop 维护一把——用
+# WeakKeyDictionary 让循环结束即自动回收,绝不跨循环复用同一信号量(会 RuntimeError)。
+_argon2_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _argon2_gate() -> asyncio.Semaphore:
+    """Return the argon2 concurrency semaphore bound to the running event loop."""
+    loop = asyncio.get_running_loop()
+    sem = _argon2_semaphores.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(get_settings().argon2_max_concurrency)
+        _argon2_semaphores[loop] = sem
+    return sem
 
 
 def hash_password(plain: str) -> str:
@@ -45,6 +64,20 @@ def verify_password(password_hash: str, plain: str) -> bool:
         return _password_hasher.verify(password_hash, plain)
     except (Argon2Error, InvalidHashError):
         return False
+
+
+async def hash_password_async(plain: str) -> str:
+    """``hash_password`` 的异步包装:argon2 是故意慢的 CPU 密集哈希,直接在事件循环里
+    跑会阻塞整个进程的所有并发请求。丢到线程池跑,让循环在哈希期间继续服务他人;并发数
+    受 :func:`_argon2_gate` 上限约束(防洪峰打爆内存/CPU)。"""
+    async with _argon2_gate():
+        return await asyncio.to_thread(hash_password, plain)
+
+
+async def verify_password_async(password_hash: str, plain: str) -> bool:
+    """``verify_password`` 的异步包装(同 ``hash_password_async`` 的事件循环 + 并发考量)。"""
+    async with _argon2_gate():
+        return await asyncio.to_thread(verify_password, password_hash, plain)
 
 
 # ---- sk-key(高熵随机串,sha256 快哈希) -------------------------------------
