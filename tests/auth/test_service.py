@@ -7,7 +7,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.service import AuthenticatedAccount, AuthService
+from src.admin.departments.schemas import DepartmentUpdate
+from src.admin.departments.service import DepartmentService
+from src.auth.service import AuthenticatedAccount, AuthService, invalidate_department_tree
 from src.core.security import decode_access_token, generate_api_key
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Role, UserRole
@@ -217,3 +219,70 @@ async def test_data_scope_dept_and_child_includes_subtree(
     scope = await service.resolve_data_scope(account)
     assert scope.department_ids == frozenset({1, 2, 3})
     assert 9 not in scope.department_ids
+
+
+async def test_data_scope_caches_dept_tree_until_invalidated(
+    auth_session: AsyncSession,
+) -> None:
+    """The dept tree is cached: a new descendant added behind the cache is NOT
+    seen until the cache is invalidated (the contract dept mutations rely on)."""
+    auth_session.add_all(
+        [
+            Department(id=1, name="root", parent_id=None),
+            Department(id=2, name="child", parent_id=1),
+        ]
+    )
+    await auth_session.flush()
+    service, _ = await _principal_with_role(
+        auth_session, data_scope="dept_and_child", department_id=1
+    )
+    token, _ = await service.authenticate_password("alice", "secret123")
+    account = await service.resolve_access_token(token)
+
+    # Prime the cache with the {1, 2} tree.
+    first = await service.resolve_data_scope(account)
+    assert first.department_ids == frozenset({1, 2})
+
+    # Add a grandchild straight into the DB, bypassing DepartmentService (so no
+    # invalidation fires). The cached tree must still be served — proves caching.
+    auth_session.add(Department(id=3, name="grandchild", parent_id=2))
+    await auth_session.flush()
+    stale = await service.resolve_data_scope(account)
+    assert stale.department_ids == frozenset({1, 2})  # 3 not visible: cache hit
+
+    # Invalidate (what every dept mutation does after commit) → fresh read.
+    await invalidate_department_tree()
+    fresh = await service.resolve_data_scope(account)
+    assert fresh.department_ids == frozenset({1, 2, 3})
+
+
+async def test_department_mutation_invalidates_scope_cache(
+    auth_session: AsyncSession,
+) -> None:
+    """End-to-end: a DepartmentService mutation drops the cached tree, so the
+    next data-scope resolution reflects the structural change immediately."""
+    auth_session.add_all(
+        [
+            Department(id=1, name="root", parent_id=None),
+            Department(id=2, name="child", parent_id=1),
+        ]
+    )
+    await auth_session.flush()
+    service, _ = await _principal_with_role(
+        auth_session, data_scope="dept_and_child", department_id=1
+    )
+    token, _ = await service.authenticate_password("alice", "secret123")
+    account = await service.resolve_access_token(token)
+
+    primed = await service.resolve_data_scope(account)
+    assert primed.department_ids == frozenset({1, 2})
+
+    # Reparent dept 2 to be a sibling of root via the real service path.
+    dept_service = DepartmentService(auth_session)
+    await dept_service.update_department(
+        2, DepartmentUpdate(parent_id=None), actor_id=1
+    )
+
+    # Cache was invalidated on commit → dept 2 no longer in dept 1's subtree.
+    after = await service.resolve_data_scope(account)
+    assert after.department_ids == frozenset({1})

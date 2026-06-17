@@ -27,17 +27,27 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
+from src.auth import dept_tree_cache
+from src.auth.dept_tree_cache import DeptPair, invalidate_department_tree
 from src.auth.repository import AuthRepository
+from src.core import cache
 from src.core.security import (
     TokenError,
     decode_access_token,
     hash_api_key,
     issue_access_token,
-    verify_password,
+    verify_password_async,
 )
-from src.db.models.identity import Department, Role
+from src.db.models.identity import Role
 from src.enums import DataScope, ErrorCode
 from src.exceptions import AppError
+
+__all__ = [
+    "AuthService",
+    "AuthenticatedAccount",
+    "DataScopeFilter",
+    "invalidate_department_tree",
+]
 
 _SUPERUSER_PERM = "*:*:*"  # Wildcard grant: bypasses every permission check.
 
@@ -96,11 +106,11 @@ def _is_expired(expires_at: datetime | None) -> bool:
     return expires_at < _now_utc()
 
 
-def _collect_subtree(root_ids: Iterable[int], departments: Sequence[Department]) -> set[int]:
+def _collect_subtree(root_ids: Iterable[int], dept_pairs: Sequence[DeptPair]) -> set[int]:
     """Root department ids plus all their descendants (adjacency-list walk)."""
     children: dict[int | None, list[int]] = defaultdict(list)
-    for dept in departments:
-        children[dept.parent_id].append(dept.id)
+    for dept_id, parent_id in dept_pairs:
+        children[parent_id].append(dept_id)
     collected: set[int] = set()
     stack = list(root_ids)
     while stack:
@@ -127,7 +137,9 @@ class AuthService:
         collapse to one opaque 401 — no user-enumeration oracle.
         """
         user = await self.repo.get_user_by_username(username)
-        if user is None or user.password is None or not verify_password(user.password, password):
+        if user is None or user.password is None:
+            raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
+        if not await verify_password_async(user.password, password):
             raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
         return issue_access_token(user.id)
 
@@ -226,12 +238,25 @@ class AuthService:
                 include_self = True
 
         if subtree_roots:
-            department_ids |= _collect_subtree(
-                subtree_roots, await self.repo.list_all_departments()
-            )
+            department_ids |= _collect_subtree(subtree_roots, await self._load_dept_tree())
 
         return DataScopeFilter(
             unrestricted=False,
             department_ids=frozenset(department_ids),
             include_self=include_self,
+        )
+
+    async def _load_dept_tree(self) -> list[DeptPair]:
+        """Department adjacency, cache-aside (short TTL, fail-open to DB)."""
+
+        async def _from_db() -> list[DeptPair]:
+            depts = await self.repo.list_all_departments()
+            return [(d.id, d.parent_id) for d in depts]
+
+        return await cache.get_or_load(
+            dept_tree_cache.CACHE_KEY,
+            _from_db,
+            ttl_seconds=dept_tree_cache.TTL_SECONDS,
+            dumps=dept_tree_cache.encode,
+            loads=dept_tree_cache.decode,
         )

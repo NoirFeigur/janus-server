@@ -18,6 +18,7 @@ from starlette import status
 
 from src.admin.departments.repository import DepartmentRepository
 from src.admin.departments.schemas import DepartmentCreate, DepartmentUpdate
+from src.auth.dept_tree_cache import invalidate_department_tree
 from src.db.models.identity import Department
 from src.enums import ErrorCode
 from src.exceptions import AppError
@@ -58,6 +59,7 @@ class DepartmentService:
         )
         await self.repo.create(dept)
         await self.session.commit()
+        await invalidate_department_tree()
         return dept
 
     async def update_department(
@@ -70,6 +72,7 @@ class DepartmentService:
         values["updated_by"] = actor_id
         await self.repo.update(dept, **values)
         await self.session.commit()
+        await invalidate_department_tree()
         return dept
 
     async def delete_department(self, dept_id: int, *, actor_id: int) -> None:
@@ -81,6 +84,7 @@ class DepartmentService:
         dept.updated_by = actor_id
         await self.repo.soft_delete(dept)
         await self.session.commit()
+        await invalidate_department_tree()
 
     async def _validate_reparent(self, dept_id: int, new_parent: int | None) -> None:
         """Reject a parent that doesn't exist, is self, or is a descendant."""
