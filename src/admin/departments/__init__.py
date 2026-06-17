@@ -1,0 +1,1 @@
+"""Admin departments sub-package."""
