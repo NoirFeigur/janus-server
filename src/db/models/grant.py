@@ -18,23 +18,6 @@ class UserModelGrant(BaseEntity):
     """Model assignment: who may use which logical models (§2.5)."""
 
     __tablename__ = "user_model_grant"
-
-    scope: Mapped[str] = mapped_column(
-        String(16), index=True
-    )  # GrantScope: user | department.
-    scope_id: Mapped[int] = mapped_column(
-        BigInteger, index=True
-    )  # scope=user -> sys_user.id; scope=department -> sys_department.id.
-
-    logical_model_id: Mapped[int] = mapped_column(
-        BigInteger, index=True
-    )  # -> logical_model.
-    is_default: Mapped[bool] = mapped_column(
-        default=False
-    )  # Default model for this scope when the employee omits ``model``.
-
-    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
-
     __table_args__ = (
         Index(
             "uq_grant_scope_logical_model_active",
@@ -51,4 +34,28 @@ class UserModelGrant(BaseEntity):
             unique=True,
             postgresql_where=text("is_default = true AND is_deleted = false"),
         ),  # At most one default model per subject.
+        {"comment": "模型分配：谁（用户/部门）可用哪些逻辑模型 + 默认模型"},
+    )
+
+    scope: Mapped[str] = mapped_column(
+        String(16),
+        index=True,
+        comment="授予范围 GrantScope：user=用户 | department=部门",
+    )
+    scope_id: Mapped[int] = mapped_column(
+        BigInteger,
+        index=True,
+        comment="scope=user 指向 sys_user.id；scope=department 指向 sys_department.id",
+    )
+
+    logical_model_id: Mapped[int] = mapped_column(
+        BigInteger, index=True, comment="逻辑模型 logical_model.id"
+    )
+    is_default: Mapped[bool] = mapped_column(
+        default=False,
+        comment="是否该 scope 的默认模型（员工未传 model 时用）",
+    )
+
+    remark: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment="备注"
     )

@@ -33,21 +33,39 @@ class BaseEntity(Base):
     __abstract__ = True
 
     id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=False, default=next_id
-    )  # Snowflake id, application-assigned (§0.2).
-    is_deleted: Mapped[bool] = mapped_column(default=False)  # Soft-delete flag.
-    created_by: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True
-    )  # sys_user.id soft reference; null = system action.
-    create_dept: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, index=True
-    )  # sys_department.id soft reference for generic data-scope filtering.
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        BigInteger,
+        primary_key=True,
+        autoincrement=False,
+        default=next_id,
+        comment="主键：雪花 ID，应用层分配（非自增）",
     )
-    updated_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    is_deleted: Mapped[bool] = mapped_column(
+        default=False, comment="软删标记：true=已删除（逻辑删除，不物理删行）"
+    )
+    created_by: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="创建人 sys_user.id（逻辑引用，无物理外键）；null=系统操作",
+    )
+    create_dept: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        index=True,
+        comment="创建部门 sys_department.id（逻辑引用），用于数据权限过滤",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        comment="创建时间（timestamptz，UTC，由数据库 now() 生成）",
+    )
+    updated_by: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="最后更新人 sys_user.id（逻辑引用）"
+    )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        comment="最后更新时间（timestamptz，UTC，更新时自动刷新）",
     )
 
 
@@ -57,10 +75,16 @@ class LogEntity(Base):
     __abstract__ = True
 
     id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=False, default=next_id
-    )  # Snowflake id, application-assigned (§0.2).
+        BigInteger,
+        primary_key=True,
+        autoincrement=False,
+        default=next_id,
+        comment="主键：雪花 ID，应用层分配（非自增）",
+    )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        DateTime(timezone=True),
+        server_default=func.now(),
+        comment="创建时间（timestamptz，UTC，由数据库 now() 生成）",
     )
 
 
@@ -76,8 +100,14 @@ class LinkEntity(Base):
     __abstract__ = True
 
     id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=False, default=next_id
-    )  # Snowflake id, application-assigned (§0.2).
+        BigInteger,
+        primary_key=True,
+        autoincrement=False,
+        default=next_id,
+        comment="主键：雪花 ID，应用层分配（非自增）",
+    )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        DateTime(timezone=True),
+        server_default=func.now(),
+        comment="创建时间（timestamptz，UTC，由数据库 now() 生成）",
     )
