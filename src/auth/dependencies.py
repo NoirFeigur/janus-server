@@ -1,8 +1,9 @@
 """Auth FastAPI dependencies (README: router layer wiring).
 
-Bridges HTTP → the auth domain. The admin console uses JWT-only dependencies;
-gateway/MCP can opt into the broader JWT-or-sk-key dependency. ``RequiredPerms``
-is the admin gate factory and therefore always uses a JWT user.
+Bridges HTTP → the auth domain. The admin console and resource-management APIs
+use JWT-only dependencies; LLM inference and MCP protocol handlers can opt into
+the broader JWT-or-sk-key dependency. ``RequiredPerms`` is the admin gate
+factory and therefore always uses a JWT user.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ async def get_current_user(
     authorization: Annotated[str | None, Header()] = None,
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ) -> AuthenticatedUser:
-    """Resolve JWT or sk-key to a user (gateway/MCP surface)."""
+    """Resolve JWT or sk-key to a user (programmatic protocol surface)."""
     credential = extract_credential(authorization, x_api_key, allow_api_key=True)
     if credential.kind == CredentialKind.api_key:
         return await service.resolve_api_key(credential.value)

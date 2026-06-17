@@ -1,8 +1,9 @@
 """Central authentication middleware.
 
 This middleware gives the service a default-deny authentication layer: public
-paths are explicit, admin/auth user endpoints require JWT, and gateway/MCP paths
-may use either JWT or sk-key. RBAC remains in route dependencies.
+paths are explicit, admin/auth/resource-management endpoints require JWT, and
+only LLM inference endpoints plus the MCP protocol endpoint may use sk-key. RBAC
+remains in route dependencies.
 """
 
 from __future__ import annotations
@@ -31,15 +32,36 @@ PUBLIC_PATHS = frozenset(
     }
 )
 
-API_KEY_PATH_PREFIXES = ("/gateway", "/mcp")
+LLM_API_KEY_PATHS = frozenset(
+    {
+        "/v1/chat/completions",
+        "/v1/messages",
+    }
+)
+LLM_API_KEY_METHODS = frozenset({"POST"})
+MCP_API_KEY_PATHS = frozenset({"/mcp", "/mcp/"})
+MCP_API_KEY_METHODS = frozenset({"GET", "POST"})
+GEMINI_API_KEY_ACTIONS = (":generateContent", ":streamGenerateContent")
 
 
 def _is_public_path(path: str) -> bool:
     return path in PUBLIC_PATHS
 
 
-def _allows_api_key(path: str) -> bool:
-    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in API_KEY_PATH_PREFIXES)
+def _is_gemini_generation_path(path: str) -> bool:
+    prefix = "/v1beta/models/"
+    if not path.startswith(prefix):
+        return False
+    model_and_action = path.removeprefix(prefix)
+    return bool(model_and_action) and model_and_action.endswith(GEMINI_API_KEY_ACTIONS)
+
+
+def _allows_api_key(path: str, method: str) -> bool:
+    if method in LLM_API_KEY_METHODS and (
+        path in LLM_API_KEY_PATHS or _is_gemini_generation_path(path)
+    ):
+        return True
+    return method in MCP_API_KEY_METHODS and path in MCP_API_KEY_PATHS
 
 
 def _strip_api_prefix(path: str, api_prefix: str) -> str:
@@ -63,7 +85,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         try:
-            allow_api_key = _allows_api_key(path)
+            allow_api_key = _allows_api_key(path, request.method.upper())
             credential = extract_credential(
                 request.headers.get("authorization"),
                 request.headers.get("x-api-key"),

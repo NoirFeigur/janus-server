@@ -2,7 +2,7 @@
 
 The platform has two credential classes:
 - JWT: interactive/admin session credential.
-- sk-key: programmatic credential for gateway/MCP calls only.
+- sk-key: programmatic credential for LLM/MCP protocol calls only.
 """
 
 from __future__ import annotations

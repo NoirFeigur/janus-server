@@ -64,7 +64,7 @@ Hermes / Claude Code / OA系统 / 脚本 / 其他应用
 | G2 | build / buy | **自建**：控制面与前端全部自研；**不引入任何独立开源网关服务**（不要 one-api / 不要 LiteLLM Proxy） |
 | G3 | 上游适配方式 | **`import litellm` 当库**用于「上游协议格式翻译 + 韧性（Router）」；**绝不 fork / vendor 其源码** |
 | G4 | 技术栈 | **Python / FastAPI**（生态成熟，异步流式契合 500 并发场景，MCP SDK 生态好） |
-| G5 | 身份模型 | 主体只有一种：**用户主体（`sys_user.id` / `user_id`）**；凭据分层：后台管理面只接受 JWT，LLM Gateway 与 MCP 额外接受 **`sk-xxxx` 静态 key**。JWT 与 sk-key 都归因到同一个 `user_id` / 配额桶，但 sk-key 不等同后台登录态 |
+| G5 | 身份模型 | 主体只有一种：**用户主体（`sys_user.id` / `user_id`）**；凭据分层：后台管理面与资源管理 API 只接受 JWT，LLM 推理协议端点与 MCP 协议端点额外接受 **`sk-xxxx` 静态 key**。JWT 与 sk-key 都归因到同一个 `user_id` / 配额桶，但 sk-key 不等同后台登录态 |
 | G6 | 两层归因 | **暂不做**（服务账号代调用时，只算调用方用户的账，不追溯背后员工） |
 | G7 | 部署形态 | **模块化单体**：一个 repo，按领域分包。**默认起步 = N 个全功能副本 + nginx 做 HA/扩容**（同一产物复制多份）；**角色拆分**（auth+admin / llm-gateway / mcp-gateway）为后续触发式演进选项，切换只改启动方式不动代码。共享 Postgres + Redis |
 | G8 | 编排基础设施 | **Docker Compose**（2000 员工 / 峰值 500 并发，**不上 k8s**；容器将来可无缝迁 k8s） |
@@ -391,7 +391,7 @@ user_model_grant        模型分配 = 用户/部门 能用哪些逻辑模型
 
 ### 鉴权（标准 Bearer + 自定义 TokenVerifier，承载 JWT/sk-key，维持 G5）
 
-- **传输层用 MCP 标准 `Authorization: Bearer <token>`**，token 就是我们自己的**企微 JWT** 或**个人 sk-key**——与 LLM 网关**完全同一套凭据层**（G5）。
+- **传输层用 MCP 标准 `Authorization: Bearer <token>`**，token 就是我们自己的**企微 JWT** 或**个人 sk-key**——与 LLM 推理协议入口**同一套凭据层**（G5）。注意：只有 MCP 协议端点接受 sk-key，MCP 相关资源/管理 API 仍按后台管理面处理，JWT-only。
 - **接 SDK 一等公民鉴权钩子 `TokenVerifier`** 自验，**不上 OAuth 2.1 discovery**（不实现授权服务器、不发 protected-resource metadata）：
   ```python
   from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -500,15 +500,15 @@ MCP 模块对核心数据模型增量为 **0**，全部复用现有设施：
 
 | 凭据 | 主体 | 签发方式 | 用途 |
 |---|---|---|---|
-| 平台/企微 JWT | `user_id` | 账密/扫码登录，短期 access + refresh | 后台管理面、Hermes 桌面端、Gateway/MCP |
-| `sk-xxxx` 静态 key | `user_id` | 自助门户生成 | **仅 Gateway/MCP 程序化调用**：脚本 / curl / OA 系统；不用于后台管理系统 |
+| 平台/企微 JWT | `user_id` | 账密/扫码登录，短期 access + refresh | 后台管理面、资源管理 API、Hermes 桌面端、LLM/MCP 协议调用 |
+| `sk-xxxx` 静态 key | `user_id` | 自助门户生成 | **仅 LLM/MCP 协议端点的程序化调用**：脚本 / curl / OA 系统；不用于后台管理系统或资源 CRUD |
 
-**两类凭据都解析成同一个 `user_id`**，落到同一个配额桶；但后台管理面只接受 JWT。Gateway/MCP 鉴权层分流：
+**两类凭据都解析成同一个 `user_id`**，落到同一个配额桶；但后台管理面和资源管理 API 只接受 JWT。LLM/MCP 协议端点鉴权层分流：
 
 ```
 Authorization: Bearer xxx
   ├─ 是 JWT（验签通过） → user_id principal
-  └─ 是 sk-xxxx → DB 哈希查表 → user_id principal（仅 gateway/mcp）
+  └─ 是 sk-xxxx → DB 哈希查表 → user_id principal（仅 LLM/MCP 协议端点）
 之后：统一 principal → 一个配额桶 → 路由 / 记账（只写一遍）
 ```
 

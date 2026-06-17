@@ -39,8 +39,34 @@ async def _client(
     async def admin_ping(request: Request) -> dict[str, int]:
         return {"user_id": request.state.user.user_id}
 
-    @app.get("/gateway/ping")
-    async def gateway_ping(request: Request) -> dict[str, int | None]:
+    @app.post("/v1/chat/completions")
+    async def openai_chat(request: Request) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
+    @app.post("/v1beta/models/{model_and_action:path}")
+    async def gemini_generate(
+        model_and_action: str, request: Request
+    ) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
+    @app.post("/mcp")
+    async def mcp_protocol(request: Request) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
+    @app.get("/gateway/keys")
+    async def gateway_resource(request: Request) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
+    @app.get("/v1/messages")
+    async def anthropic_messages_resource(request: Request) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
+    @app.get("/mcp/tools")
+    async def mcp_resource(request: Request) -> dict[str, int | None]:
         return {"api_key_id": request.state.user.api_key_id}
 
     async with sqlite_session_factory() as session:
@@ -81,7 +107,7 @@ async def test_admin_rejects_missing_and_sk_key(
         assert sk.json()["code"] == "auth.invalid_token"
 
 
-async def test_gateway_allows_sk_key(
+async def test_llm_and_mcp_protocol_endpoints_allow_sk_key(
     sqlite_engine,
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -96,7 +122,7 @@ async def test_gateway_allows_sk_key(
         await session.flush()
         key = ApiKey(
             user_id=user.id,
-            name="gateway",
+            name="programmatic",
             key_hash=key_hash,
             key_prefix=prefix,
             status="active",
@@ -104,6 +130,27 @@ async def test_gateway_allows_sk_key(
         session.add(key)
         await session.commit()
 
-        resp = await client.get("/gateway/ping", headers={"X-API-Key": plaintext})
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["api_key_id"] == key.id
+        for method, path in (
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/messages"),
+            ("POST", "/v1beta/models/gemini-pro:generateContent"),
+            ("POST", "/mcp"),
+        ):
+            resp = await client.request(method, path, headers={"X-API-Key": plaintext})
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["api_key_id"] == key.id
+
+
+async def test_resource_management_paths_reject_sk_key(
+    sqlite_engine,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_TABLES)
+        )
+    async for client, _session in _client(sqlite_session_factory):
+        for path in ("/gateway/keys", "/mcp/tools", "/v1/messages"):
+            resp = await client.get(path, headers={"Authorization": "Bearer sk-test"})
+            assert resp.status_code == 401
+            assert resp.json()["code"] == "auth.invalid_token"
