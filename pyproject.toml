@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "alembic>=1.16,<2",
+    "argon2-cffi>=25.1,<26",
     "arq>=0.26,<1",
     "asyncpg>=0.30,<1",
     "cryptography>=45,<47",
@@ -22,15 +23,18 @@ dependencies = [
     "pyjwt[crypto]>=2.10,<3",
     "redis>=5,<7",
     "sqlalchemy[asyncio]>=2.0.41,<3",
+    "structlog>=26.1,<27",
     "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "aiosqlite>=0.21,<1",
+    "fakeredis>=2.36,<3",
     "mypy>=1.16,<2",
     "pytest>=8.4,<9",
     "pytest-asyncio>=1.0,<2",
+    "pytest-cov>=7.1,<8",
     "ruff>=0.11,<1",
 ]
 
