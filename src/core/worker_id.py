@@ -27,8 +27,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
-from collections.abc import Awaitable
-from dataclasses import dataclass
+import signal
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import cast
 
 from redis.asyncio import Redis
@@ -41,6 +42,17 @@ from src.core.snowflake import _MAX_WORKER_ID, set_worker_id
 _log = get_logger(__name__)
 
 _KEY_PREFIX = "snowflake:worker_id:"
+
+
+def _signal_self_terminate() -> None:
+    """Default lease-lost action: ask this process to shut down gracefully.
+
+    Raising SIGTERM in-process triggers the ASGI server's graceful-shutdown path
+    (lifespan teardown runs, in-flight requests drain) and the orchestrator then
+    restarts the replica, which re-leases a fresh worker-id. We do NOT hard-exit:
+    a half-released lease or a torn-down event loop is worse than a clean signal.
+    """
+    signal.raise_signal(signal.SIGTERM)
 
 # Renew the lease iff we still own it (value matches our token). Returns 1 on
 # renew, 0 if the key vanished or was taken over (we lost the lease).
@@ -76,6 +88,11 @@ class WorkerIdLease:
     _token: str
     _ttl_seconds: int
     _heartbeat: asyncio.Task[None] | None = None
+    # Invoked once if the heartbeat detects the lease was lost (TTL lapsed and
+    # the id was re-leased by another replica). Defaults to signalling this
+    # process to shut down gracefully; injectable so tests can assert the
+    # fail-fast fires without actually terminating the test runner.
+    _on_lease_lost: Callable[[], None] = field(default=_signal_self_terminate)
 
     @property
     def _key(self) -> str:
@@ -101,10 +118,15 @@ class WorkerIdLease:
                 _log.warning("worker_id.heartbeat_error", worker_id=self.worker_id)
                 continue
             if not renewed:
-                # We lost the lease (TTL lapsed during a Redis partition and the id
-                # was re-leased). Surfacing loudly beats silently minting colliding
-                # ids under a worker-id we no longer own.
+                # We lost the lease (TTL lapsed during a Redis partition and the
+                # id was re-leased by another replica). Continuing would mint
+                # snowflake ids under a worker-id we no longer own → primary-key
+                # collisions across replicas. Fail fast: trigger graceful
+                # shutdown and STOP the heartbeat (do not keep renewing a lease we
+                # lost, and do not keep the process alive minting colliding ids).
                 _log.error("worker_id.lease_lost", worker_id=self.worker_id)
+                self._on_lease_lost()
+                return
 
     async def release(self) -> None:
         """Stop the heartbeat and release the id (compare-and-delete)."""

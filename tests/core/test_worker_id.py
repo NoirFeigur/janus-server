@@ -257,11 +257,57 @@ async def test_heartbeat_surfaces_lost_lease(
     redis = _LeaseRedis()
     # Our id was taken over (TTL lapsed, re-leased) → renew compare fails.
     redis._data[_key(7)] = "successor-token"
+    # Inject a no-op lease-lost action so the heartbeat does NOT signal SIGTERM
+    # to the test process (the production default is _signal_self_terminate).
+    fired: list[bool] = []
     lease = WorkerIdLease(
-        worker_id=7, _redis=redis, _token="our-token", _ttl_seconds=30  # type: ignore[arg-type]
+        worker_id=7,
+        _redis=redis,  # type: ignore[arg-type]
+        _token="our-token",
+        _ttl_seconds=30,
+        _on_lease_lost=lambda: fired.append(True),
     )
     await _run_heartbeat_iterations(lease, monkeypatch, iterations=1)
     assert ("error", "worker_id.lease_lost") in rec.events
+
+
+async def test_heartbeat_lost_lease_triggers_fail_fast_and_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost lease must fire the shutdown action exactly once AND stop renewing.
+
+    Continuing to mint snowflake ids under a worker-id we no longer own would
+    collide primary keys across replicas, so on lease loss the heartbeat invokes
+    the injected fail-fast action and returns (does not loop). We assert both: the
+    action fired exactly once, and the loop exited on its own (our fake_sleep is
+    never asked for a second tick because _run_heartbeat returned).
+    """
+    rec = _RecordingLog()
+    monkeypatch.setattr(worker_id_module, "_log", rec)
+    redis = _LeaseRedis()
+    redis._data[_key(9)] = "successor-token"  # lease already lost
+    fired: list[bool] = []
+    lease = WorkerIdLease(
+        worker_id=9,
+        _redis=redis,  # type: ignore[arg-type]
+        _token="our-token",
+        _ttl_seconds=30,
+        _on_lease_lost=lambda: fired.append(True),
+    )
+
+    sleep_calls = {"n": 0}
+
+    async def counting_sleep(_seconds: float) -> None:
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] > 10:  # safety net: loop should have already returned
+            raise AssertionError("heartbeat did not stop after losing the lease")
+
+    monkeypatch.setattr(worker_id_module.asyncio, "sleep", counting_sleep)
+    # No CancelledError needed — a correct implementation returns on lease loss.
+    await lease._run_heartbeat()
+
+    assert fired == [True]  # fail-fast fired exactly once
+    assert sleep_calls["n"] == 1  # slept once, lost lease, returned (no re-loop)
 
 
 async def test_start_heartbeat_is_idempotent(
