@@ -1,0 +1,34 @@
+# Keep the build context lean and reproducible: never ship local cruft, secrets,
+# or test/CI artifacts into the image. The Dockerfile copies only src/ + alembic/
+# + the locked manifest, but this also shrinks the context uploaded to the daemon.
+
+# Python runtime cruft
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs (the image builds its own via uv)
+.venv/
+venv/
+
+# Secrets — NEVER bake into an image
+.env
+*.pem
+*.key
+
+# Local dev / VCS / editor
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+*.md
+docs/
+
+# The docker artifacts themselves don't belong inside the image
+docker/

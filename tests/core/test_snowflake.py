@@ -106,3 +106,53 @@ def test_clock_rollback_spins_until_caught_up(monkeypatch: pytest.MonkeyPatch) -
     extracted_ms = (value >> snowflake._TIMESTAMP_SHIFT) + snowflake._EPOCH_MS
     assert extracted_ms == base
     assert value & snowflake._MAX_SEQUENCE == 1
+
+
+def test_small_clock_rollback_within_threshold_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rollback at the threshold boundary is waited out, not raised.
+
+    A drift exactly equal to ``_MAX_ROLLBACK_WAIT_MS`` is the largest jump we
+    still absorb by waiting; it must catch up and mint an id, never raise. The
+    real ``time.sleep(0.001)`` in the wait loop is harmless here (one short nap).
+    """
+    base = 3_000_000_000_000
+    snowflake._last_ms = base
+    snowflake._sequence = 0
+    rollback = snowflake._MAX_ROLLBACK_WAIT_MS  # exactly at the boundary
+
+    # Behind by the full threshold once, then the clock catches up to base.
+    readings = iter([base - rollback, base])
+
+    def rolling_now_ms() -> int:
+        try:
+            return next(readings)
+        except StopIteration:
+            return base
+
+    monkeypatch.setattr(snowflake, "_now_ms", rolling_now_ms)
+    value = snowflake.next_id()
+    extracted_ms = (value >> snowflake._TIMESTAMP_SHIFT) + snowflake._EPOCH_MS
+    assert extracted_ms == base  # caught up, minted under the recovered clock
+
+
+def test_large_clock_rollback_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rollback larger than the threshold raises instead of hanging.
+
+    A multi-second backwards jump (manual clock set / big NTP correction) cannot
+    be waited out without stalling every caller behind ``_lock`` for the full
+    rollback. ``next_id`` must raise ``ClockRollbackError`` immediately so the
+    misconfiguration surfaces rather than freezing id minting.
+    """
+    base = 4_000_000_000_000
+    snowflake._last_ms = base
+    snowflake._sequence = 0
+    # One ms past the threshold → fail-fast territory.
+    rolled_back = base - (snowflake._MAX_ROLLBACK_WAIT_MS + 1)
+
+    monkeypatch.setattr(snowflake, "_now_ms", lambda: rolled_back)
+    with pytest.raises(snowflake.ClockRollbackError):
+        snowflake.next_id()
+    # _last_ms must be untouched — we refused to mint, not advanced the clock.
+    assert snowflake._last_ms == base

@@ -57,6 +57,8 @@ class ObjectStorage:
         access_key: str | None,
         secret_key: str | None,
         presign_ttl_seconds: int,
+        connect_timeout_seconds: float,
+        read_timeout_seconds: float,
     ) -> None:
         if not access_key or not secret_key:
             raise ValueError(
@@ -69,6 +71,8 @@ class ObjectStorage:
         self._access_key = access_key
         self._secret_key = secret_key
         self._presign_ttl = presign_ttl_seconds
+        self._connect_timeout = connect_timeout_seconds
+        self._read_timeout = read_timeout_seconds
 
     @property
     def bucket(self) -> str:
@@ -84,8 +88,20 @@ class ObjectStorage:
         Path-style addressing (``endpoint/bucket/key``) — virtual-host style
         (``bucket.endpoint``) cannot resolve against a bare IP endpoint. Safe for
         AWS S3 too (it accepts path-style), so the wrapper stays portable.
+
+        Network timeouts (connect/read) cap how long an upload/presign/delete can
+        block: aioboto3 defaults are long (60s each) and these run on the request
+        hot path, so a hung storage backend would otherwise pin a worker for a
+        full minute. ``retries={"max_attempts": 1}`` disables botocore's silent
+        retry amplification — a stuck call fails once at the timeout rather than
+        multiplying the wait.
         """
-        return AioConfig(s3={"addressing_style": "path"})
+        return AioConfig(
+            s3={"addressing_style": "path"},
+            connect_timeout=self._connect_timeout,
+            read_timeout=self._read_timeout,
+            retries={"max_attempts": 1},
+        )
 
     @asynccontextmanager
     async def _client(self) -> AsyncIterator[S3Client]:
@@ -161,6 +177,8 @@ def get_object_storage() -> ObjectStorage:
             else None
         ),
         presign_ttl_seconds=settings.oss_presign_ttl_seconds,
+        connect_timeout_seconds=settings.oss_connect_timeout_seconds,
+        read_timeout_seconds=settings.oss_read_timeout_seconds,
     )
 
 

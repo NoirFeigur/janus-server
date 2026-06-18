@@ -78,6 +78,8 @@ def _make_storage(recorder: dict[str, Any]) -> ObjectStorage:
         access_key="AK",
         secret_key="SK",
         presign_ttl_seconds=900,
+        connect_timeout_seconds=5.0,
+        read_timeout_seconds=10.0,
     )
     storage._session = lambda: _FakeSession(recorder)  # type: ignore[method-assign]
     return storage
@@ -150,4 +152,30 @@ def test_missing_credentials_raise_at_construction() -> None:
             access_key=None,
             secret_key=None,
             presign_ttl_seconds=900,
+            connect_timeout_seconds=5.0,
+            read_timeout_seconds=10.0,
         )
+
+
+def test_config_carries_network_timeouts_and_disables_retries() -> None:
+    """The botocore config must cap connect/read time and disable retry amplification.
+
+    A hung storage backend on the request hot path must fail at the timeout rather
+    than pin a worker for the aioboto3 default (60s each), and botocore's silent
+    retries must not multiply that wait. Asserts the wrapper threads the configured
+    timeouts through and pins ``max_attempts`` to 1.
+    """
+    storage = ObjectStorage(
+        endpoint_url="http://minio.test:9000",
+        region="us-east-1",
+        bucket="private",
+        access_key="AK",
+        secret_key="SK",
+        presign_ttl_seconds=900,
+        connect_timeout_seconds=5.0,
+        read_timeout_seconds=10.0,
+    )
+    config = storage._config()
+    assert config.connect_timeout == 5.0
+    assert config.read_timeout == 10.0
+    assert config.retries == {"max_attempts": 1}

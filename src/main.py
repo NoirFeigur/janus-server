@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -45,11 +46,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # 关闭:释放 worker-id 租约(停心跳 + compare-and-delete),再回收 Redis 连接池
-        # (DB engine 由 SQLAlchemy 自身在进程退出时处理)。
+        # 关闭:释放 worker-id 租约(停心跳 + compare-and-delete),回收 Redis 连接池,
+        # 再显式 dispose DB engine(归还连接池里的所有连接 + 关闭底层 asyncpg 连接)。
+        # 不依赖进程退出做隐式回收:优雅关闭路径里显式 dispose 让 PG 端连接立即释放
+        # (不等 TCP 超时),也避免在 reload/多 app 实例场景下泄漏连接池。
         if worker_id_lease is not None:
             await worker_id_lease.release()
         await close_redis()
+        await engine.dispose()
         _log.info("app.shutdown")
 
 
@@ -70,7 +74,18 @@ class TraceIdMiddleware(BaseHTTPMiddleware):
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
+    # Swagger/OpenAPI 仅在 local 暴露:交互式文档 + schema 会把整张内部 API 地图(管理面
+    # 端点、参数、错误码)摊给任何能访问的人,生产副本不该公开。非 local 环境把 docs/
+    # redoc/openapi.json 三个 URL 全部关掉(FastAPI 不注册这些路由),请求落空即 404。
+    docs_enabled = settings.environment == "local"
+    app = FastAPI(
+        title=settings.app_name,
+        debug=settings.debug,
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
     app.state.session_factory = async_session_factory
     app.state.api_prefix = settings.api_prefix
 
@@ -112,19 +127,25 @@ def create_app() -> FastAPI:
     # 摘出轮转。liveness 只表「进程活着」,readiness 表「能接流量」,语义不同。
     @app.get("/health/ready", tags=["health"])
     async def readiness() -> Response:
+        # 每项探测都包一个整体超时闸:即便单项的 socket 超时未触发(或探测卡在
+        # connect 之外的环节),probe 自身也绝不悬挂——LB 探测有自己的 deadline,
+        # 探针超时即判该项 down,返回 503 让 LB 摘流,而不是把探测请求挂死。
+        probe_timeout = get_settings().health_probe_timeout_seconds
         checks: dict[str, str] = {}
         healthy = True
         try:
-            async with engine.connect() as conn:
-                await conn.execute(text("SELECT 1"))
+            async with asyncio.timeout(probe_timeout):
+                async with engine.connect() as conn:
+                    await conn.execute(text("SELECT 1"))
             checks["postgres"] = "ok"
-        except Exception:
+        except Exception:  # noqa: BLE001 — any failure (incl. probe timeout) = down.
             checks["postgres"] = "down"
             healthy = False
         try:
-            await redis_ping()
+            async with asyncio.timeout(probe_timeout):
+                await redis_ping()
             checks["redis"] = "ok"
-        except Exception:
+        except Exception:  # noqa: BLE001 — any failure (incl. probe timeout) = down.
             checks["redis"] = "down"
             healthy = False
 

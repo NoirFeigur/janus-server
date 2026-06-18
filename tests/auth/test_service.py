@@ -955,10 +955,9 @@ async def test_change_password_revokes_all_sessions(
     await service.change_current_password(
         current, old_password="old-secret1", new_password="new-secret2"
     )
-    # Session revocation is an after-commit hook now (it fires only once the
-    # password write lands), so emulate the request edge: commit the unit of
-    # work, which runs the queued revocation hook.
-    await commit_session(auth_session)
+    # Revocation is synchronous before commit now (flush + Redis revoke run
+    # inside change_current_password), so the pre-change session is already
+    # gone — no commit_session() needed to trigger it.
     # 改密后旧 access token 的会话已被吊销 → 解析报 token_revoked
     with pytest.raises(AppError) as exc:
         await service.resolve_access_token(token)

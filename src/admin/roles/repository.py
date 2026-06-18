@@ -4,6 +4,12 @@ Beyond base CRUD on ``Role``, manages the two link tables a role owns:
 ``RoleMenu`` (permission grants) and ``RoleDept`` (custom data-scope depts).
 Links are physically replaced (LinkEntity has no soft-delete): assignment is a
 delete-all-then-insert within the caller's transaction.
+
+The resolved scope is consumed via the :class:`~src.db.scope.DataScope`
+structural Protocol, not the concrete ``auth.service.DataScopeFilter`` — a
+repository is a ``db``-layer citizen and must not import upward from ``auth``.
+``DataScopeFilter`` satisfies the Protocol structurally, so callers pass it
+unchanged.
 """
 
 from __future__ import annotations
@@ -14,10 +20,9 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
 
-from src.auth.service import DataScopeFilter
 from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, UserRole
 from src.db.repository import BaseRepository
-from src.db.scope import data_scope_predicate
+from src.db.scope import DataScope, data_scope_predicate
 
 
 class RoleRepository(BaseRepository[Role]):
@@ -44,7 +49,7 @@ class RoleRepository(BaseRepository[Role]):
         return role
 
     def _scope_predicate(
-        self, scope: DataScopeFilter, *, actor_id: int
+        self, scope: DataScope, *, actor_id: int
     ) -> ColumnElement[bool] | None:
         """Generic management-resource data-scope predicate (audit columns).
 
@@ -56,7 +61,7 @@ class RoleRepository(BaseRepository[Role]):
 
     async def list_in_scope(
         self,
-        scope: DataScopeFilter,
+        scope: DataScope,
         *,
         actor_id: int,
         keyword: str | None = None,
@@ -88,7 +93,7 @@ class RoleRepository(BaseRepository[Role]):
 
     async def count_in_scope(
         self,
-        scope: DataScopeFilter,
+        scope: DataScope,
         *,
         actor_id: int,
         keyword: str | None = None,
@@ -104,7 +109,7 @@ class RoleRepository(BaseRepository[Role]):
         total = await self.session.scalar(stmt)
         return int(total or 0)
 
-    def is_visible(self, role: Role, scope: DataScopeFilter, *, actor_id: int) -> bool:
+    def is_visible(self, role: Role, scope: DataScope, *, actor_id: int) -> bool:
         """In-Python scope check for one role."""
         if scope.unrestricted:
             return True

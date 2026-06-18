@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import secrets
 import signal
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import cast
@@ -42,6 +43,16 @@ from src.core.snowflake import _MAX_WORKER_ID, set_worker_id
 _log = get_logger(__name__)
 
 _KEY_PREFIX = "snowflake:worker_id:"
+
+
+def _monotonic() -> float:
+    """Monotonic clock wrapper (patchable in tests for deterministic timing).
+
+    Wraps :func:`time.monotonic` behind a module function so tests can drive the
+    heartbeat's "have we been unable to renew for a full TTL?" decision without
+    real elapsed time.
+    """
+    return time.monotonic()
 
 
 def _signal_self_terminate() -> None:
@@ -88,11 +99,17 @@ class WorkerIdLease:
     _token: str
     _ttl_seconds: int
     _heartbeat: asyncio.Task[None] | None = None
-    # Invoked once if the heartbeat detects the lease was lost (TTL lapsed and
-    # the id was re-leased by another replica). Defaults to signalling this
-    # process to shut down gracefully; injectable so tests can assert the
-    # fail-fast fires without actually terminating the test runner.
+    # Invoked once if the heartbeat detects the lease was lost (either the id was
+    # re-leased by another replica, or we could not renew for a full TTL so the
+    # key has provably expired). Defaults to signalling this process to shut down
+    # gracefully; injectable so tests can assert the fail-fast fires without
+    # actually terminating the test runner.
     _on_lease_lost: Callable[[], None] = field(default=_signal_self_terminate)
+    # Monotonic timestamp of the last *successful* renew (or lease acquisition).
+    # Drives the partition self-fence: if we go a full TTL without renewing, the
+    # Redis key has expired and another replica may already hold our id, so we
+    # must stop minting snowflake ids under it. Set on first heartbeat tick.
+    _last_renew_monotonic: float | None = None
 
     @property
     def _key(self) -> str:
@@ -105,6 +122,9 @@ class WorkerIdLease:
 
     async def _run_heartbeat(self) -> None:
         interval = max(1, self._ttl_seconds // 3)
+        # Seed the renew clock at start: the lease was just acquired (or renewed),
+        # so the partition window is measured from now.
+        self._last_renew_monotonic = _monotonic()
         while True:
             await asyncio.sleep(interval)
             try:
@@ -114,7 +134,26 @@ class WorkerIdLease:
                         _RENEW_LUA, 1, self._key, self._token, str(self._ttl_seconds)
                     ),
                 )
-            except Exception:  # noqa: BLE001 — transient Redis blip, retry next tick.
+            except Exception:  # noqa: BLE001 — transient Redis blip; retry, but
+                # a *sustained* partition is not transient: once we have been
+                # unable to renew for a full TTL, the Redis key has expired and
+                # another replica may already hold our worker-id. Continuing to
+                # mint snowflake ids under it would collide primary keys across
+                # replicas, so self-fence exactly as if the renew compare failed.
+                last = (
+                    self._last_renew_monotonic
+                    if self._last_renew_monotonic is not None
+                    else _monotonic()
+                )
+                elapsed = _monotonic() - last
+                if elapsed >= self._ttl_seconds:
+                    _log.error(
+                        "worker_id.lease_lost_partition",
+                        worker_id=self.worker_id,
+                        elapsed_seconds=round(elapsed, 1),
+                    )
+                    self._on_lease_lost()
+                    return
                 _log.warning("worker_id.heartbeat_error", worker_id=self.worker_id)
                 continue
             if not renewed:
@@ -127,6 +166,8 @@ class WorkerIdLease:
                 _log.error("worker_id.lease_lost", worker_id=self.worker_id)
                 self._on_lease_lost()
                 return
+            # Renew landed → reset the partition window.
+            self._last_renew_monotonic = _monotonic()
 
     async def release(self) -> None:
         """Stop the heartbeat and release the id (compare-and-delete)."""

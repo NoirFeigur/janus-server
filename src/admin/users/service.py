@@ -8,9 +8,17 @@ opaque 403 as a permission failure; there is no "exists but hidden" oracle.
 
 The transaction is owned by the request-level Unit of Work, not here: this
 layer only ``flush()``es, and the single commit happens at the request edge
-(:func:`src.db.session.get_session`). Side effects that must run only after the
-commit lands — revoking a target's sessions when their password changes —
-register as after-commit hooks so a rolled-back request never logs anyone out.
+(:func:`src.db.session.get_session`). Two kinds of post-write side effect:
+
+- **Security-critical session revocation** (password change / disable / delete)
+  runs SYNCHRONOUSLY before commit — the write is flushed, then the Redis revoke
+  runs inside the request's unit of work. A Redis failure raises and the request
+  edge rolls the DB write back, so a Redis blip can never leave "credential
+  changed in the DB but old sessions still alive". The inverse (sessions killed
+  but the write rolled back on a later commit failure) is safe.
+- **Permission-cache invalidation** stays a fail-open after-commit hook: it has
+  a TTL backstop bounding staleness, so a Redis blip degrades gracefully rather
+  than failing the request.
 
 Role assignment is a set replace via ``UserRole``. ``password`` is hashed on the
 way in and never read back out (§0.8).
@@ -338,24 +346,27 @@ class UserService:
 
         # A password change here must force re-login everywhere, exactly like
         # reset_password — otherwise an admin-set password through this endpoint
-        # would silently leave the target's old sessions alive (B7). Fires only
-        # after the write commits (after-commit hook), so a rolled-back update
-        # never logs the target out.
+        # would silently leave the target's old sessions alive (B7).
         #
         # Disabling a user must ALSO kill every live session: the access-allowlist
         # entry and rotatable refresh both outlive the status flip on their own,
         # so a disabled user keeps a usable refresh token until it expires, and a
         # later re-enable would silently resurrect those stale sessions. Revoking
-        # on disable forces a fresh login and severs the resurrection path. (A
-        # single ``revoke_all_sessions`` is idempotent, so overlapping with the
-        # password-change hook is harmless.)
+        # on disable forces a fresh login and severs the resurrection path.
+        #
+        # Revocation is SYNCHRONOUS before commit (not an after-commit hook): the
+        # write is flushed, then the Redis revoke runs inside the request's unit
+        # of work. A Redis failure raises and the request edge rolls the write
+        # back — closing the "password/status changed in the DB but old sessions
+        # still live" window a best-effort after-commit hook would leave open on a
+        # Redis blip. (revoke_all_sessions is idempotent, so a password change that
+        # also disables runs it once with no double-revoke hazard.)
         disabled_now = payload.status is not None and (
             payload.status == UserStatus.disabled
         )
         if password_changed or disabled_now:
-            add_after_commit_hook(
-                self.session, lambda: self.auth.sessions.revoke_all_sessions(user_id)
-            )
+            await self.session.flush()
+            await self.auth.sessions.revoke_all_sessions(user_id)
         return await self._detail(user)
 
     async def reset_password(
@@ -368,9 +379,13 @@ class UserService:
         admin acting on the target's behalf. Strength is enforced server-side
         (``auth_password_too_weak`` / 400 with machine-readable violation labels).
         On success **all** of the target's sessions are revoked (B7), so any
-        session standing on the old credential dies immediately. The revoke
-        fires as an after-commit hook so it only runs once the password write
-        has landed (a rolled-back request never logs the target out).
+        session standing on the old credential dies immediately.
+
+        Revocation is SYNCHRONOUS before commit (not an after-commit hook): the
+        password write is flushed, then the Redis revoke runs inside the request's
+        unit of work. A Redis failure raises and the request edge rolls the
+        password write back — so a Redis blip can never leave "password reset in
+        the DB but the target's old sessions still alive".
         """
         user = await self._require_visible(user_id, actor)
         await self._require_dominance(user, actor)
@@ -378,9 +393,7 @@ class UserService:
         user.password = await hash_password_async(new_password)
         user.updated_by = actor.user_id
         await self.repo.session.flush()
-        add_after_commit_hook(
-            self.session, lambda: self.auth.sessions.revoke_all_sessions(user_id)
-        )
+        await self.auth.sessions.revoke_all_sessions(user_id)
 
     async def delete_user(self, user_id: int, actor: AuthenticatedUser) -> None:
         user = await self._require_visible(user_id, actor)
@@ -388,15 +401,17 @@ class UserService:
         await self.repo.replace_roles(user_id, [])
         user.updated_by = actor.user_id
         await self.repo.soft_delete(user)
-        # Soft-deleting drops the user's perm snapshot AND must kill every live
-        # session: like disable, the access-allowlist entry and refresh token
-        # outlive the row flip on their own, so a deleted user keeps usable
-        # credentials until TTL. Both hooks fire only after the write commits.
+        # Soft-deleting must kill every live session: like disable, the
+        # access-allowlist entry and refresh token outlive the row flip on their
+        # own, so a deleted user keeps usable credentials until TTL. Revoke
+        # SYNCHRONOUSLY before commit (Redis failure rolls the delete back), so a
+        # Redis blip can never leave a deleted user with live sessions. The perm
+        # snapshot drop stays a fail-open after-commit hook (TTL backstop bounds
+        # staleness; it is not a security-critical revocation).
+        await self.repo.session.flush()
+        await self.auth.sessions.revoke_all_sessions(user_id)
         add_after_commit_hook(
             self.session, lambda: perm_cache.invalidate_user(user_id)
-        )
-        add_after_commit_hook(
-            self.session, lambda: self.auth.sessions.revoke_all_sessions(user_id)
         )
 
     async def batch_delete_users(
@@ -434,6 +449,17 @@ class UserService:
                 add_after_commit_hook(
                     self.session, partial(perm_cache.invalidate_user, user_id)
                 )
+        # Each deleted user must lose every live session, exactly like the
+        # single-user delete — otherwise a batch-deleted user keeps usable
+        # credentials until TTL (the resurrection hole). Revoke SYNCHRONOUSLY
+        # before commit: a Redis failure rolls the whole batch back rather than
+        # leaving deleted users with live sessions. revoke_all_sessions is a
+        # no-op for users with no active sessions, so this is cheap.
+        deleted_ids = [uid for uid in requested_ids if uid not in skipped]
+        if deleted_ids:
+            await self.session.flush()
+            for user_id in deleted_ids:
+                await self.auth.sessions.revoke_all_sessions(user_id)
         return BatchResult.of(
             requested=len(requested_ids), affected=affected, skipped=skipped_ids
         )

@@ -26,11 +26,20 @@ def get_redis() -> Redis:
     用 ``ConnectionPool.from_url`` + ``Redis(connection_pool=...)`` 装配（而非模块级
     ``from_url``）：前者带完整类型标注，后者在 redis 5.x 的 stub 里是 untyped，
     在 ``mypy --strict`` 下会触发 ``no-untyped-call``。
+
+    带 socket 超时（``socket_connect_timeout`` / ``socket_timeout``）：redis-py 默认
+    无超时，Redis 卡死或网络黑洞时调用会无限挂起，拖垮整个事件循环（鉴权热路径、
+    配额计数都走 Redis）。设上限后失败快速上抛，由调用方降级。
     """
     global _client
     if _client is None:
         settings = get_settings()
-        pool = ConnectionPool.from_url(settings.redis_url, decode_responses=True)
+        pool = ConnectionPool.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+        )
         _client = Redis(connection_pool=pool)
     return _client
 

@@ -35,6 +35,22 @@ class Settings(BaseSettings):
     argon2_max_concurrency: int = 8
     redis_url: str = "redis://localhost:6379/0"  # 业务缓存 / 实时配额计数（db 0）
     redis_arq_url: str = "redis://localhost:6379/1"  # ARQ 任务队列（db 1，与业务缓存隔离）
+    # Redis 网络超时。默认 redis-py 无 socket 超时——一旦 Redis 卡死或网络黑洞,调用会
+    # 无限挂起,拖垮整个事件循环(鉴权热路径、配额计数都走 Redis)。给 connect 与读写都
+    # 设上限,失败快速上抛由调用方降级,胜过无声悬挂。健康探针另有更短的整体超时(见下)。
+    redis_socket_connect_timeout_seconds: float = 2.0  # 建连超时;Redis 不可达时快速失败
+    redis_socket_timeout_seconds: float = 2.0  # 读写超时;单次命令阻塞上限
+
+    # 对象存储网络超时(MinIO/S3)。同理,aioboto3 默认超时偏长(connect 60s/read 60s),
+    # 上传/预签名走请求热路径,后端卡在挂死的存储上会耗尽 worker。给 connect/read 设务实
+    # 上限,并禁用 botocore 自带重试(让上层显式决定,不在底层静默放大延迟)。
+    oss_connect_timeout_seconds: float = 5.0  # 建连超时
+    oss_read_timeout_seconds: float = 10.0  # 读写超时(上传大附件留余量)
+
+    # 健康探针整体超时。readiness 逐个探测 PG + Redis;即便单项已有 socket 超时,也用一个
+    # 更短的整体闸把每项包起来,确保 /health/ready 永不超过此时长返回(LB 探测有自己的
+    # deadline,探针自身绝不能成为悬挂点)。
+    health_probe_timeout_seconds: float = 3.0  # 单项依赖探测的硬上限;超时即判该项 down
 
     # Snowflake worker-id 租约(data-model §0.2)。多副本部署时每个副本必须持有唯一的
     # 10-bit worker-id(0..1023),否则主键会跨副本撞车。启动时从 Redis 原子租约一个空闲
@@ -157,6 +173,22 @@ def validate_runtime(settings: Settings) -> None:
         problems.append(
             "trusted_proxy_count must be >= 1 outside local "
             "(replicas run behind nginx; 0 makes per-IP throttling useless)"
+        )
+
+    # The avatar/attachment upload router is always mounted, so a missing OSS
+    # credential only surfaces as a 500 on the first upload (get_object_storage
+    # raises ValueError when access/secret are absent). Demand both up front: an
+    # operator who ships the upload feature without storage credentials should
+    # learn at startup, not from a user-facing error.
+    if settings.oss_access_key is None or not settings.oss_access_key.get_secret_value():
+        problems.append(
+            "JANUS_OSS_ACCESS_KEY is required outside local "
+            "(upload endpoints 500 without object-storage credentials)"
+        )
+    if settings.oss_secret_key is None or not settings.oss_secret_key.get_secret_value():
+        problems.append(
+            "JANUS_OSS_SECRET_KEY is required outside local "
+            "(upload endpoints 500 without object-storage credentials)"
         )
 
     if problems:

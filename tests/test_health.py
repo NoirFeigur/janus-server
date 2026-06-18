@@ -132,3 +132,45 @@ async def test_readiness_success_path_direct(monkeypatch: pytest.MonkeyPatch) ->
     finally:
         await sqlite.dispose()
     assert resp.status_code == 200
+
+
+def _has_route(app_obj: object, path: str) -> bool:
+    return any(getattr(r, "path", None) == path for r in app_obj.routes)  # type: ignore[attr-defined]
+
+
+def test_docs_enabled_in_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """local exposes the interactive docs (developer convenience)."""
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("JANUS_ENVIRONMENT", "local")
+    try:
+        test_app = create_app()
+    finally:
+        get_settings.cache_clear()
+    assert test_app.docs_url == "/docs"
+    assert test_app.redoc_url == "/redoc"
+    assert test_app.openapi_url == "/openapi.json"
+    assert _has_route(test_app, "/openapi.json")
+
+
+def test_docs_disabled_outside_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-local replica must not publish its API map: docs/redoc/openapi off.
+
+    Swagger/ReDoc/openapi.json expose the entire internal API surface (admin
+    endpoints, params, error codes) to anyone who can reach the replica, so a
+    production build disables all three — the routes are never registered.
+    """
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("JANUS_ENVIRONMENT", "production")
+    try:
+        test_app = create_app()
+    finally:
+        get_settings.cache_clear()
+    assert test_app.docs_url is None
+    assert test_app.redoc_url is None
+    assert test_app.openapi_url is None
+    # The schema route itself must be absent (not merely hidden).
+    assert not _has_route(test_app, "/openapi.json")

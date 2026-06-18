@@ -2,9 +2,15 @@
 
 Base CRUD on ``User`` plus role-link management (``UserRole``) and the
 data-scope-aware listing the admin user surface requires. The data-scope filter
-is the only place the resolved :class:`DataScopeFilter` touches SQL: a row is
-visible when unrestricted, OR its department is in the allowed set, OR
-(include_self) it is the actor's own record.
+is the only place the resolved scope touches SQL: a row is visible when
+unrestricted, OR its department is in the allowed set, OR (include_self) it is
+the actor's own record.
+
+The resolved scope is consumed via the :class:`~src.db.scope.DataScope`
+structural Protocol, not the concrete ``auth.service.DataScopeFilter`` — a
+repository is a ``db``-layer citizen and must not import upward from ``auth``.
+``DataScopeFilter`` satisfies the Protocol structurally, so callers pass it
+unchanged.
 """
 
 from __future__ import annotations
@@ -15,9 +21,9 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
 
-from src.auth.service import DataScopeFilter
 from src.db.models.identity import User, UserRole
 from src.db.repository import BaseRepository
+from src.db.scope import DataScope
 
 
 class UserRepository(BaseRepository[User]):
@@ -47,7 +53,7 @@ class UserRepository(BaseRepository[User]):
         return user
 
     def _scope_predicate(
-        self, scope: DataScopeFilter, *, actor_id: int
+        self, scope: DataScope, *, actor_id: int
     ) -> ColumnElement[bool] | None:
         """Build the WHERE predicate for a data scope (None = no restriction)."""
         if scope.unrestricted:
@@ -64,7 +70,7 @@ class UserRepository(BaseRepository[User]):
 
     async def list_in_scope(
         self,
-        scope: DataScopeFilter,
+        scope: DataScope,
         *,
         actor_id: int,
         keyword: str | None = None,
@@ -94,7 +100,7 @@ class UserRepository(BaseRepository[User]):
 
     async def count_in_scope(
         self,
-        scope: DataScopeFilter,
+        scope: DataScope,
         *,
         actor_id: int,
         keyword: str | None = None,
@@ -111,7 +117,7 @@ class UserRepository(BaseRepository[User]):
         return int(total or 0)
 
     def is_visible(
-        self, user: User, scope: DataScopeFilter, *, actor_id: int
+        self, user: User, scope: DataScope, *, actor_id: int
     ) -> bool:
         """In-Python scope check for a single row (mutation guard)."""
         if scope.unrestricted:

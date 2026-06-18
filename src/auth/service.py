@@ -27,7 +27,6 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette import status
 
-from src.admin.audit.repository import AuditRepository
 from src.auth import dept_tree_cache, perm_cache
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.credentials import CredentialKind
@@ -52,10 +51,7 @@ from src.core.security import (
 from src.core.session_store import RefreshOutcome, SessionStore
 from src.db.models.audit import LoginLog
 from src.db.models.identity import Role
-from src.db.session import (
-    add_after_commit_hook,
-    unit_of_work,
-)
+from src.db.session import unit_of_work
 from src.enums import AuditOutcome, DataScope, ErrorCode, LoginFailureReason
 from src.exceptions import AppError
 
@@ -315,7 +311,7 @@ class AuthService:
             trace_id=trace_id,
         )
         async with unit_of_work(self._audit_factory()) as session:
-            await AuditRepository(session).append_login_log(row)
+            await AuthRepository(session).append_login_log(row)
 
     def _audit_factory(self) -> async_sessionmaker[AsyncSession]:
         """Resolve the audit unit-of-work factory, deriving it lazily.
@@ -557,9 +553,15 @@ class AuthService:
         frontend i18n. On success **all** of the user's sessions are revoked
         (B7 — force re-login on every device, including the current one), so a
         leaked-credential change immediately invalidates any hijacked session.
-        The revoke fires as an after-commit hook so it only runs once the
-        password write has actually landed (a rolled-back request never logs the
-        user out).
+
+        Revocation is **synchronous before commit** (not an after-commit hook):
+        the password write is flushed, then the Redis revoke runs inside the
+        request's unit of work. If Redis is unreachable the revoke raises and the
+        request-level UoW rolls the password write back — so we never land in the
+        "password changed in the DB but old sessions still alive" state a
+        best-effort after-commit hook would leave on a Redis blip. The worst case
+        is the inverse (sessions killed but password unchanged on a later commit
+        failure), which is safe: the user simply re-logs in with the old password.
         """
         violations = password_strength_violations(
             new_password, min_length=get_settings().password_min_length
@@ -580,10 +582,7 @@ class AuthService:
         row.password = await hash_password_async(new_password)
         row.updated_by = user.user_id
         await self.repo.session.flush()
-        user_id = user.user_id
-        add_after_commit_hook(
-            self.repo.session, lambda: self.sessions.revoke_all_sessions(user_id)
-        )
+        await self.sessions.revoke_all_sessions(user.user_id)
 
     # ---- authorization ------------------------------------------------------
 

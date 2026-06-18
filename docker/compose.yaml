@@ -1,0 +1,87 @@
+# Janus Server — development compose.
+#
+# Brings up the three application roles from ONE image (README: 默认部署 = N 个
+# 全功能副本 + 旁路 ARQ scheduler/worker):
+#   - app           全功能副本(auth + admin + gateway + mcp);可 scale N 份
+#   - arq-worker    消费任务队列;无状态,可 scale N 份
+#   - arq-scheduler cron 触发器;**必须单实例**(多开会让每个周期任务执行 N 次)
+#   - nginx         反向代理 + 负载均衡 + TLS 终结 + SSE 流式
+#
+# PostgreSQL / Redis 连**现成的共享实例**(本项目不部署 DB,见 README 技术栈)。
+# 开发想要本地 PG/Redis,取消注释下方 postgres/redis 服务,并把连接串指向它们。
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    # 全功能副本无需对外直接暴露端口:流量统一经 nginx 进入。开发若想直连可解开:
+    # ports:
+    #   - "8000:8000"
+    expose:
+      - "8000"
+    restart: unless-stopped
+    # /health/ready 真实探测 PG + Redis;不健康时 compose / LB 可据此摘流。
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/ready').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  arq-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    # 无状态队列消费者:水平扩展只需 `docker compose up --scale arq-worker=N`。
+    command: ["arq", "src.tasks.worker.WorkerSettings"]
+    restart: unless-stopped
+
+  arq-scheduler:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    # cron 触发器铁律:**单实例**。绝不 scale 这个服务 —— 多开会重复触发每个周期任务。
+    # WorkerSettings 同时携带 functions 与 cron_jobs;调度进程与 worker 共用同一入口,
+    # 由「只跑一个 scheduler 副本」这一部署约束保证触发不重复(README ARQ 章节)。
+    command: ["arq", "src.tasks.worker.WorkerSettings"]
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+
+  # ---- 可选:本地 PG / Redis(默认连共享实例,故注释掉)---------------------
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: janus
+  #     POSTGRES_PASSWORD: janus
+  #     POSTGRES_DB: janus
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+
+# volumes:
+#   pgdata:

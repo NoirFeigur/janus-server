@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.attach import SysAttach
+from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
 from src.enums import ActiveStatus, ApiKeyStatus, AttachBizType, UserStatus
@@ -238,3 +239,18 @@ class AuthRepository:
         )
         result = await self.session.scalars(stmt)
         return result.all()
+
+    async def append_login_log(self, row: LoginLog) -> LoginLog:
+        """Append one login-attempt audit row and flush its snowflake id.
+
+        Login auditing is an auth-domain concern: the row is written from the
+        auth service's own session (its own unit of work for failures, see
+        ``AuthService._append_login_log``). Owning the insert here keeps auth from
+        importing the admin audit repository — admin reads the same ``LoginLog``
+        table from its side, but the write belongs to the domain that produces it.
+        ``LoginLog`` inherits ``LogEntity`` (append-only), so this is a bare
+        add + flush with no update/soft-delete semantics.
+        """
+        self.session.add(row)
+        await self.session.flush()
+        return row

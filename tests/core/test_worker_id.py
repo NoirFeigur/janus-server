@@ -271,6 +271,111 @@ async def test_heartbeat_surfaces_lost_lease(
     assert ("error", "worker_id.lease_lost") in rec.events
 
 
+async def test_heartbeat_partition_self_fences_after_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sustained Redis partition self-fences once a full TTL elapses unrenewed.
+
+    The renew Lua never returns 0 here — it *raises* every tick (Redis
+    unreachable), modelling a partition rather than a clean takeover. A naive
+    retry-forever loop would keep the process alive minting snowflake ids under a
+    worker-id whose key has long since expired (and may already be re-leased),
+    colliding primary keys across replicas. The heartbeat must instead notice it
+    has been unable to renew for a full TTL and fire the same fail-fast action.
+
+    Drives the module monotonic clock so the TTL window elapses deterministically
+    without real sleeping: the clock jumps past TTL on the first failed renew.
+    """
+    rec = _RecordingLog()
+    monkeypatch.setattr(worker_id_module, "_log", rec)
+
+    class _PartitionedRedis(_LeaseRedis):
+        async def eval(self, script: str, numkeys: int, *args: str) -> int:
+            raise RuntimeError("redis unreachable")
+
+    redis = _PartitionedRedis()
+    fired: list[bool] = []
+    lease = WorkerIdLease(
+        worker_id=11,
+        _redis=redis,  # type: ignore[arg-type]
+        _token="our-token",
+        _ttl_seconds=30,
+        _on_lease_lost=lambda: fired.append(True),
+    )
+
+    # Monotonic clock: start at 0 (seeded at heartbeat start), then jump past TTL
+    # so the first failed renew is already a full-TTL partition.
+    clock = {"t": 0.0}
+    monkeypatch.setattr(worker_id_module, "_monotonic", lambda: clock["t"])
+
+    sleep_calls = {"n": 0}
+
+    async def advancing_sleep(_seconds: float) -> None:
+        sleep_calls["n"] += 1
+        clock["t"] += 31.0  # advance past the 30s TTL window
+        if sleep_calls["n"] > 10:  # safety net: must self-fence well before this
+            raise AssertionError("partition heartbeat did not self-fence")
+
+    monkeypatch.setattr(worker_id_module.asyncio, "sleep", advancing_sleep)
+    await lease._run_heartbeat()
+
+    assert fired == [True]  # self-fenced exactly once
+    assert ("error", "worker_id.lease_lost_partition") in rec.events
+    assert sleep_calls["n"] == 1  # fenced on the first full-TTL failed renew
+
+
+async def test_heartbeat_transient_blip_does_not_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A brief renew failure (well under TTL) retries — it must NOT self-fence.
+
+    Distinguishes a transient blip from a sustained partition: a single failed
+    renew with little elapsed time since the last success keeps the loop running
+    (logs a warning, continues) rather than killing the replica on every hiccup.
+    """
+    rec = _RecordingLog()
+    monkeypatch.setattr(worker_id_module, "_log", rec)
+
+    calls = {"n": 0}
+
+    class _BlipRedis(_LeaseRedis):
+        async def eval(self, script: str, numkeys: int, *args: str) -> int:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("redis blip")  # one transient failure
+            return 1  # owns it again afterwards
+
+    redis = _BlipRedis()
+    redis._data[_key(13)] = "our-token"
+    fired: list[bool] = []
+    lease = WorkerIdLease(
+        worker_id=13,
+        _redis=redis,  # type: ignore[arg-type]
+        _token="our-token",
+        _ttl_seconds=30,
+        _on_lease_lost=lambda: fired.append(True),
+    )
+
+    # Clock barely advances (1s/tick) → never reaches the 30s partition window.
+    clock = {"t": 0.0}
+    monkeypatch.setattr(worker_id_module, "_monotonic", lambda: clock["t"])
+
+    sleep_calls = {"n": 0}
+
+    async def small_sleep(_seconds: float) -> None:
+        sleep_calls["n"] += 1
+        clock["t"] += 1.0
+        if sleep_calls["n"] > 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(worker_id_module.asyncio, "sleep", small_sleep)
+    with contextlib.suppress(asyncio.CancelledError):
+        await lease._run_heartbeat()
+
+    assert fired == []  # transient blip never self-fenced
+    assert ("warning", "worker_id.heartbeat_error") in rec.events
+
+
 async def test_heartbeat_lost_lease_triggers_fail_fast_and_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

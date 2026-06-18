@@ -21,7 +21,6 @@ from src.auth.service import AuthenticatedUser
 from src.core.query import ListQuery
 from src.core.security import verify_password_async
 from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
-from src.db.session import commit_session
 from src.enums import ErrorCode, UserStatus
 from src.exceptions import AppError
 
@@ -427,8 +426,9 @@ async def test_update_user_disable_revokes_sessions(
     await svc.update_user(
         target.id, UserUpdate(status=UserStatus.disabled), _superuser()
     )
-    # Revocation is an after-commit hook; emulate the request edge committing.
-    await commit_session(admin_session)
+    # Revocation is synchronous before commit now — it already ran inside
+    # update_user (flush + Redis revoke), so no commit_session() is needed to
+    # trigger it.
 
     with pytest.raises(AppError) as exc:
         await auth.resolve_access_token(token)
@@ -451,7 +451,7 @@ async def test_delete_user_revokes_sessions(
     assert (await auth.resolve_access_token(token)).user_id == target.id
 
     await svc.delete_user(target.id, _superuser())
-    await commit_session(admin_session)
+    # Synchronous revocation already ran inside delete_user.
 
     with pytest.raises(AppError) as exc:
         await auth.resolve_access_token(token)
@@ -526,10 +526,9 @@ async def test_reset_password_revokes_target_sessions(
 
     await svc.reset_password(target.id, "new12345", _superuser())
 
-    # Session revocation is an after-commit hook now (it fires only once the
-    # password write lands), so emulate the request edge: commit the unit of
-    # work, which runs the queued revocation hook.
-    await commit_session(admin_session)
+    # Revocation is synchronous before commit now (flush + Redis revoke run
+    # inside reset_password), so the pre-reset session is already gone — no
+    # commit_session() needed to trigger it.
 
     # The pre-reset access token's session is revoked → resolve fails.
     with pytest.raises(AppError) as exc:
