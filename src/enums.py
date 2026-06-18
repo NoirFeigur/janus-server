@@ -93,6 +93,11 @@ class ConfigValueType(StrEnum):
     json = "json"  # Parsed as a JSON document (object/array/scalar).
 
 
+class AttachBizType(StrEnum):
+    avatar = "avatar"  # User profile avatar image (object key under avatar/).
+    attachment = "attachment"  # Generic business attachment (export/upload).
+
+
 class ErrorCode(StrEnum):
     auth_invalid_token = "auth.invalid_token"  # JWT or sk-key is invalid or expired.
     auth_token_revoked = "auth.token_revoked"  # Token's session was revoked (logout/kick/reuse).
@@ -101,6 +106,9 @@ class ErrorCode(StrEnum):
     auth_password_too_weak = "auth.password_too_weak"  # New password fails strength policy.
     auth_user_disabled = "auth.user_disabled"  # Authenticated user is disabled.
     auth_forbidden = "auth.forbidden"  # Authenticated principal lacks permission.
+    attach_not_found = "attach.not_found"  # Referenced attachment does not exist.
+    attach_invalid_image = "attach.invalid_image"  # Uploaded file is not a decodable image.
+    attach_too_large = "attach.too_large"  # Uploaded file exceeds the size limit.
     model_not_granted = "model.not_granted"  # Principal is not granted the logical model.
     model_not_found = "model.not_found"  # Logical model does not exist or is disabled.
     model_no_channel = "model.no_available_channel"  # Logical model has no usable channel.

@@ -13,7 +13,12 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.admin.users.schemas import UserCreate, UserRead, UserUpdate
+from src.admin.users.schemas import (
+    ResetPasswordRequest,
+    UserCreate,
+    UserRead,
+    UserUpdate,
+)
 from src.admin.users.service import UserDetail, UserService
 from src.auth.dependencies import RequiredPerms, TraceId
 from src.auth.service import AuthenticatedUser
@@ -108,6 +113,21 @@ async def update_user(
 ) -> SuccessEnvelope[UserRead]:
     detail = await service.update_user(user_id, payload, user)
     return success(_to_read(detail), trace_id=trace_id)
+
+
+@router.post("/{user_id}/reset-password", response_model=SuccessEnvelope[None])
+async def reset_password(
+    user_id: int,
+    payload: ResetPasswordRequest,
+    service: ServiceDep,
+    trace_id: TraceId,
+    user: Annotated[
+        AuthenticatedUser, Depends(RequiredPerms("system:user:resetPwd"))
+    ],
+) -> SuccessEnvelope[None]:
+    """Admin-initiated password reset for a target user (forces re-login)."""
+    await service.reset_password(user_id, payload.password, user)
+    return success(None, trace_id=trace_id)
 
 
 @router.delete("/{user_id}", response_model=SuccessEnvelope[None])

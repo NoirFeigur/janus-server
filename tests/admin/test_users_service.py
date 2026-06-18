@@ -19,8 +19,9 @@ from src.admin.users.service import UserService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.core.query import ListQuery
+from src.core.security import verify_password_async
 from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
-from src.enums import UserStatus
+from src.enums import ErrorCode, UserStatus
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -308,3 +309,83 @@ async def test_list_users_bulk_roles(admin_session: AsyncSession) -> None:
     assert listing.total == 2
     assert by_name["a"] == [role.id]
     assert by_name["b"] == []  # user with no roles defaults to empty list
+
+
+async def test_reset_password_sets_new_hash(admin_session: AsyncSession) -> None:
+    svc = UserService(admin_session)
+    target, _ = await svc.create_user(
+        UserCreate(username="reset-me", employee_no="E-rst", password="old12345"),
+        _superuser(),
+    )
+
+    await svc.reset_password(target.id, "new12345", _superuser())
+
+    assert target.password is not None
+    assert await verify_password_async(target.password, "new12345")
+    assert not await verify_password_async(target.password, "old12345")
+    assert target.updated_by == ADMIN_ID
+
+
+async def test_reset_password_weak_rejected_with_code(
+    admin_session: AsyncSession,
+) -> None:
+    svc = UserService(admin_session)
+    target, _ = await svc.create_user(
+        UserCreate(username="weak-rst", employee_no="E-wk", password="old12345"),
+        _superuser(),
+    )
+    old_hash = target.password
+
+    with pytest.raises(AppError) as exc:
+        await svc.reset_password(target.id, "short", _superuser())
+    assert exc.value.code is ErrorCode.auth_password_too_weak
+    assert exc.value.status_code == 400
+    # Password unchanged on a rejected reset.
+    assert target.password == old_hash
+
+
+async def test_reset_password_revokes_target_sessions(
+    admin_session: AsyncSession,
+) -> None:
+    """Admin reset forces the target off every device (B7)."""
+    from src.auth.service import AuthService
+
+    svc = UserService(admin_session)
+    target, _ = await svc.create_user(
+        UserCreate(username="kickme", employee_no="E-kick", password="old12345"),
+        _superuser(),
+    )
+    # The target logs in → a real session lands in fake_redis.
+    auth = AuthService(admin_session)
+    token, _, _ = await auth.authenticate_password("kickme", "old12345")
+    current = await auth.resolve_access_token(token)
+    assert current.user_id == target.id
+
+    await svc.reset_password(target.id, "new12345", _superuser())
+
+    # The pre-reset access token's session is revoked → resolve fails.
+    with pytest.raises(AppError) as exc:
+        await auth.resolve_access_token(token)
+    assert exc.value.code is ErrorCode.auth_token_revoked
+
+
+async def test_reset_password_not_visible_raises(
+    admin_session: AsyncSession,
+) -> None:
+    """A scoped actor who cannot see the target gets an opaque 403."""
+    admin_session.add(Department(id=900, name="d900", parent_id=None))
+    await admin_session.flush()
+    svc = UserService(admin_session)
+    # Target in a department the scoped actor cannot see.
+    target, _ = await svc.create_user(
+        UserCreate(
+            username="hidden", employee_no="E-hid", department_id=900, password="pw123456"
+        ),
+        _superuser(),
+    )
+    await _seed_dept_scoped_role(admin_session, 55, code="weakr")
+    actor = _scoped_actor(55, dept=None, perms={"system:user:resetPwd"})
+
+    with pytest.raises(AppError) as exc:
+        await svc.reset_password(target.id, "new12345", actor)
+    assert exc.value.status_code == 403

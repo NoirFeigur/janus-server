@@ -59,6 +59,14 @@ class _StubAuthService:
             preferred_locale=user.preferred_locale,
         )
 
+    async def avatar_url(
+        self, user: AuthenticatedUser, storage: object | None
+    ) -> str | None:
+        # These tests exercise principals without a bound avatar (or no OSS), so
+        # the enrichment degrades to None — the endpoint must still succeed.
+        return None
+
+
     async def change_current_password(
         self, user: AuthenticatedUser, *, old_password: str, new_password: str
     ) -> None:
@@ -114,7 +122,12 @@ async def test_me_endpoint_serializes_principal() -> None:
         mobile="13800000000",
         preferred_locale="zh-CN",
     )
-    envelope = await me(current_user, TRACE)
+    envelope = await me(
+        current_user,
+        cast(AuthService, _StubAuthService()),
+        None,
+        TRACE,
+    )
     assert envelope.success is True
     assert envelope.data is not None
     # Snowflake ids serialize as strings on the wire.
@@ -136,7 +149,12 @@ async def test_me_endpoint_null_department() -> None:
         department_id=None,
         permissions=frozenset(),
     )
-    envelope = await me(current_user, TRACE)
+    envelope = await me(
+        current_user,
+        cast(AuthService, _StubAuthService()),
+        None,
+        TRACE,
+    )
     assert envelope.data is not None
     assert envelope.data.department_id is None
     assert envelope.data.is_superuser is False
@@ -157,6 +175,7 @@ async def test_update_me_endpoint_returns_updated_profile() -> None:
         CurrentUserUpdate(real_name="Alice R.", email=None),
         current_user,
         cast(AuthService, _StubAuthService()),
+        None,
         TRACE,
     )
     assert envelope.success is True

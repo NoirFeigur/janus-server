@@ -94,6 +94,12 @@ class User(BaseEntity):
         comment="所属部门 sys_department.id（逻辑引用，无物理外键）",
     )
 
+    avatar: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="头像附件 sys_attach.id（逻辑引用，无物理外键）；读取时现算预签名 URL",
+    )
+
     status: Mapped[str] = mapped_column(
         String(16),
         default="active",

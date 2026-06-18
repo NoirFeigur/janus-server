@@ -454,3 +454,58 @@ async def test_superuser_can_assign_any_role(admin_ctx: AdminCtx) -> None:
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["role_ids"] == [str(powerful.id)]
+
+
+async def test_reset_password_succeeds_and_changes_hash(admin_ctx: AdminCtx) -> None:
+    created = await admin_ctx.client.post(
+        "/admin/users",
+        json={"username": "rstroute", "employee_no": "E-rstr", "password": "old12345"},
+    )
+    user_id = created.json()["data"]["id"]
+    before = await admin_ctx.session.get(User, int(user_id))
+    assert before is not None
+    old_hash = before.password
+
+    resp = await admin_ctx.client.post(
+        f"/admin/users/{user_id}/reset-password", json={"password": "new12345"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"] is True
+    assert body["data"] is None  # empty success envelope, no password echoed
+    await admin_ctx.session.refresh(before)
+    assert before.password != old_hash  # rehashed
+
+
+async def test_reset_password_requires_permission(admin_ctx: AdminCtx) -> None:
+    created = await admin_ctx.client.post(
+        "/admin/users",
+        json={"username": "gated", "employee_no": "E-gate", "password": "old12345"},
+    )
+    user_id = created.json()["data"]["id"]
+    # Drop to a non-superuser actor lacking the reset perm.
+    admin_ctx.state.perms = {"system:user:list"}
+
+    resp = await admin_ctx.client.post(
+        f"/admin/users/{user_id}/reset-password", json={"password": "new12345"}
+    )
+
+    assert resp.status_code == 403
+
+
+async def test_reset_password_weak_rejected(admin_ctx: AdminCtx) -> None:
+    created = await admin_ctx.client.post(
+        "/admin/users",
+        json={"username": "weakrt", "employee_no": "E-wkr", "password": "old12345"},
+    )
+    user_id = created.json()["data"]["id"]
+
+    resp = await admin_ctx.client.post(
+        f"/admin/users/{user_id}/reset-password", json={"password": "short"}
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["success"] is False
+    assert body["code"] == "auth.password_too_weak"

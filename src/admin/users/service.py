@@ -22,9 +22,10 @@ from starlette import status
 from src.admin.users.repository import UserRepository
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.config import get_settings
 from src.core.pagination import PageResult, page_result
 from src.core.query import BatchResult, ListQuery, resolve_sort
-from src.core.security import hash_password_async
+from src.core.security import hash_password_async, password_strength_violations
 from src.db.models.identity import Department, Role, User
 from src.enums import ErrorCode
 from src.exceptions import AppError
@@ -209,6 +210,34 @@ class UserService:
 
         await self.session.commit()
         return await self._detail(user)
+
+    async def reset_password(
+        self, user_id: int, new_password: str, actor: AuthenticatedUser
+    ) -> None:
+        """Admin-set a target user's password and force re-login everywhere.
+
+        Visibility-gated like every single-user mutation (an actor who cannot see
+        the target gets the same opaque 403). No old-password check — this is an
+        admin acting on the target's behalf. Strength is enforced server-side
+        (``auth_password_too_weak`` / 400 with machine-readable violation labels).
+        On success **all** of the target's sessions are revoked (B7), so any
+        session standing on the old credential dies immediately.
+        """
+        user = await self._require_visible(user_id, actor)
+        violations = password_strength_violations(
+            new_password, min_length=get_settings().password_min_length
+        )
+        if violations:
+            raise AppError(
+                ErrorCode.auth_password_too_weak,
+                status.HTTP_400_BAD_REQUEST,
+                params={"violations": violations},
+            )
+        user.password = await hash_password_async(new_password)
+        user.updated_by = actor.user_id
+        await self.repo.session.flush()
+        await self.session.commit()
+        await self.auth.sessions.revoke_all_sessions(user_id)
 
     async def delete_user(self, user_id: int, actor: AuthenticatedUser) -> None:
         user = await self._require_visible(user_id, actor)

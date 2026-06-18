@@ -36,6 +36,7 @@ from src.auth.repository import AuthRepository
 from src.config import get_settings
 from src.core import cache
 from src.core.login_throttle import LoginThrottle, ThrottlePolicy
+from src.core.oss import ObjectStorage
 from src.core.redis import get_redis
 from src.core.security import (
     TokenError,
@@ -80,6 +81,7 @@ class AuthenticatedUser:
     email: str | None = None
     mobile: str | None = None
     preferred_locale: str = "zh-CN"
+    avatar: int | None = None
     credential_kind: CredentialKind = CredentialKind.jwt
     api_key_id: int | None = None
 
@@ -411,6 +413,7 @@ class AuthService:
             email=user.email,
             mobile=user.mobile,
             preferred_locale=user.preferred_locale,
+            avatar=user.avatar,
             credential_kind=credential_kind,
             api_key_id=api_key_id,
         )
@@ -420,7 +423,13 @@ class AuthService:
         user: AuthenticatedUser,
         values: Mapping[str, str | None],
     ) -> AuthenticatedUser:
-        """Update self-service profile fields and return a fresh principal."""
+        """Update self-service profile fields and return a fresh principal.
+
+        ``avatar`` is special: it carries an attachment id (string) the caller
+        uploaded, or ``None`` to clear. A non-null value is validated to be an
+        avatar attachment owned by the caller (else ``attach_not_found`` / 404),
+        so a user cannot bind someone else's object as their picture.
+        """
         row = await self.repo.get_user_by_id(user.user_id)
         if row is None:
             raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
@@ -429,10 +438,52 @@ class AuthService:
         for field in ("real_name", "email", "mobile", "preferred_locale"):
             if field in values:
                 setattr(row, field, values[field])
+        if "avatar" in values:
+            row.avatar = await self._resolve_avatar_binding(values["avatar"], user)
         row.updated_by = user.user_id
         await self.repo.session.flush()
         await self.repo.session.commit()
         return await self._build_user(user.user_id, credential_kind=user.credential_kind)
+
+    async def _resolve_avatar_binding(
+        self, avatar: str | None, user: AuthenticatedUser
+    ) -> int | None:
+        """Resolve an avatar-binding value to a validated attachment id (or None).
+
+        ``None`` clears the avatar. A non-null value must parse as an int and be
+        an avatar attachment owned by the caller; otherwise raise
+        ``attach_not_found`` (404) — a malformed id and a non-owned/absent id are
+        deliberately the same opaque outcome.
+        """
+        if avatar is None:
+            return None
+        try:
+            attach_id = int(avatar)
+        except ValueError as exc:
+            raise AppError(
+                ErrorCode.attach_not_found, status.HTTP_404_NOT_FOUND
+            ) from exc
+        owned = await self.repo.get_owned_avatar(attach_id, user.user_id)
+        if owned is None:
+            raise AppError(ErrorCode.attach_not_found, status.HTTP_404_NOT_FOUND)
+        return owned.id
+
+    async def avatar_url(
+        self, user: AuthenticatedUser, storage: ObjectStorage | None
+    ) -> str | None:
+        """Presigned GET URL for the user's bound avatar (None if unset/unavailable).
+
+        Returns ``None`` when the user has no avatar, when object storage is not
+        configured (``storage is None``), or when the referenced attachment was
+        soft-deleted. Read-only enrichment for ``/me`` — never raises, so a missing
+        avatar or unconfigured OSS degrades to "no picture" rather than a 500.
+        """
+        if user.avatar is None or storage is None:
+            return None
+        object_key = await self.repo.get_attach_object_key(user.avatar)
+        if object_key is None:
+            return None
+        return await storage.presign_get(object_key)
 
     async def change_current_password(
         self, user: AuthenticatedUser, *, old_password: str, new_password: str

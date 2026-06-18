@@ -23,12 +23,18 @@ class LoginRequest(BaseModel):
 
 
 class CurrentUserUpdate(BaseModel):
-    """Self-service profile fields the current user may update."""
+    """Self-service profile fields the current user may update.
+
+    ``avatar`` carries an attachment id (snowflake, as a string) the user has
+    uploaded via ``POST /attach/upload``; ``null`` clears the avatar. Omitting it
+    leaves the avatar unchanged (partial update).
+    """
 
     real_name: str | None = Field(default=None, max_length=64)
     email: str | None = Field(default=None, max_length=255)
     mobile: str | None = Field(default=None, max_length=32)
     preferred_locale: str | None = Field(default=None, max_length=16)
+    avatar: str | None = Field(default=None, max_length=32)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -68,5 +74,7 @@ class CurrentUserRead(BaseModel):
     mobile: str | None = None
     department_id: str | None
     preferred_locale: str
+    avatar: str | None = None  # Avatar attachment id (snowflake as string), if set.
+    avatar_url: str | None = None  # Freshly presigned avatar URL (short-lived), if set.
     permissions: list[str]  # Sorted effective permission codes (granular grants).
     is_superuser: bool  # True iff holding an active role with the superadmin code.

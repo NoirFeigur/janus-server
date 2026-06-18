@@ -27,12 +27,15 @@ from src.auth.schemas import (
     TokenRead,
 )
 from src.auth.service import AuthenticatedUser, AuthService
+from src.core.oss import OptionalObjectStorageDep
 from src.responses import SuccessEnvelope, success
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-def _to_current_user_read(user: AuthenticatedUser) -> CurrentUserRead:
+def _to_current_user_read(
+    user: AuthenticatedUser, *, avatar_url: str | None = None
+) -> CurrentUserRead:
     return CurrentUserRead(
         user_id=str(user.user_id),
         username=user.username,
@@ -43,6 +46,8 @@ def _to_current_user_read(user: AuthenticatedUser) -> CurrentUserRead:
         preferred_locale=user.preferred_locale,
         permissions=sorted(user.permissions),
         is_superuser=user.is_superuser,
+        avatar=str(user.avatar) if user.avatar is not None else None,
+        avatar_url=avatar_url,
     )
 
 
@@ -113,9 +118,22 @@ async def refresh(
 
 
 @router.get("/me", response_model=SuccessEnvelope[CurrentUserRead])
-async def me(user: CurrentJwtUser, trace_id: TraceId) -> SuccessEnvelope[CurrentUserRead]:
-    """Return the authenticated user's profile + effective permissions."""
-    return success(_to_current_user_read(user), trace_id=trace_id)
+async def me(
+    user: CurrentJwtUser,
+    service: Annotated[AuthService, Depends(get_auth_service)],
+    storage: OptionalObjectStorageDep,
+    trace_id: TraceId,
+) -> SuccessEnvelope[CurrentUserRead]:
+    """Return the authenticated user's profile + effective permissions.
+
+    Enriches the response with a freshly presigned ``avatar_url`` when the user
+    has a bound avatar and object storage is configured; otherwise ``avatar_url``
+    is ``None`` (read-only enrichment never fails the request).
+    """
+    avatar_url = await service.avatar_url(user, storage)
+    return success(
+        _to_current_user_read(user, avatar_url=avatar_url), trace_id=trace_id
+    )
 
 
 @router.put("/me", response_model=SuccessEnvelope[CurrentUserRead])
@@ -123,12 +141,16 @@ async def update_me(
     payload: CurrentUserUpdate,
     user: CurrentJwtUser,
     service: Annotated[AuthService, Depends(get_auth_service)],
+    storage: OptionalObjectStorageDep,
     trace_id: TraceId,
 ) -> SuccessEnvelope[CurrentUserRead]:
     """Update self-service profile fields for the current user."""
     values: dict[str, str | None] = payload.model_dump(exclude_unset=True)
     updated = await service.update_current_user(user, values)
-    return success(_to_current_user_read(updated), trace_id=trace_id)
+    avatar_url = await service.avatar_url(updated, storage)
+    return success(
+        _to_current_user_read(updated, avatar_url=avatar_url), trace_id=trace_id
+    )
 
 
 @router.put("/me/password", response_model=SuccessEnvelope[None])

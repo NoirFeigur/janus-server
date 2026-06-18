@@ -5,6 +5,7 @@ full metadata by importing one place. Import side effects register each model
 on ``Base.metadata``.
 """
 
+from src.db.models.attach import SysAttach
 from src.db.models.audit import LoginLog, OperLog
 from src.db.models.credential import ApiKey
 from src.db.models.grant import UserModelGrant
@@ -55,4 +56,6 @@ __all__ = [
     "LoginLog",
     # platform config
     "SysConfig",
+    # attachment
+    "SysAttach",
 ]

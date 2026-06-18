@@ -16,9 +16,11 @@ from src.auth.service import (
     invalidate_department_tree,
 )
 from src.core.security import decode_access_token, generate_api_key, verify_password_async
+from src.core.snowflake import next_id
+from src.db.models.attach import SysAttach
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Role, RoleDept, UserRole
-from src.enums import DataScope, ErrorCode
+from src.enums import AttachBizType, DataScope, ErrorCode
 from src.exceptions import AppError
 from tests.auth.conftest import grant_permission, seed_user
 
@@ -128,6 +130,195 @@ async def test_update_current_user_rejects_null_locale(
     with pytest.raises(AppError) as exc:
         await service.update_current_user(current_user, {"preferred_locale": None})
     assert exc.value.status_code == 400
+
+
+async def _seed_avatar(
+    session: AsyncSession,
+    *,
+    owner_id: int,
+    biz_type: AttachBizType = AttachBizType.avatar,
+) -> SysAttach:
+    """Insert a stored attachment row (object already 'in the bucket')."""
+    attach_id = next_id()
+    attach = SysAttach(
+        id=attach_id,
+        object_key=f"avatar/2026/06/{attach_id}.webp",
+        bucket="private",
+        original_name="me.png",
+        content_type="image/webp",
+        file_size=1234,
+        biz_type=biz_type,
+        created_by=owner_id,
+        updated_by=owner_id,
+    )
+    session.add(attach)
+    await session.flush()
+    return attach
+
+
+class _FakeStorage:
+    """Returns a deterministic presigned URL; records the keys it signed."""
+
+    def __init__(self) -> None:
+        self.signed: list[str] = []
+
+    async def presign_get(self, object_key: str) -> str:
+        self.signed.append(object_key)
+        return f"https://signed.example/{object_key}"
+
+
+async def test_update_current_user_binds_owned_avatar(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session)
+    attach = await _seed_avatar(auth_session, owner_id=user.id)
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+
+    updated = await service.update_current_user(
+        current_user, {"avatar": str(attach.id)}
+    )
+
+    assert updated.avatar == attach.id
+    assert user.avatar == attach.id
+
+
+async def test_update_current_user_clears_avatar_with_null(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session)
+    attach = await _seed_avatar(auth_session, owner_id=user.id)
+    user.avatar = attach.id
+    await auth_session.flush()
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+        avatar=attach.id,
+    )
+
+    updated = await service.update_current_user(current_user, {"avatar": None})
+
+    assert updated.avatar is None
+    assert user.avatar is None
+
+
+async def test_update_current_user_rejects_non_owned_avatar(
+    auth_session: AsyncSession,
+) -> None:
+    owner = await seed_user(auth_session, username="owner")
+    other = await seed_user(auth_session, username="other")
+    attach = await _seed_avatar(auth_session, owner_id=owner.id)
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=other.id,
+        username="other",
+        department_id=None,
+        permissions=frozenset(),
+    )
+
+    with pytest.raises(AppError) as exc:
+        await service.update_current_user(current_user, {"avatar": str(attach.id)})
+    assert exc.value.code is ErrorCode.attach_not_found
+    assert exc.value.status_code == 404
+    assert other.avatar is None  # binding rejected → unchanged
+
+
+async def test_update_current_user_rejects_non_avatar_biz_type(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session)
+    # An attachment owned by the user but of the wrong biz type must not bind.
+    attach = await _seed_avatar(
+        auth_session, owner_id=user.id, biz_type=AttachBizType.attachment
+    )
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+
+    with pytest.raises(AppError) as exc:
+        await service.update_current_user(current_user, {"avatar": str(attach.id)})
+    assert exc.value.code is ErrorCode.attach_not_found
+
+
+async def test_update_current_user_rejects_malformed_avatar_id(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session)
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+
+    with pytest.raises(AppError) as exc:
+        await service.update_current_user(current_user, {"avatar": "not-a-number"})
+    assert exc.value.code is ErrorCode.attach_not_found
+
+
+async def test_avatar_url_presigns_bound_avatar(auth_session: AsyncSession) -> None:
+    user = await seed_user(auth_session)
+    attach = await _seed_avatar(auth_session, owner_id=user.id)
+    service = AuthService(auth_session)
+    storage = _FakeStorage()
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+        avatar=attach.id,
+    )
+
+    url = await service.avatar_url(current_user, storage)  # type: ignore[arg-type]
+
+    assert url == f"https://signed.example/{attach.object_key}"
+    assert storage.signed == [attach.object_key]
+
+
+async def test_avatar_url_none_when_no_avatar(auth_session: AsyncSession) -> None:
+    user = await seed_user(auth_session)
+    service = AuthService(auth_session)
+    storage = _FakeStorage()
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+    )
+
+    assert await service.avatar_url(current_user, storage) is None  # type: ignore[arg-type]
+    assert storage.signed == []  # nothing to sign
+
+
+async def test_avatar_url_none_when_storage_unconfigured(
+    auth_session: AsyncSession,
+) -> None:
+    user = await seed_user(auth_session)
+    attach = await _seed_avatar(auth_session, owner_id=user.id)
+    service = AuthService(auth_session)
+    current_user = AuthenticatedUser(
+        user_id=user.id,
+        username="alice",
+        department_id=None,
+        permissions=frozenset(),
+        avatar=attach.id,
+    )
+
+    # OSS not configured (storage is None) → degrade to no URL, never 500.
+    assert await service.avatar_url(current_user, None) is None
 
 
 async def test_change_current_password_rehashes_password(

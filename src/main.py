@@ -18,6 +18,7 @@ from src.core.redis import close_redis
 from src.core.redis import ping as redis_ping
 from src.db.session import async_session_factory, engine
 from src.exceptions import register_exception_handlers
+from src.files.router import router as attach_router
 from src.gateway.router import router as gateway_router
 
 RequestHandler = Callable[[Request], Awaitable[Response]]
@@ -71,6 +72,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router, prefix=settings.api_prefix)
     app.include_router(admin_router, prefix=settings.api_prefix)
+    app.include_router(attach_router, prefix=settings.api_prefix)
     app.include_router(gateway_router, prefix=settings.api_prefix)
 
     # health 探针走裸格式,不套统一信封——它服务于 k8s/LB 存活探测,约定是

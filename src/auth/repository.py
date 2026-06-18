@@ -18,9 +18,10 @@ from collections.abc import Sequence
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.models.attach import SysAttach
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
-from src.enums import ActiveStatus, ApiKeyStatus, UserStatus
+from src.enums import ActiveStatus, ApiKeyStatus, AttachBizType, UserStatus
 
 
 class AuthRepository:
@@ -65,6 +66,38 @@ class AuthRepository:
         )
         api_key: ApiKey | None = await self.session.scalar(stmt)
         return api_key
+
+    async def get_owned_avatar(self, attach_id: int, owner_id: int) -> SysAttach | None:
+        """An avatar attachment owned by ``owner_id`` (None if absent/not owned).
+
+        Self-service avatar binding may only point at an attachment the caller
+        uploaded (``created_by``) and that is of ``avatar`` biz type — prevents
+        binding someone else's object or a non-avatar file as a profile picture.
+        """
+        stmt = (
+            select(SysAttach)
+            .where(SysAttach.id == attach_id)
+            .where(SysAttach.is_deleted.is_(False))
+            .where(SysAttach.biz_type == AttachBizType.avatar.value)
+            .where(SysAttach.created_by == owner_id)
+        )
+        attach: SysAttach | None = await self.session.scalar(stmt)
+        return attach
+
+    async def get_attach_object_key(self, attach_id: int) -> str | None:
+        """Object key for an attachment by id (None if absent/soft-deleted).
+
+        Read path for presigning an already-bound avatar URL on ``/me`` — the
+        avatar id was ownership-validated at bind time, so the read just needs the
+        key (no owner filter). Soft-deleted rows return ``None`` (avatar cleared).
+        """
+        stmt = (
+            select(SysAttach.object_key)
+            .where(SysAttach.id == attach_id)
+            .where(SysAttach.is_deleted.is_(False))
+        )
+        object_key: str | None = await self.session.scalar(stmt)
+        return object_key
 
     async def list_permission_codes(self, user_id: int) -> frozenset[str]:
         """Aggregate the user's effective permission codes in one query.

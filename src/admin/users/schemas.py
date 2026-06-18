@@ -45,6 +45,17 @@ class UserUpdate(BaseModel):
     role_ids: list[int] | None = None  # None = unchanged; [] = clear assignments.
 
 
+class ResetPasswordRequest(BaseModel):
+    """Admin-initiated password reset for a target user (no old-password check).
+
+    The acting admin sets a new password on the target's behalf (e.g. a user who
+    forgot theirs); strength is enforced server-side. ``password`` is write-only
+    and never echoed back (§0.8).
+    """
+
+    password: str = Field(min_length=1, max_length=128)
+
+
 class UserRead(BaseModel):
     """User read model. Never carries ``password`` (§0.8)."""
 

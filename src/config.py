@@ -60,6 +60,21 @@ class Settings(BaseSettings):
     default_locale: str = "zh-CN"
     supported_locales: tuple[str, ...] = ("zh-CN", "en-US")
 
+    # 对象存储(MinIO,S3 兼容)。私有桶——读取一律用短期预签名 URL(后端用 access/secret
+    # 本地算 HMAC 签名,零网络开销),DB 只存桶内 object key,绝不存永久 URL。endpoint/桶名/
+    # 密钥都是部署相关的连接信息,走 .env(见 .env.example);这里只给本地/占位默认,绝不写生产值。
+    # 换 S3/阿里云 OSS 只改 .env。
+    oss_endpoint_url: str = "http://localhost:9000"  # S3 端点(.env JANUS_OSS_ENDPOINT_URL)
+    oss_region: str = "us-east-1"  # MinIO 不校验区域,给个 S3 默认值占位
+    oss_bucket: str = "local"  # 桶名(.env JANUS_OSS_BUCKET);头像/附件统一落此桶,按 biz_type 分前缀
+    oss_access_key: SecretStr | None = None  # access key(.env JANUS_OSS_ACCESS_KEY)
+    oss_secret_key: SecretStr | None = None  # secret key(.env JANUS_OSS_SECRET_KEY)
+    oss_presign_ttl_seconds: int = 900  # 读预签名 URL 有效期(15min);私有桶读取凭证
+    # 头像上传约束。后端代理上传 → 统一校验大小/类型并转 webp(省存储 + 转码即剥 EXIF 隐私元数据)。
+    avatar_max_bytes: int = 2 * 1024 * 1024  # 头像原图大小上限(2MB);超限拒绝
+    # 通用附件上传约束。后端代理上传 → 仅校验大小,原样落桶(保留原始扩展名/类型,不转码)。
+    attachment_max_bytes: int = 10 * 1024 * 1024  # 通用附件大小上限(10MB);超限拒绝
+
     cors_allow_origins: list[str] = Field(default_factory=list)
 
     log_level: str = "INFO"  # 根 logger 级别（DEBUG/INFO/WARNING/ERROR）

@@ -9,6 +9,7 @@ description = "Unified internal AI infrastructure backend."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+    "aioboto3>=13.2,<16",
     "alembic>=1.16,<2",
     "argon2-cffi>=25.1,<26",
     "arq>=0.26,<1",
@@ -18,9 +19,11 @@ dependencies = [
     "httpx>=0.28,<1",
     "litellm>=1.72,<2",
     "mcp>=1.9,<2",
+    "pillow>=11,<12",
     "pydantic>=2.11,<3",
     "pydantic-settings>=2.9,<3",
     "pyjwt[crypto]>=2.10,<3",
+    "python-multipart>=0.0.18,<1",
     "redis>=5,<7",
     "sqlalchemy[asyncio]>=2.0.41,<3",
     "structlog>=26.1,<27",
@@ -35,6 +38,7 @@ dev = [
     "pytest-asyncio>=1.0,<2",
     "pytest-cov>=7.1,<8",
     "ruff>=0.11,<1",
+    "types-aioboto3[s3]>=13.2,<16",
 ]
 
 [tool.hatch.build.targets.wheel]
