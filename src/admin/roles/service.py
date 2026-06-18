@@ -20,6 +20,7 @@ from starlette import status
 from src.admin.roles.repository import RoleRepository
 from src.admin.roles.schemas import RoleCreate, RoleUpdate
 from src.auth import perm_cache
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.core.pagination import PageResult, page_result
 from src.core.query import BatchResult, ListQuery, resolve_sort
@@ -76,6 +77,21 @@ class RoleService:
         existing = await self.repo.existing_dept_ids(dept_ids)
         if existing != set(dept_ids):
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+
+    def _require_assignable_code(self, code: str, actor: AuthenticatedUser) -> None:
+        """Reject minting/renaming a role into the reserved ``superadmin`` code.
+
+        Super-admin status is code-based (``AuthenticatedUser.is_superuser`` tests
+        the role code, not a perm chain), so a role carrying the ``superadmin``
+        code IS the super-admin grant. Only an existing super-admin may create one
+        — otherwise a scoped admin could self-mint a no-menu ``superadmin`` role
+        (which confers zero perms, so the menu-subset guard waves it through) and
+        then assign it, escalating to full super-admin.
+        """
+        if actor.is_superuser:
+            return
+        if code == SUPERADMIN_ROLE_CODE:
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
     async def _require_assignable_menus(
         self, menu_ids: Sequence[int], actor: AuthenticatedUser
@@ -163,6 +179,14 @@ class RoleService:
     async def create_role(self, payload: RoleCreate, *, actor: AuthenticatedUser) -> RoleDetail:
         if await self.repo.get_by_code(payload.code) is not None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+        # The ``superadmin`` code is the *identity* of super-admin (is_superuser is
+        # code-based, not perm-based), so minting a role with it is minting the
+        # super-admin grant itself. A non-super-admin must never do this: the
+        # menu/scope escalation guards below are blind to it (a no-menu superadmin
+        # role confers zero perms, trivially passing the subset check), so a scoped
+        # admin could otherwise self-create a superadmin role and assign it. Only a
+        # super-admin may create a super-admin-coded role.
+        self._require_assignable_code(payload.code, actor)
         await self._validate_menus(payload.menu_ids)
         await self._require_assignable_menus(payload.menu_ids, actor)
         await self._require_assignable_scope(

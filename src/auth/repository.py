@@ -217,3 +217,24 @@ class AuthRepository:
         stmt = select(Department).where(Department.is_deleted.is_(False))
         result = await self.session.scalars(stmt)
         return result.all()
+
+    async def list_active_roles_by_ids(self, role_ids: Sequence[int]) -> Sequence[Role]:
+        """Active, non-deleted role rows for a given id set (assignment guards).
+
+        Used by the user-admin escalation guard to inspect a role's ``code``
+        (super-admin marker) and ``data_scope`` breadth before letting an actor
+        assign it — a perms-only subset check is blind to both (a ``superadmin``
+        role with no menus confers zero perms; an ``all``-scope role confers no
+        perm code yet grants unrestricted visibility). Same active/not-deleted
+        filters as the other RBAC reads.
+        """
+        if not role_ids:
+            return ()
+        stmt = (
+            select(Role)
+            .where(Role.id.in_(role_ids))
+            .where(Role.is_deleted.is_(False))
+            .where(Role.status == ActiveStatus.active.value)
+        )
+        result = await self.session.scalars(stmt)
+        return result.all()

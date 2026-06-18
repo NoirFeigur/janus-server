@@ -296,6 +296,133 @@ async def test_non_superuser_cannot_assign_unheld_perm_role(
     assert exc.value.status_code == 403
 
 
+async def test_non_superuser_cannot_assign_superadmin_role(
+    admin_session: AsyncSession,
+) -> None:
+    """A scoped actor cannot assign a ``superadmin``-coded role — even one with
+    NO menus (zero conferred perms), which the perms-subset check waves through.
+
+    This is the escalation the perms-only guard is blind to: ``is_superuser`` is
+    code-based, so a no-menu ``superadmin`` role confers an empty perm set that
+    trivially passes ``issubset``, yet assigning it hands out full super-admin.
+    """
+    admin_session.add(Department(id=830, name="d830", parent_id=None))
+    # A superadmin-coded role with NO menus → confers zero perms.
+    su_role = Role(
+        name="su", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
+    )
+    admin_session.add(su_role)
+    await _seed_dept_scoped_role(admin_session, 60, code="weak60")
+    actor = _scoped_actor(60, dept=830, perms={"system:user:add"})
+    svc = UserService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_user(
+            UserCreate(
+                username="escalate-su",
+                employee_no="E-esu",
+                department_id=830,
+                role_ids=[su_role.id],
+            ),
+            actor,
+        )
+    assert exc.value.status_code == 403
+
+
+async def test_superuser_may_assign_superadmin_role(
+    admin_session: AsyncSession,
+) -> None:
+    """The superadmin-code guard must not block an actual super-admin."""
+    su_role = Role(
+        name="su2", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
+    )
+    admin_session.add(su_role)
+    await admin_session.commit()
+    svc = UserService(admin_session)
+    _, role_ids = await svc.create_user(
+        UserCreate(username="newsu", employee_no="E-nsu", role_ids=[su_role.id]),
+        _superuser(),
+    )
+    assert role_ids == [su_role.id]
+
+
+async def test_non_superuser_cannot_assign_all_scope_role(
+    admin_session: AsyncSession,
+) -> None:
+    """A scoped actor cannot assign an ``all``-scope role — even with zero menus.
+
+    Perms-light but scope-heavy: an ``all``-data role with no menus confers no
+    perm code (passes the subset check) yet grants unrestricted visibility. The
+    data-scope breadth layer of the guard must reject it.
+    """
+    admin_session.add(Department(id=840, name="d840", parent_id=None))
+    all_role = Role(name="allr", code="allr", data_scope="all", status="active")
+    admin_session.add(all_role)
+    await _seed_dept_scoped_role(admin_session, 61, code="weak61")
+    actor = _scoped_actor(61, dept=840, perms={"system:user:add"})
+    svc = UserService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_user(
+            UserCreate(
+                username="escalate-all",
+                employee_no="E-eall",
+                department_id=840,
+                role_ids=[all_role.id],
+            ),
+            actor,
+        )
+    assert exc.value.status_code == 403
+
+
+async def test_update_user_disable_revokes_sessions(
+    admin_session: AsyncSession,
+) -> None:
+    """Disabling a user kills every live session (no resurrection on re-enable)."""
+    from src.auth.service import AuthService
+
+    svc = UserService(admin_session)
+    target, _ = await svc.create_user(
+        UserCreate(username="disableme", employee_no="E-dis", password="pw123456"),
+        _superuser(),
+    )
+    auth = AuthService(admin_session)
+    token, _, _ = await auth.authenticate_password("disableme", "pw123456")
+    current = await auth.resolve_access_token(token)
+    assert current.user_id == target.id
+
+    await svc.update_user(
+        target.id, UserUpdate(status=UserStatus.disabled), _superuser()
+    )
+    # Revocation is an after-commit hook; emulate the request edge committing.
+    await commit_session(admin_session)
+
+    with pytest.raises(AppError) as exc:
+        await auth.resolve_access_token(token)
+    assert exc.value.code is ErrorCode.auth_token_revoked
+
+
+async def test_delete_user_revokes_sessions(
+    admin_session: AsyncSession,
+) -> None:
+    """Soft-deleting a user kills every live session too (same resurrection risk)."""
+    from src.auth.service import AuthService
+
+    svc = UserService(admin_session)
+    target, _ = await svc.create_user(
+        UserCreate(username="deleteme", employee_no="E-del2", password="pw123456"),
+        _superuser(),
+    )
+    auth = AuthService(admin_session)
+    token, _, _ = await auth.authenticate_password("deleteme", "pw123456")
+    assert (await auth.resolve_access_token(token)).user_id == target.id
+
+    await svc.delete_user(target.id, _superuser())
+    await commit_session(admin_session)
+
+    with pytest.raises(AppError) as exc:
+        await auth.resolve_access_token(token)
+    assert exc.value.code is ErrorCode.auth_token_revoked
+
+
 async def test_list_users_bulk_roles(admin_session: AsyncSession) -> None:
     role = Role(name="m", code="lrole", data_scope="self", status="active")
     admin_session.add(role)

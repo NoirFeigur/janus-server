@@ -101,11 +101,32 @@ class MenuService:
         if menu_type != MenuType.button and perms:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
+    def _require_assignable_perms(
+        self, perms: str | None, actor: AuthenticatedUser
+    ) -> None:
+        """Privilege-escalation guard for a menu's permission code.
+
+        A menu's ``perms`` string IS a permission grant: every role linking the
+        menu confers that code to its holders. Without this guard an actor holding
+        ``system:menu:edit`` could set a menu's ``perms`` to any code — e.g. point
+        a menu their own role already links at ``*:*:*`` — and instantly mint
+        themselves a permission they never held (the role→menu link is unchanged,
+        so the role-edit guard never re-runs). Mirror the role-assignment rule: a
+        non-super-admin may only set a perms code that is already within their own
+        permission set. Super-admin may set anything; a null/empty perms (catalog
+        or menu node, no operation code) is trivially allowed.
+        """
+        if actor.is_superuser or not perms:
+            return
+        if perms not in actor.permissions:
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+
     async def create_menu(
         self, payload: MenuCreate, *, actor: AuthenticatedUser
     ) -> Menu:
         await self._validate_parent(payload.parent_id)
         self._validate_kind(payload.menu_type, payload.perms)
+        self._require_assignable_perms(payload.perms, actor)
         menu = Menu(
             name=payload.name,
             parent_id=payload.parent_id,
@@ -142,6 +163,11 @@ class MenuService:
         )
         effective_perms = values.get("perms", menu.perms)
         self._validate_kind(MenuType(effective_type), effective_perms)
+        # Only re-gate when this edit actually changes ``perms`` — an unrelated
+        # field edit (path/icon/visible) must not require the actor to already
+        # hold the menu's pre-existing code (that was vetted when it was set).
+        if "perms" in values:
+            self._require_assignable_perms(effective_perms, actor)
 
         if payload.menu_type is not None:
             values["menu_type"] = payload.menu_type.value

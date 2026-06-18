@@ -421,6 +421,36 @@ async def test_scoped_actor_may_grant_custom_dept_within_scope(
     assert dept_ids == [10]
 
 
+async def test_non_superuser_cannot_create_superadmin_role(
+    admin_session: AsyncSession,
+) -> None:
+    """A scoped actor cannot mint a ``superadmin``-coded role.
+
+    The code IS the super-admin grant (is_superuser is code-based), so a no-menu
+    superadmin role would pass the menu-subset guard (zero conferred perms) yet
+    self-mint full super-admin once assigned. The code guard blocks it up front.
+    """
+    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:add"})
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_role(
+            RoleCreate(name="Sneaky", code=SUPERADMIN_ROLE_CODE), actor=actor
+        )
+    assert exc.value.status_code == 403
+
+
+async def test_superuser_may_create_superadmin_role(
+    admin_session: AsyncSession,
+) -> None:
+    """An actual super-admin may create a super-admin-coded role."""
+    svc = RoleService(admin_session)
+    role, _, _ = await svc.create_role(
+        RoleCreate(name="Su", code=SUPERADMIN_ROLE_CODE), actor=_actor()
+    )
+    assert role.code == SUPERADMIN_ROLE_CODE
+
+
 async def test_update_role_escalating_menu_rejected(
     admin_session: AsyncSession,
 ) -> None:

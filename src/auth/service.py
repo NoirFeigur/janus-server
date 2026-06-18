@@ -601,6 +601,21 @@ class AuthService:
         """Permission codes a given set of menus would confer (role-edit guard)."""
         return await self.repo.list_permission_codes_for_menus(menu_ids)
 
+    async def roles_for_assignment(self, role_ids: Sequence[int]) -> Sequence[Role]:
+        """Active role rows for an assignment escalation guard.
+
+        Exposes each role's ``code`` (super-admin marker) and ``data_scope``
+        (visibility breadth) so the user-admin layer can reject assigning a role
+        broader than the actor — neither is observable through the perms-only
+        subset check (a ``superadmin`` role with no menus confers zero perms, and
+        an ``all``-scope role confers no perm code yet grants unrestricted view).
+        """
+        return await self.repo.list_active_roles_by_ids(role_ids)
+
+    async def role_department_ids(self, role_ids: Sequence[int]) -> frozenset[int]:
+        """Custom-scope department ids granted to a set of roles (scope guard)."""
+        return await self.repo.list_role_department_ids(role_ids)
+
     async def resolve_data_scope(self, user: AuthenticatedUser) -> DataScopeFilter:
         """Resolve the user's effective data scope (broadest role wins).
 

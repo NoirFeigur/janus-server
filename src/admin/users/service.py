@@ -28,6 +28,7 @@ from starlette import status
 from src.admin.users.repository import UserRepository
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.auth import perm_cache
+from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.config import get_settings
 from src.core.pagination import PageResult, page_result
@@ -35,7 +36,7 @@ from src.core.query import BatchResult, ListQuery, resolve_sort
 from src.core.security import hash_password_async, password_strength_violations
 from src.db.models.identity import Department, Role, User
 from src.db.session import add_after_commit_hook
-from src.enums import ErrorCode
+from src.enums import DataScope, ErrorCode, UserStatus
 from src.exceptions import AppError
 
 UserDetail = tuple[User, list[int]]
@@ -110,16 +111,59 @@ class UserService:
     async def _require_assignable_roles(
         self, role_ids: Sequence[int], actor: AuthenticatedUser
     ) -> None:
-        """Privilege-escalation guard: an actor may only assign roles whose
-        conferred permissions are a subset of the actor's own. Super-admin may
-        assign anything; everyone else cannot grant a permission they lack
-        (so a non-admin cannot mint a ``*:*:*`` role onto anyone, themselves
-        included)."""
+        """Privilege-escalation guard for role assignment (three layers).
+
+        Super-admin may assign anything; for everyone else a role is assignable
+        only if it grants the actor no power the actor lacks along EVERY axis:
+
+        1. **Permission codes** — the role's conferred perms must be a subset of
+           the actor's own (no minting a ``*:*:*`` role onto anyone).
+        2. **Super-admin marker** — a role carrying the ``superadmin`` code is
+           never assignable by a non-super-admin. This is the axis the perms-only
+           check is blind to: ``is_superuser`` is *code*-based, so a ``superadmin``
+           role with no menus confers an EMPTY perm set that trivially passes the
+           subset test — yet assigning it would hand out full super-admin.
+        3. **Data-scope breadth** — the role's visibility may not exceed the
+           actor's own (``all`` is refused outright; ``custom`` depts must fall
+           within the actor's visible department set). A perms-light, scope-heavy
+           role (e.g. ``all``-scope with zero menus) otherwise slips through.
+        """
         if actor.is_superuser or not role_ids:
             return
         conferred = await self.auth.permissions_for_roles(role_ids)
         if not conferred.issubset(actor.permissions):
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+
+        roles = await self.auth.roles_for_assignment(role_ids)
+        if any(role.code == SUPERADMIN_ROLE_CODE for role in roles):
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+        await self._require_roles_within_scope(roles, actor)
+
+    async def _require_roles_within_scope(
+        self, roles: Sequence[Role], actor: AuthenticatedUser
+    ) -> None:
+        """Reject assigning any role whose data scope exceeds the actor's own.
+
+        An unrestricted actor (super-admin or an ``all``-scope role) may assign
+        any scope. A scoped actor may not assign a role that is ``all`` (strictly
+        broader than the actor) nor a ``custom`` role whose granted departments
+        leak outside the actor's visible set. Relative scopes (``dept`` /
+        ``dept_and_child`` / ``self`` / ``dept_and_child_or_self``) are bounded by
+        the eventual holder's own position, so they confer no breadth the actor
+        lacks and are allowed.
+        """
+        actor_scope = await self._scope(actor)
+        if actor_scope.unrestricted:
+            return
+        if any(role.data_scope == DataScope.all_data.value for role in roles):
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+        custom_role_ids = [
+            role.id for role in roles if role.data_scope == DataScope.custom.value
+        ]
+        if custom_role_ids:
+            granted = await self.auth.role_department_ids(custom_role_ids)
+            if not granted.issubset(actor_scope.department_ids):
+                raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
     async def _require_unique_employee_no(self, employee_no: str) -> None:
         stmt = (
@@ -231,7 +275,18 @@ class UserService:
         # would silently leave the target's old sessions alive (B7). Fires only
         # after the write commits (after-commit hook), so a rolled-back update
         # never logs the target out.
-        if password_changed:
+        #
+        # Disabling a user must ALSO kill every live session: the access-allowlist
+        # entry and rotatable refresh both outlive the status flip on their own,
+        # so a disabled user keeps a usable refresh token until it expires, and a
+        # later re-enable would silently resurrect those stale sessions. Revoking
+        # on disable forces a fresh login and severs the resurrection path. (A
+        # single ``revoke_all_sessions`` is idempotent, so overlapping with the
+        # password-change hook is harmless.)
+        disabled_now = payload.status is not None and (
+            payload.status == UserStatus.disabled
+        )
+        if password_changed or disabled_now:
             add_after_commit_hook(
                 self.session, lambda: self.auth.sessions.revoke_all_sessions(user_id)
             )
@@ -273,8 +328,15 @@ class UserService:
         await self.repo.replace_roles(user_id, [])
         user.updated_by = actor.user_id
         await self.repo.soft_delete(user)
+        # Soft-deleting drops the user's perm snapshot AND must kill every live
+        # session: like disable, the access-allowlist entry and refresh token
+        # outlive the row flip on their own, so a deleted user keeps usable
+        # credentials until TTL. Both hooks fire only after the write commits.
         add_after_commit_hook(
             self.session, lambda: perm_cache.invalidate_user(user_id)
+        )
+        add_after_commit_hook(
+            self.session, lambda: self.auth.sessions.revoke_all_sessions(user_id)
         )
 
     async def batch_delete_users(
