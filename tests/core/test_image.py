@@ -73,3 +73,26 @@ def test_decompression_bomb_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1024)
     with pytest.raises(InvalidImageError, match="bomb"):
         to_webp_avatar(_png_bytes(size=(64, 64)), max_bytes=2 * 1024 * 1024)
+
+
+def test_oversized_pixel_count_rejected_before_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An image whose declared dimensions exceed our explicit ``_MAX_PIXELS`` is
+    refused at the header (before ``load()``), independent of Pillow's own bomb
+    ceiling. This closes the band Pillow only *warns* on (MAX_IMAGE_PIXELS .. 2×)
+    where ``load()`` would otherwise decode a huge raster into memory.
+
+    Pillow's ceiling stays HIGH so this image would NOT trip the bomb guard —
+    proving our own pre-load pixel check is what rejects it (distinct message)."""
+    monkeypatch.setattr("src.core.image._MAX_PIXELS", 1024)  # 32x32=1024 → 64x64 over
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10_000_000)  # Pillow would allow it.
+    with pytest.raises(InvalidImageError, match="pixel limit"):
+        to_webp_avatar(_png_bytes(size=(64, 64)), max_bytes=2 * 1024 * 1024)
+
+
+def test_image_at_pixel_limit_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boundary: an image exactly at ``_MAX_PIXELS`` passes (``>`` not ``>=``)."""
+    monkeypatch.setattr("src.core.image._MAX_PIXELS", 4096)  # 64x64 == 4096 px exactly.
+    out = to_webp_avatar(_png_bytes(size=(64, 64)), max_bytes=2 * 1024 * 1024)
+    assert out.content_type == "image/webp"

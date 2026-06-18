@@ -260,8 +260,15 @@ async def test_batch_delete_roles_skips_out_of_scope(admin_ctx: AdminCtx) -> Non
             UserRole(user_id=assignee.id, role_id=out_scope.id),
         ]
     )
+    # Actor holds the menu's perm so it DOMINATES both roles (perm subset ok) —
+    # isolating the skip to the data-scope axis: out_scope's custom dept (3200)
+    # lies outside the actor's scope {3100}, so it is skipped while in_scope is
+    # deleted. (Without the perm the dominance guard would skip BOTH, which is a
+    # separate guarantee covered by the service-level dominance tests.)
     await _set_dept_scoped_actor(
-        admin_ctx, department_id=3100, perms={"system:role:remove"}
+        admin_ctx,
+        department_id=3100,
+        perms={"system:role:remove", "system:role:list"},
     )
 
     resp = await admin_ctx.client.post(

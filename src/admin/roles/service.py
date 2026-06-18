@@ -143,6 +143,59 @@ class RoleService:
         dept_ids = await self.repo.list_dept_ids(role.id)
         return role, menu_ids, dept_ids
 
+    async def _require_role_dominance(
+        self, role: Role, actor: AuthenticatedUser
+    ) -> None:
+        """Reject editing/deleting a role that outranks the actor (dominance).
+
+        ``_require_visible`` only answers "may the actor SEE this role"; it does
+        NOT answer "may the actor MANAGE it". Without this guard a scoped admin
+        holding ``system:role:edit/remove`` could delete or rewrite a role more
+        powerful than any it could create — including the ``superadmin`` role
+        itself — as long as the role fell inside its data scope.
+
+        The dominance test is the role-creation escalation test applied to the
+        role's CURRENT shape: an actor may manage a role only if it could have
+        MINTED that role itself. This reuses the same three guards used on
+        create/update (reserved-code + menu-perm subset + data-scope breadth), so
+        a role carrying ``superadmin``, an ``all`` scope, or any permission the
+        actor lacks is unmanageable. Super-admin actors pass trivially.
+        """
+        if actor.is_superuser:
+            return
+        self._require_assignable_code(role.code, actor)
+        menu_ids = await self.repo.list_menu_ids(role.id)
+        await self._require_assignable_menus(menu_ids, actor)
+        dept_ids = await self.repo.list_dept_ids(role.id)
+        await self._require_assignable_scope(
+            DataScope(role.data_scope), dept_ids, actor
+        )
+
+    async def _dominates_role(
+        self,
+        role: Role,
+        menu_ids: Sequence[int],
+        dept_ids: Sequence[int],
+        actor: AuthenticatedUser,
+    ) -> bool:
+        """Boolean form of :meth:`_require_role_dominance` for bulk pre-filtering.
+
+        Takes pre-fetched menu/dept ids (one bulk lookup for the whole batch, no
+        1+N) and returns a verdict instead of raising — so a batch quietly skips
+        roles the actor cannot manage. Super-admin dominates everything.
+        """
+        if actor.is_superuser:
+            return True
+        try:
+            self._require_assignable_code(role.code, actor)
+            await self._require_assignable_menus(menu_ids, actor)
+            await self._require_assignable_scope(
+                DataScope(role.data_scope), dept_ids, actor
+            )
+        except AppError:
+            return False
+        return True
+
     async def list_roles(
         self,
         actor: AuthenticatedUser,
@@ -216,6 +269,11 @@ class RoleService:
     ) -> RoleDetail:
         role = await self._require_visible(role_id, actor)
 
+        # Dominance: the actor must already out-rank the role's CURRENT shape
+        # before it may rewrite it (else a scoped admin could edit a role more
+        # powerful than any it could mint). Runs before the new-value guards.
+        await self._require_role_dominance(role, actor)
+
         # Privilege-escalation guards run BEFORE any mutation so a rejected edit
         # leaves no partial flush behind.
         if payload.menu_ids is not None:
@@ -266,6 +324,7 @@ class RoleService:
 
     async def delete_role(self, role_id: int, *, actor: AuthenticatedUser) -> None:
         role = await self._require_visible(role_id, actor)
+        await self._require_role_dominance(role, actor)
         # Drop all association rows (physical) — including user assignments so no
         # stale role id lingers on users — then soft-delete the role itself.
         await self.repo.replace_menus(role_id, [])
@@ -283,10 +342,37 @@ class RoleService:
     ) -> BatchResult:
         requested_ids = list(dict.fromkeys(ids))
         scope = await self._scope(actor)
-        affected, skipped_ids = await self.repo.soft_delete_many(
-            requested_ids,
+
+        # Dominance pre-filter (bulk): a scoped actor may only delete roles it
+        # could have minted itself — same guard the single delete enforces, so an
+        # outranking role (e.g. ``superadmin``) is skipped, not swept out. Loads
+        # the page's roles + menu/dept grants once each (no 1+N). Super-admin
+        # dominates everything (skip the lookups entirely).
+        dominance_skipped: list[int] = []
+        deletable_ids = requested_ids
+        if not actor.is_superuser:
+            roles = await self.repo.list_by_ids(requested_ids)
+            role_by_id = {role.id: role for role in roles}
+            menu_map = await self.repo.list_menu_ids_for_roles(requested_ids)
+            dept_map = await self.repo.list_dept_ids_for_roles(requested_ids)
+            deletable_ids = []
+            for role_id in requested_ids:
+                role = role_by_id.get(role_id)
+                if role is not None and await self._dominates_role(
+                    role,
+                    menu_map.get(role_id, []),
+                    dept_map.get(role_id, []),
+                    actor,
+                ):
+                    deletable_ids.append(role_id)
+                else:
+                    dominance_skipped.append(role_id)
+
+        affected, scope_skipped_ids = await self.repo.soft_delete_many(
+            deletable_ids,
             scope_predicate=self.repo._scope_predicate(scope, actor_id=actor.user_id),
         )
+        skipped_ids = scope_skipped_ids + dominance_skipped
         skipped = set(skipped_ids)
         for role_id in requested_ids:
             if role_id not in skipped:

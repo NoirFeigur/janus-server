@@ -112,6 +112,23 @@ class RoleRepository(BaseRepository[Role]):
             return True
         return bool(scope.include_self and role.created_by == actor_id)
 
+    async def list_by_ids(self, role_ids: Sequence[int]) -> Sequence[Role]:
+        """Live (non-deleted) role rows for a set of ids (batch dominance guard).
+
+        Returns rows in arbitrary order; the caller maps by ``id``. Missing or
+        already-deleted ids are simply absent — the caller treats them as
+        un-dominatable (skipped).
+        """
+        if not role_ids:
+            return []
+        stmt = (
+            select(Role)
+            .where(Role.id.in_(role_ids))
+            .where(Role.is_deleted.is_(False))
+        )
+        result = await self.session.scalars(stmt)
+        return list(result.all())
+
     async def list_menu_ids(self, role_id: int) -> list[int]:
         """Menu ids currently granted to the role."""
         stmt = select(RoleMenu.menu_id).where(RoleMenu.role_id == role_id)

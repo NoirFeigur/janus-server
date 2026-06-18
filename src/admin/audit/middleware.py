@@ -33,6 +33,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from src.admin.audit.repository import AuditRepository
 from src.auth.middleware import _strip_api_prefix
 from src.auth.service import AuthenticatedUser
+from src.core.client_ip import client_ip
 from src.core.logging import get_logger
 from src.db.models.audit import OperLog
 from src.db.session import async_session_factory
@@ -71,19 +72,30 @@ def classify(method: str, path: str) -> tuple[str, str, str | None]:
 
     - ``module`` from the resource segment (``users``→``user`` …); unknown
       segments fall back to the raw segment so new endpoints stay *visible*.
-    - ``action``: ``batch-delete`` segment ⇒ ``batch_delete``; else by method
-      (POST=create, PUT/PATCH=update, DELETE=delete).
-    - ``target_id``: the trailing numeric path segment for ``/{id}`` routes;
-      ``None`` for collection routes (create) and batch endpoints.
+    - ``action``:
+      - ``batch-delete`` collection segment ⇒ ``batch_delete``;
+      - a named item action ``/<resource>/<id>/<verb>`` ⇒ that verb with hyphens
+        normalized to underscores (e.g. ``reset-password`` ⇒ ``reset_password``)
+        — so a password reset is NOT mislabelled ``create`` just because it is a
+        POST;
+      - otherwise by method (POST=create, PUT/PATCH=update, DELETE=delete).
+    - ``target_id``: the numeric id segment for ``/{id}`` and ``/{id}/{verb}``
+      routes; ``None`` for collection/batch routes and sub-resource routes whose
+      trailing segment is an opaque (non-numeric) id (e.g. ``sessions/{jti}``).
     """
     segments = [s for s in path.split("/") if s]
     # segments[0] == "admin"; segments[1] == resource; segments[2:] == id/sub.
     resource = segments[1] if len(segments) > 1 else "unknown"
     module = _MODULE_BY_SEGMENT.get(resource, resource)
 
-    tail = segments[2] if len(segments) > 2 else None
-    if tail == "batch-delete":
+    sub = segments[2:]
+    if sub and sub[0] == "batch-delete":
         return module, "batch_delete", None
+
+    # Named item action: /<resource>/<numeric id>/<verb> (e.g. reset-password).
+    # The verb is authoritative — method alone would mislabel this POST a create.
+    if len(sub) >= 2 and sub[0].isdigit() and not sub[1].isdigit():
+        return module, sub[1].replace("-", "_"), sub[0]
 
     method_upper = method.upper()
     if method_upper == "POST":
@@ -93,7 +105,9 @@ def classify(method: str, path: str) -> tuple[str, str, str | None]:
     else:  # DELETE
         action = "delete"
 
-    target_id = tail if (tail is not None and tail.isdigit()) else None
+    # Trailing numeric id for /{id} routes; a non-numeric trailing segment (a
+    # sub-resource opaque id like a session jti) leaves target_id NULL.
+    target_id = sub[0] if (sub and sub[0].isdigit()) else None
     return module, action, target_id
 
 
@@ -143,8 +157,11 @@ class AdminAuditMiddleware(BaseHTTPMiddleware):
             stashed = getattr(request.state, "error_code", None)
             error_code = str(stashed) if stashed is not None else None
 
-        client = request.client
-        request_ip = client.host if client is not None else None
+        # Real caller IP, not the nginx peer: behind a reverse proxy
+        # ``request.client.host`` is the proxy address, so honour
+        # ``trusted_proxy_count`` exactly like the login log (consistent
+        # non-repudiation across both audit trails).
+        request_ip = client_ip(request)
 
         row = OperLog(
             actor_id=actor_id,

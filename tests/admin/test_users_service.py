@@ -557,3 +557,147 @@ async def test_reset_password_not_visible_raises(
     with pytest.raises(AppError) as exc:
         await svc.reset_password(target.id, "new12345", actor)
     assert exc.value.status_code == 403
+
+
+async def _seed_visible_target_with_role(
+    session: AsyncSession,
+    *,
+    dept_id: int,
+    role: Role,
+    username: str,
+    employee_no: str,
+) -> User:
+    """A user in ``dept_id`` holding ``role`` — visible to a dept-``dept_id`` actor."""
+    session.add(role)
+    await session.flush()
+    user = User(
+        username=username,
+        employee_no=employee_no,
+        department_id=dept_id,
+        password="x",
+    )
+    session.add(user)
+    await session.flush()
+    session.add(UserRole(user_id=user.id, role_id=role.id))
+    await session.commit()
+    return user
+
+
+async def test_scoped_actor_cannot_reset_password_of_superadmin_target(
+    admin_session: AsyncSession,
+) -> None:
+    """Dominance guard: VISIBLE ≠ MANAGEABLE.
+
+    A dept admin with ``system:user:resetPwd`` who can SEE a super-admin user
+    (same department) must still be refused — resetting that password would be
+    a full account takeover. The target's ``superadmin`` role makes it
+    un-dominatable even though it is in scope.
+    """
+    admin_session.add(Department(id=700, name="d700", parent_id=None))
+    await admin_session.flush()
+    su_role = Role(
+        name="su-tgt", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
+    )
+    target = await _seed_visible_target_with_role(
+        admin_session, dept_id=700, role=su_role, username="su-victim", employee_no="E-suv"
+    )
+    await _seed_dept_scoped_role(admin_session, 70, code="deptadmin70")
+    actor = _scoped_actor(70, dept=700, perms={"system:user:resetPwd"})
+    svc = UserService(admin_session)
+
+    # Target IS visible (same dept) — prove the block is dominance, not visibility.
+    assert (await svc._require_visible(target.id, actor)).id == target.id
+    with pytest.raises(AppError) as exc:
+        await svc.reset_password(target.id, "new12345", actor)
+    assert exc.value.status_code == 403
+
+
+async def test_scoped_actor_cannot_delete_higher_privileged_target(
+    admin_session: AsyncSession,
+) -> None:
+    """Dominance guard on delete: a target holding an ``all``-scope role (broader
+    visibility than the actor) is un-deletable by a dept-scoped actor."""
+    admin_session.add(Department(id=710, name="d710", parent_id=None))
+    await admin_session.flush()
+    all_role = Role(name="all710", code="all710", data_scope="all", status="active")
+    target = await _seed_visible_target_with_role(
+        admin_session, dept_id=710, role=all_role, username="powtgt", employee_no="E-pow"
+    )
+    await _seed_dept_scoped_role(admin_session, 71, code="deptadmin71")
+    actor = _scoped_actor(71, dept=710, perms={"system:user:remove"})
+    svc = UserService(admin_session)
+
+    with pytest.raises(AppError) as exc:
+        await svc.delete_user(target.id, actor)
+    assert exc.value.status_code == 403
+    # Still present (not soft-deleted) after the refused delete.
+    assert (await admin_session.get(User, target.id)).is_deleted is False
+
+
+async def test_scoped_actor_can_manage_peer_level_target(
+    admin_session: AsyncSession,
+) -> None:
+    """Dominance allows managing a target whose roles the actor COULD assign —
+    a role-less (zero-privilege) target in scope is freely manageable."""
+    admin_session.add(Department(id=720, name="d720", parent_id=None))
+    await admin_session.flush()
+    target = User(
+        username="peer", employee_no="E-peer", department_id=720, password="x"
+    )
+    admin_session.add(target)
+    await admin_session.flush()
+    await _seed_dept_scoped_role(admin_session, 72, code="deptadmin72")
+    target_id = target.id
+    await admin_session.commit()
+    actor = _scoped_actor(72, dept=720, perms={"system:user:resetPwd"})
+    svc = UserService(admin_session)
+
+    await svc.reset_password(target_id, "new12345", actor)
+    refreshed = await admin_session.get(User, target_id)
+    assert await verify_password_async(refreshed.password, "new12345")
+
+
+async def test_superuser_bypasses_dominance(admin_session: AsyncSession) -> None:
+    """A super-admin may reset even another super-admin's password (regression:
+    the dominance guard must not block the unrestricted actor)."""
+    su_role = Role(
+        name="su-b", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
+    )
+    target = await _seed_visible_target_with_role(
+        admin_session, dept_id=0, role=su_role, username="su-b-tgt", employee_no="E-sub"
+    )
+    svc = UserService(admin_session)
+    await svc.reset_password(target.id, "new12345", _superuser())
+    assert await verify_password_async(target.password, "new12345")
+
+
+async def test_batch_delete_skips_undominated_targets(
+    admin_session: AsyncSession,
+) -> None:
+    """Batch delete skips (does not sweep) targets the actor cannot dominate.
+
+    A dept admin batch-deleting [role-less peer, super-admin] removes only the
+    peer; the super-admin is reported skipped, not deleted."""
+    admin_session.add(Department(id=730, name="d730", parent_id=None))
+    await admin_session.flush()
+    su_role = Role(
+        name="su-bd", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
+    )
+    admin_session.add(su_role)
+    await admin_session.flush()
+    peer = User(username="peer-bd", employee_no="E-pbd", department_id=730, password="x")
+    su_tgt = User(username="su-bd-t", employee_no="E-sbd", department_id=730, password="x")
+    admin_session.add_all([peer, su_tgt])
+    await admin_session.flush()
+    admin_session.add(UserRole(user_id=su_tgt.id, role_id=su_role.id))
+    await _seed_dept_scoped_role(admin_session, 73, code="deptadmin73")
+    peer_id, su_id = peer.id, su_tgt.id
+    await admin_session.commit()
+    actor = _scoped_actor(73, dept=730, perms={"system:user:remove"})
+    svc = UserService(admin_session)
+
+    result = await svc.batch_delete_users([peer_id, su_id], actor)
+    assert result.affected == 1
+    assert str(su_id) in result.skipped_ids
+    assert (await admin_session.get(User, peer_id)).is_deleted is True
+    assert (await admin_session.get(User, su_id)).is_deleted is False

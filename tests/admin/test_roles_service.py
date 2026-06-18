@@ -528,3 +528,124 @@ async def test_update_role_escalation_guard_runs_before_mutation(
         assert reloaded is not None
         assert reloaded.name == "Before"
         assert reloaded.sort_order == 5
+
+
+# ---- dominance guards (manage an EXISTING role) ----------------------------
+# Visibility ≠ manageability: a scoped actor who can SEE a role more powerful
+# than itself must still be refused on update/delete (else it could delete the
+# superadmin role, or rename an all-scope role it could never have minted).
+
+
+async def test_scoped_actor_cannot_delete_superadmin_role(
+    admin_session: AsyncSession,
+) -> None:
+    """A scoped actor that can SEE the ``superadmin`` role (it created it under
+    some prior grant) still cannot delete it — dominance blocks the reserved
+    code even though visibility passes."""
+    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    su_role = Role(
+        name="su-del",
+        code=SUPERADMIN_ROLE_CODE,
+        data_scope="self",
+        status="active",
+        created_by=2000,  # visible to the actor
+        create_dept=10,  # dept-scope visibility keys off create_dept (not created_by)
+    )
+    admin_session.add(su_role)
+    await admin_session.commit()
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:remove"})
+    svc = RoleService(admin_session)
+
+    # Visible — prove the block is dominance, not visibility.
+    assert (await svc._require_visible(su_role.id, actor)).id == su_role.id
+    with pytest.raises(AppError) as exc:
+        await svc.delete_role(su_role.id, actor=actor)
+    assert exc.value.status_code == 403
+    assert (await admin_session.get(Role, su_role.id)).is_deleted is False
+
+
+async def test_scoped_actor_cannot_delete_all_scope_role(
+    admin_session: AsyncSession,
+) -> None:
+    """An ``all``-scope role is broader than a dept actor's reach → un-deletable."""
+    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    all_role = Role(
+        name="all-del",
+        code="alldel",
+        data_scope="all",
+        status="active",
+        created_by=2000,
+        create_dept=10,  # dept-scope visibility keys off create_dept
+    )
+    admin_session.add(all_role)
+    await admin_session.commit()
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:remove"})
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.delete_role(all_role.id, actor=actor)
+    assert exc.value.status_code == 403
+
+
+async def test_scoped_actor_cannot_rename_role_with_menu_beyond_perms(
+    admin_session: AsyncSession,
+) -> None:
+    """Dominance on update: even a benign rename is refused when the EXISTING
+    role grants a permission the actor lacks (it could never have minted it)."""
+    menu_id = await _seed_menu(admin_session, "system:user:delete")
+    role = Role(
+        name="Power",
+        code="powerrole",
+        data_scope="self",
+        status="active",
+        created_by=2000,
+    )
+    admin_session.add(role)
+    await admin_session.flush()
+    admin_session.add(RoleMenu(role_id=role.id, menu_id=menu_id))
+    await admin_session.commit()
+    actor = _actor(user_id=2000, permissions={"system:role:edit"})  # lacks user:delete
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.update_role(role.id, RoleUpdate(name="Renamed"), actor=actor)
+    assert exc.value.status_code == 403
+
+
+async def test_superuser_can_delete_superadmin_role(
+    admin_session: AsyncSession,
+) -> None:
+    """Regression: the dominance guard must not block an actual super-admin."""
+    su_role = Role(
+        name="su-ok", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
+    )
+    admin_session.add(su_role)
+    await admin_session.commit()
+    svc = RoleService(admin_session)
+    await svc.delete_role(su_role.id, actor=_actor())  # default actor is super-admin
+    assert (await admin_session.get(Role, su_role.id)).is_deleted is True
+
+
+async def test_batch_delete_roles_skips_undominated(
+    admin_session: AsyncSession,
+) -> None:
+    """Batch delete skips roles the actor cannot dominate (e.g. ``all``-scope),
+    deleting only the ones it could have minted."""
+    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    ok_role = Role(
+        name="ok-bd", code="okbd", data_scope="self", status="active",
+        created_by=2000, create_dept=10,
+    )
+    all_role = Role(
+        name="all-bd", code="allbd", data_scope="all", status="active",
+        created_by=2000, create_dept=10,
+    )
+    admin_session.add_all([ok_role, all_role])
+    await admin_session.commit()
+    ok_id, all_id = ok_role.id, all_role.id
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:remove"})
+    svc = RoleService(admin_session)
+
+    result = await svc.batch_delete_roles([ok_id, all_id], actor=actor)
+    assert result.affected == 1
+    assert str(all_id) in result.skipped_ids
+    assert (await admin_session.get(Role, ok_id)).is_deleted is True
+    assert (await admin_session.get(Role, all_id)).is_deleted is False

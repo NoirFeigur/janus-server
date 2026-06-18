@@ -53,6 +53,12 @@ def test_should_audit(method: str, path: str, expected: bool) -> None:
         ("PATCH", "/admin/users/7", ("user", "update", "7")),
         ("DELETE", "/admin/departments/9", ("dept", "delete", "9")),
         ("DELETE", "/admin/users/42", ("user", "delete", "42")),
+        # named item action: the verb wins over the method (a POST reset-password
+        # must NOT be mislabelled "create"); hyphens normalize to underscores.
+        ("POST", "/admin/users/42/reset-password", ("user", "reset_password", "42")),
+        # sub-resource with an opaque (non-numeric) trailing id: method-classified,
+        # target_id stays NULL (a session jti is not a numeric row id).
+        ("DELETE", "/admin/online/sessions/abc123", ("online", "delete", None)),
         # unknown resource falls back to the raw segment (stays visible, not dropped)
         ("POST", "/admin/widgets", ("widgets", "create", None)),
     ],

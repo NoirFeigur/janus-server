@@ -165,6 +165,49 @@ class UserService:
             if not granted.issubset(actor_scope.department_ids):
                 raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
+    async def _require_dominance(
+        self, target: User, actor: AuthenticatedUser
+    ) -> None:
+        """Reject acting on a target who outranks the actor (dominance guard).
+
+        Visibility (``_require_visible``) answers "may the actor SEE this user";
+        it does NOT answer "may the actor MANAGE this user". Without this guard a
+        scoped admin holding ``system:user:resetPwd/edit/remove`` could reset the
+        password of / disable / delete any *higher-privileged* user who merely
+        falls inside their data scope — e.g. a department admin resetting a
+        super-admin's password and taking the account over.
+
+        The dominance test is exactly the assignment escalation test applied to
+        the target's CURRENT roles: an actor may manage a target only if it could
+        (re)assign that target's role set itself. This reuses the same three-axis
+        guard (perm subset + ``superadmin`` marker + data-scope breadth), so a
+        target holding ``superadmin``, an ``all``-scope role, or any permission
+        the actor lacks is unmanageable. Super-admin actors and role-less targets
+        (zero conferred privilege) pass trivially.
+        """
+        if actor.is_superuser:
+            return
+        target_role_ids = await self.repo.list_role_ids(target.id)
+        await self._require_assignable_roles(target_role_ids, actor)
+
+    async def _dominates_roles(
+        self, role_ids: Sequence[int], actor: AuthenticatedUser
+    ) -> bool:
+        """Boolean form of :meth:`_require_dominance` for bulk pre-filtering.
+
+        Same three-axis test (perm subset + ``superadmin`` marker + scope breadth)
+        as the assignment guard, returning a verdict instead of raising — so a
+        batch can quietly *skip* targets the actor cannot manage rather than fail
+        the whole request. Super-admin and role-less targets dominate trivially.
+        """
+        if actor.is_superuser or not role_ids:
+            return True
+        try:
+            await self._require_assignable_roles(role_ids, actor)
+        except AppError:
+            return False
+        return True
+
     async def _require_unique_employee_no(self, employee_no: str) -> None:
         stmt = (
             select(User.id)
@@ -262,6 +305,7 @@ class UserService:
         self, user_id: int, payload: UserUpdate, actor: AuthenticatedUser
     ) -> UserDetail:
         user = await self._require_visible(user_id, actor)
+        await self._require_dominance(user, actor)
         values = payload.model_dump(
             exclude_unset=True, exclude={"role_ids", "password", "status"}
         )
@@ -329,6 +373,7 @@ class UserService:
         has landed (a rolled-back request never logs the target out).
         """
         user = await self._require_visible(user_id, actor)
+        await self._require_dominance(user, actor)
         self._require_password_strength(new_password)
         user.password = await hash_password_async(new_password)
         user.updated_by = actor.user_id
@@ -339,6 +384,7 @@ class UserService:
 
     async def delete_user(self, user_id: int, actor: AuthenticatedUser) -> None:
         user = await self._require_visible(user_id, actor)
+        await self._require_dominance(user, actor)
         await self.repo.replace_roles(user_id, [])
         user.updated_by = actor.user_id
         await self.repo.soft_delete(user)
@@ -358,10 +404,27 @@ class UserService:
     ) -> BatchResult:
         requested_ids = list(dict.fromkeys(ids))
         scope = await self._scope(actor)
-        affected, skipped_ids = await self.repo.soft_delete_many(
-            requested_ids,
+
+        # Dominance pre-filter: a scoped actor may only delete targets it could
+        # (re)assign the roles of — same guard the single-user delete enforces,
+        # applied in bulk so an outranking target is skipped, not silently swept
+        # out with the rest. Super-admin dominates everything (skip the lookup).
+        dominance_skipped: list[int] = []
+        deletable_ids = requested_ids
+        if not actor.is_superuser:
+            role_map = await self.repo.list_role_ids_for_users(requested_ids)
+            deletable_ids = []
+            for user_id in requested_ids:
+                if await self._dominates_roles(role_map.get(user_id, []), actor):
+                    deletable_ids.append(user_id)
+                else:
+                    dominance_skipped.append(user_id)
+
+        affected, scope_skipped_ids = await self.repo.soft_delete_many(
+            deletable_ids,
             scope_predicate=self.repo._scope_predicate(scope, actor_id=actor.user_id),
         )
+        skipped_ids = scope_skipped_ids + dominance_skipped
         skipped = set(skipped_ids)
         for user_id in requested_ids:
             if user_id not in skipped:

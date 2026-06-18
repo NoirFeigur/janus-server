@@ -22,6 +22,11 @@ from PIL import Image, UnidentifiedImageError
 _WEBP_QUALITY = 80
 # 头像默认最长边上限(像素)。超过则等比缩小——头像无需原图分辨率,挡超大图省存储/带宽。
 _DEFAULT_MAX_DIMENSION = 512
+# 解码前的总像素硬上限(宽×高)。字节闸挡不住「小文件声明巨大尺寸」:Pillow 对
+# 介于 MAX_IMAGE_PIXELS(~89MP)与其 2 倍之间的图只发 warning 仍照常 load(),解码
+# 即吃下数百 MB 内存。头像源图远用不到这么大(24MP 已覆盖高端手机直出),据此在
+# load() 前按 header 尺寸拒超限,把「warning 频段」也一并堵死(不依赖 Pillow 默认)。
+_MAX_PIXELS = 24_000_000
 
 
 class InvalidImageError(Exception):
@@ -58,6 +63,15 @@ def to_webp_avatar(
 
     try:
         with Image.open(io.BytesIO(raw)) as image:
+            # Header gives width/height WITHOUT decoding pixels — reject an
+            # oversized declaration here, before load() materializes it. This
+            # closes the band Pillow only *warns* on (MAX_IMAGE_PIXELS .. 2×),
+            # where load() would otherwise decode hundreds of MB into memory.
+            width, height = image.size
+            if width * height > _MAX_PIXELS:
+                raise InvalidImageError(
+                    f"image {width}x{height} exceeds pixel limit {_MAX_PIXELS}"
+                )
             image.load()  # Force full decode so a truncated/corrupt file fails here.
             # Drop alpha/palette quirks: convert to RGB so webp re-encode is uniform
             # and EXIF/ICC side-channels do not carry over.
@@ -65,9 +79,11 @@ def to_webp_avatar(
     except Image.DecompressionBombError as exc:
         # A "decompression bomb": a small file declaring enormous dimensions
         # (e.g. 100000x100000) that would blow up to gigabytes once decoded.
-        # Pillow guards this via MAX_IMAGE_PIXELS and raises here — fold it into
-        # the same opaque "not a usable image" rejection (size gate alone cannot
-        # catch it: the compressed bytes are tiny).
+        # Pillow guards this via MAX_IMAGE_PIXELS and raises here (only past the
+        # 2× hard ceiling) — fold it into the same opaque "not a usable image"
+        # rejection. The explicit _MAX_PIXELS check above catches the softer
+        # warning band Pillow does NOT raise on. (size gate alone cannot catch
+        # either: the compressed bytes are tiny.)
         raise InvalidImageError(f"decompression bomb refused: {exc}") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidImageError(f"not a decodable image: {exc}") from exc
