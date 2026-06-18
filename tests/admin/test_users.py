@@ -46,7 +46,7 @@ def _non_super_actor(*, department_id: int, perms: set[str]) -> AuthenticatedUse
 async def test_create_user_hashes_password_and_hides_it(admin_ctx: AdminCtx) -> None:
     resp = await admin_ctx.client.post(
         "/admin/users",
-        json={"username": "carol", "employee_no": "E-100", "password": "pw12345"},
+        json={"username": "carol", "employee_no": "E-100", "password": "pw123456"},
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
@@ -57,7 +57,23 @@ async def test_create_user_hashes_password_and_hides_it(admin_ctx: AdminCtx) -> 
     row = await admin_ctx.session.get(User, int(data["id"]))
     assert row is not None
     assert row.password is not None
-    assert row.password != "pw12345"
+    assert row.password != "pw123456"
+
+
+async def test_create_user_rejects_weak_password(admin_ctx: AdminCtx) -> None:
+    # Strength policy applies to admin-set passwords too (not only self-service /
+    # reset): a 7-char password fails the min-length-8 floor with a machine code.
+    resp = await admin_ctx.client.post(
+        "/admin/users",
+        json={"username": "weakling", "employee_no": "E-weak", "password": "pw12345"},
+    )
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["code"] == "auth.password_too_weak"
+    assert "too_short" in body["params"]["violations"]
+    # Nothing persisted on a rejected create.
+    assert await admin_ctx.session.get(User, 0) is None
 
 
 async def test_create_user_duplicate_username_rejected(admin_ctx: AdminCtx) -> None:

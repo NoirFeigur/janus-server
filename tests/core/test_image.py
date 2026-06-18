@@ -62,3 +62,14 @@ def test_oversized_dimensions_are_downscaled() -> None:
 
     w, h = Image.open(io.BytesIO(out.data)).size
     assert max(w, h) <= 512
+
+
+def test_decompression_bomb_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A small file declaring huge dimensions (a decompression bomb) must be
+    refused as an invalid image — the byte-size gate alone cannot catch it
+    because the compressed bytes are tiny. Lower Pillow's pixel ceiling so a
+    modest test image trips the same DecompressionBombError guard."""
+    # 64x64 = 4096 px; set the ceiling below that so .load() raises the bomb error.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1024)
+    with pytest.raises(InvalidImageError, match="bomb"):
+        to_webp_avatar(_png_bytes(size=(64, 64)), max_bytes=2 * 1024 * 1024)

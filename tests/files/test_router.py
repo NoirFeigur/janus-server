@@ -13,6 +13,7 @@ import pytest
 from PIL import Image
 from sqlalchemy import select
 
+from src.config import get_settings
 from src.db.models.attach import SysAttach
 from tests.files.conftest import AttachCtx
 
@@ -98,6 +99,28 @@ async def test_upload_requires_authentication(attach_ctx: AttachCtx) -> None:
     )
 
     assert resp.status_code == 401
+
+
+async def test_upload_rejects_oversized_body_before_buffering(
+    attach_ctx: AttachCtx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The router caps the read at the biz_type limit and rejects mid-stream —
+    an oversized attachment is refused with attach.too_large and never stored."""
+    settings = get_settings()
+    # Shrink the attachment limit to 16 bytes (the router reads the same cached
+    # settings singleton), then send 1KiB → the cap must trip before any write.
+    monkeypatch.setattr(settings, "attachment_max_bytes", 16, raising=False)
+
+    resp = await attach_ctx.client.post(
+        "/attach/upload",
+        files={"file": ("big.bin", b"x" * 1024, "application/octet-stream")},
+        data={"biz_type": "attachment"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "attach.too_large"
+    # Rejected before any storage write.
+    assert attach_ctx.storage.uploads == []
 
 
 async def _object_key(attach_ctx: AttachCtx) -> str:

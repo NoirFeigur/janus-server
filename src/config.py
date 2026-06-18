@@ -109,3 +109,58 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+class ConfigError(RuntimeError):
+    """Startup configuration is unsafe for the target environment (fail-fast)."""
+
+
+def validate_runtime(settings: Settings) -> None:
+    """Fail-fast on unsafe production config at startup (called from lifespan).
+
+    ``local`` skips every check (developer convenience: in-memory keys, wildcard
+    CORS, debug). Any non-local ``environment`` must satisfy every invariant below
+    or the process refuses to start — far better than discovering a missing JWT
+    key at first-login or a wildcard CORS hole in production. Collect ALL failures
+    and raise once so an operator fixes them in a single pass, not one reboot each.
+    """
+    if settings.environment == "local":
+        return
+
+    problems: list[str] = []
+
+    # JWT signing key: absence only surfaces at first token issuance otherwise
+    # (a login-time 500 in prod). Demand it up front.
+    if settings.platform_jwt_private_key is None:
+        problems.append(
+            "JANUS_PLATFORM_JWT_PRIVATE_KEY is required outside local "
+            "(RS256 signing key for login)"
+        )
+
+    # debug=True leaks exception detail into error envelopes (see
+    # exceptions.unhandled_exception_handler) — never in production.
+    if settings.debug:
+        problems.append("debug must be False outside local (leaks stack detail)")
+
+    # Wildcard CORS with credentials is a cross-origin credential-theft hole; an
+    # internal admin platform must pin explicit frontend origins.
+    if "*" in settings.cors_allow_origins:
+        problems.append(
+            "cors_allow_origins must not contain '*' outside local "
+            "(pin explicit frontend origins)"
+        )
+
+    # Behind nginx, request.client.host is the proxy IP; trusting 0 hops collapses
+    # every client into one bucket for per-IP login throttling. Production sits
+    # behind a reverse proxy, so the trusted hop count must be set.
+    if settings.trusted_proxy_count < 1:
+        problems.append(
+            "trusted_proxy_count must be >= 1 outside local "
+            "(replicas run behind nginx; 0 makes per-IP throttling useless)"
+        )
+
+    if problems:
+        raise ConfigError(
+            "unsafe configuration for environment="
+            f"{settings.environment!r}: " + "; ".join(problems)
+        )

@@ -136,6 +136,7 @@ class AttachService:
             original_name=original_name,
             biz_type=AttachBizType.attachment,
             actor=actor,
+            force_download=True,
         )
 
     async def _persist(
@@ -148,13 +149,15 @@ class AttachService:
         original_name: str | None,
         biz_type: AttachBizType,
         actor: AuthenticatedUser,
+        force_download: bool = False,
     ) -> tuple[SysAttach, str]:
         """对象优先持久化:上传桶 → 落行(flush)→ 现算预签名 URL。
 
         事务由请求级 Unit of Work 在边界提交;本层只 flush 让行物化。失败的提交至多在
         桶里留个孤儿对象(可按 ``sys_attach`` 元数据清理),绝不会留下指向不存在对象的
         悬空行。预签名 URL 仅按 object key 现算,不依赖行已落库,故 flush 后即可生成。
-        两条上传链路共用此收口,保证顺序与事务边界一致。
+        两条上传链路共用此收口,保证顺序与事务边界一致。``force_download`` 透传给预签名:
+        通用附件强制 ``Content-Disposition: attachment`` 防内联渲染(stored-XSS),头像不强制。
         """
         await self.storage.upload(
             object_key=object_key,
@@ -177,7 +180,7 @@ class AttachService:
         await self.repo.create(attach)
         await self.session.flush()
 
-        url = await self.storage.presign_get(object_key)
+        url = await self.storage.presign_get(object_key, force_download=force_download)
         return attach, url
 
     async def presigned_url(self, attach_id: int) -> str | None:

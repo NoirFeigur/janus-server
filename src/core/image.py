@@ -62,6 +62,13 @@ def to_webp_avatar(
             # Drop alpha/palette quirks: convert to RGB so webp re-encode is uniform
             # and EXIF/ICC side-channels do not carry over.
             rgb = image.convert("RGB")
+    except Image.DecompressionBombError as exc:
+        # A "decompression bomb": a small file declaring enormous dimensions
+        # (e.g. 100000x100000) that would blow up to gigabytes once decoded.
+        # Pillow guards this via MAX_IMAGE_PIXELS and raises here — fold it into
+        # the same opaque "not a usable image" rejection (size gate alone cannot
+        # catch it: the compressed bytes are tiny).
+        raise InvalidImageError(f"decompression bomb refused: {exc}") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidImageError(f"not a decodable image: {exc}") from exc
 

@@ -63,12 +63,12 @@ async def _seed_dept_scoped_role(
 async def test_create_user_hashes_password(admin_session: AsyncSession) -> None:
     svc = UserService(admin_session)
     user, role_ids = await svc.create_user(
-        UserCreate(username="carol", employee_no="E-100", password="pw12345"),
+        UserCreate(username="carol", employee_no="E-100", password="pw123456"),
         _superuser(),
     )
     assert user.username == "carol"
     assert user.password is not None
-    assert user.password != "pw12345"  # argon2 hash, not plaintext
+    assert user.password != "pw123456"  # argon2 hash, not plaintext
     assert role_ids == []
 
 
@@ -79,6 +79,41 @@ async def test_create_user_without_password(admin_session: AsyncSession) -> None
         UserCreate(username="sso", employee_no="E-sso"), _superuser()
     )
     assert user.password is None
+
+
+async def test_create_user_weak_password_rejected(
+    admin_session: AsyncSession,
+) -> None:
+    # Admin-set passwords obey the same strength floor as reset/self-service:
+    # "pw12345" is 7 chars → too_short, refused before any row is written.
+    svc = UserService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_user(
+            UserCreate(username="weak", employee_no="E-weak", password="pw12345"),
+            _superuser(),
+        )
+    assert exc.value.code is ErrorCode.auth_password_too_weak
+    assert exc.value.status_code == 400
+    # Nothing persisted.
+    assert (
+        await admin_session.scalar(select(User).where(User.username == "weak"))
+    ) is None
+
+
+async def test_update_user_weak_password_rejected(
+    admin_session: AsyncSession,
+) -> None:
+    svc = UserService(admin_session)
+    user, _ = await svc.create_user(
+        UserCreate(username="updtgt", employee_no="E-upd", password="old12345"),
+        _superuser(),
+    )
+    old_hash = user.password
+    with pytest.raises(AppError) as exc:
+        await svc.update_user(user.id, UserUpdate(password="weak"), _superuser())
+    assert exc.value.code is ErrorCode.auth_password_too_weak
+    # Password unchanged on a rejected update.
+    assert user.password == old_hash
 
 
 async def test_create_user_duplicate_username_rejected(

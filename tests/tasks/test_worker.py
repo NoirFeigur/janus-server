@@ -27,8 +27,12 @@ def test_worker_settings_wires_noop_and_cron() -> None:
     # noop is always registered; any registry tasks are appended after it.
     assert registry.noop in worker.WorkerSettings.functions
     assert worker.WorkerSettings.cron_jobs is schedule.cron_jobs
-    # redis_settings is sourced from config (a url string in this scaffold).
-    assert worker.WorkerSettings.redis_settings
+    # redis_settings is an arq RedisSettings parsed from the dedicated ARQ url
+    # (db 1), not the business cache url (db 0) — the two must stay isolated.
+    from arq.connections import RedisSettings
+
+    assert isinstance(worker.WorkerSettings.redis_settings, RedisSettings)
+    assert worker.WorkerSettings.redis_settings.database == 1
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,7 @@ class _FakeStorage:
     def __init__(self) -> None:
         self.uploads: list[dict[str, Any]] = []
         self.deletes: list[str] = []
+        self.presigns: list[dict[str, Any]] = []
 
     @property
     def bucket(self) -> str:
@@ -48,7 +49,8 @@ class _FakeStorage:
             {"object_key": object_key, "data": data, "content_type": content_type}
         )
 
-    async def presign_get(self, object_key: str) -> str:
+    async def presign_get(self, object_key: str, *, force_download: bool = False) -> str:
+        self.presigns.append({"object_key": object_key, "force_download": force_download})
         return f"https://signed.example/{object_key}"
 
     async def delete(self, object_key: str) -> None:
@@ -233,3 +235,29 @@ async def test_upload_attachment_sanitizes_unsafe_extension(
     assert ".." not in attach.object_key
     # The final path segment is exactly the id (unsafe suffix dropped, no extension).
     assert attach.object_key.split("/")[-1] == str(attach.id)
+
+
+async def test_attachment_presign_forces_download_but_avatar_inline(
+    session: AsyncSession,
+) -> None:
+    """Generic attachments must presign with force_download (stored-XSS guard);
+    avatars stay inline (already transcoded to safe webp for <img> rendering)."""
+    storage = _FakeStorage()
+    service = AttachService(session, storage)  # type: ignore[arg-type]
+
+    await service.upload_avatar(
+        _png_bytes(), original_name="me.png", actor=ACTOR, max_bytes=2 * 1024 * 1024
+    )
+    await service.upload_attachment(
+        b"<svg onload=alert(1)>",
+        original_name="x.svg",
+        content_type="image/svg+xml",
+        actor=ACTOR,
+        max_bytes=1024,
+    )
+
+    by_key = {p["object_key"]: p["force_download"] for p in storage.presigns}
+    avatar_keys = [k for k in by_key if k.startswith("avatar/")]
+    attach_keys = [k for k in by_key if k.startswith("attachment/")]
+    assert avatar_keys and by_key[avatar_keys[0]] is False
+    assert attach_keys and by_key[attach_keys[0]] is True

@@ -117,12 +117,23 @@ class ObjectStorage:
                 ContentType=content_type,
             )
 
-    async def presign_get(self, object_key: str) -> str:
-        """为 ``object_key`` 现算一个限时(``presign_ttl``)可读预签名 URL。"""
+    async def presign_get(
+        self, object_key: str, *, force_download: bool = False
+    ) -> str:
+        """为 ``object_key`` 现算一个限时(``presign_ttl``)可读预签名 URL。
+
+        ``force_download=True`` 时把 ``Content-Disposition: attachment`` 烤进签名
+        参数:浏览器拿到响应会强制下载而非内联渲染——挡住「用户上传的 HTML/SVG 经同源
+        预签名 URL 打开 → stored-XSS」这条链(头像不用,它已转码为安全的 webp 内联展示)。
+        签名覆盖该响应头,客户端无法篡改。
+        """
+        params: dict[str, str] = {"Bucket": self._bucket, "Key": object_key}
+        if force_download:
+            params["ResponseContentDisposition"] = "attachment"
         async with self._client() as client:
             return await client.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": self._bucket, "Key": object_key},
+                Params=params,
                 ExpiresIn=self._presign_ttl,
             )
 

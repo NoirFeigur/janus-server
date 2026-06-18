@@ -84,7 +84,7 @@ class FakeStorage:
             {"object_key": object_key, "data": data, "content_type": content_type}
         )
 
-    async def presign_get(self, object_key: str) -> str:
+    async def presign_get(self, object_key: str, *, force_download: bool = False) -> str:
         return f"https://signed.example/{object_key}"
 
     async def delete(self, object_key: str) -> None:

@@ -174,6 +174,25 @@ class UserService:
         if await self.session.scalar(stmt) is not None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
+    def _require_password_strength(self, plain: str) -> None:
+        """Reject a too-weak password with a machine-readable violation list.
+
+        Single source of strength enforcement shared by every admin set-password
+        path (create / update / reset). Without this, ``create_user`` and
+        ``update_user`` would hash whatever the admin typed — letting a holder of
+        ``system:user:add/edit`` plant a weak credential that bypasses the policy
+        ``reset_password`` and self-service change both enforce.
+        """
+        violations = password_strength_violations(
+            plain, min_length=get_settings().password_min_length
+        )
+        if violations:
+            raise AppError(
+                ErrorCode.auth_password_too_weak,
+                status.HTTP_400_BAD_REQUEST,
+                params={"violations": violations},
+            )
+
     async def _detail(self, user: User) -> UserDetail:
         return user, await self.repo.list_role_ids(user.id)
 
@@ -215,6 +234,8 @@ class UserService:
         await self._require_department_in_scope(payload.department_id, actor)
         await self._validate_roles(payload.role_ids)
         await self._require_assignable_roles(payload.role_ids, actor)
+        if payload.password is not None:
+            self._require_password_strength(payload.password)
         password_hash = (
             await hash_password_async(payload.password) if payload.password else None
         )
@@ -246,6 +267,7 @@ class UserService:
         )
         password_changed = payload.password is not None
         if payload.password is not None:
+            self._require_password_strength(payload.password)
             values["password"] = await hash_password_async(payload.password)
         if payload.status is not None:
             values["status"] = payload.status.value
@@ -307,15 +329,7 @@ class UserService:
         has landed (a rolled-back request never logs the target out).
         """
         user = await self._require_visible(user_id, actor)
-        violations = password_strength_violations(
-            new_password, min_length=get_settings().password_min_length
-        )
-        if violations:
-            raise AppError(
-                ErrorCode.auth_password_too_weak,
-                status.HTTP_400_BAD_REQUEST,
-                params={"violations": violations},
-            )
+        self._require_password_strength(new_password)
         user.password = await hash_password_async(new_password)
         user.updated_by = actor.user_id
         await self.repo.session.flush()
