@@ -148,6 +148,29 @@ class AuthRepository:
         result = await self.session.scalars(stmt)
         return frozenset(code for code in result.all() if code)
 
+    async def list_permission_codes_for_menus(
+        self, menu_ids: Sequence[int]
+    ) -> frozenset[str]:
+        """Permission codes conferred directly by a set of menus.
+
+        Used by the role-admin layer to enforce that an actor cannot craft a
+        role granting permissions the actor does not itself hold (role-edit
+        privilege-escalation guard). Same active/not-deleted + non-null-perms
+        filters as the per-user aggregation, but keyed on the menu ids directly
+        (no role/user join — the menus are the ones about to be linked).
+        """
+        if not menu_ids:
+            return frozenset()
+        stmt = (
+            select(Menu.perms)
+            .where(Menu.id.in_(menu_ids))
+            .where(Menu.is_deleted.is_(False))
+            .where(Menu.status == ActiveStatus.active.value)
+            .where(Menu.perms.is_not(None))
+        )
+        result = await self.session.scalars(stmt)
+        return frozenset(code for code in result.all() if code)
+
     async def list_active_role_codes(self, user_id: int) -> frozenset[str]:
         """Codes of the user's active, non-deleted roles (super-admin marker).
 

@@ -7,11 +7,12 @@
 - :meth:`upload_attachment` —— 通用附件:仅校验大小,原样落桶(保留原始扩展名/类型,
   不解码不转码)→ object key ``attachment/{YYYY}/{MM}/{id}{ext}``。
 
-**上传顺序**:先上传对象、再落库提交。若提交失败,桶里至多留个孤儿对象(可后续按
+**上传顺序**:先上传对象、再落库。若请求边界提交失败,桶里至多留个孤儿对象(可后续按
 ``sys_attach`` 元数据扫未引用对象清理);反过来(先落库后上传)会留下指向不存在对象的
 悬空行,体验更差。故选「对象优先」。
 
-持有事务边界(commit),凭据校验在 ``ObjectStorage`` 构造期已 fail-fast。
+事务边界由请求级 Unit of Work 持有,本层只 ``flush()``;凭据校验在 ``ObjectStorage``
+构造期已 fail-fast。
 """
 
 from __future__ import annotations
@@ -148,10 +149,12 @@ class AttachService:
         biz_type: AttachBizType,
         actor: AuthenticatedUser,
     ) -> tuple[SysAttach, str]:
-        """对象优先持久化:上传桶 → 落行 → commit → 现算预签名 URL。
+        """对象优先持久化:上传桶 → 落行(flush)→ 现算预签名 URL。
 
-        失败的 commit 至多在桶里留个孤儿对象(可按 ``sys_attach`` 元数据清理),绝不会留下
-        指向不存在对象的悬空行。两条上传链路共用此收口,保证顺序与事务边界一致。
+        事务由请求级 Unit of Work 在边界提交;本层只 flush 让行物化。失败的提交至多在
+        桶里留个孤儿对象(可按 ``sys_attach`` 元数据清理),绝不会留下指向不存在对象的
+        悬空行。预签名 URL 仅按 object key 现算,不依赖行已落库,故 flush 后即可生成。
+        两条上传链路共用此收口,保证顺序与事务边界一致。
         """
         await self.storage.upload(
             object_key=object_key,
@@ -172,7 +175,7 @@ class AttachService:
             updated_by=actor.user_id,
         )
         await self.repo.create(attach)
-        await self.session.commit()
+        await self.session.flush()
 
         url = await self.storage.presign_get(object_key)
         return attach, url

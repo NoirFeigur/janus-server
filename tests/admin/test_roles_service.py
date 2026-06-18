@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.admin.roles.schemas import RoleCreate, RoleUpdate
 from src.admin.roles.service import RoleService
@@ -51,6 +51,20 @@ async def _seed_menu(session: AsyncSession, perm: str) -> int:
     session.add(menu)
     await session.commit()
     return menu.id
+
+
+async def _seed_scoped_actor_role(
+    session: AsyncSession, user_id: int, data_scope: str = "dept"
+) -> None:
+    """Give an actor a non-super-admin role so ``resolve_data_scope`` returns a
+    bounded scope (a ``dept`` role resolves to the actor's own department)."""
+    role = Role(
+        name=f"r{user_id}", code=f"r{user_id}", data_scope=data_scope, status="active"
+    )
+    session.add(role)
+    await session.flush()
+    session.add(UserRole(user_id=user_id, role_id=role.id))
+    await session.commit()
 
 
 async def test_create_role_with_menus(admin_session: AsyncSession) -> None:
@@ -301,3 +315,186 @@ async def test_scoped_actor_only_sees_roles_in_scope(
     with pytest.raises(AppError) as exc:
         await svc.delete_role(hidden.id, actor=actor)
     assert exc.value.status_code == 403
+
+
+# ---- privilege-escalation guards (role create/update) ----------------------
+
+
+async def test_create_role_with_menu_beyond_actor_perms_rejected(
+    admin_session: AsyncSession,
+) -> None:
+    """A scoped actor cannot mint a role granting a permission it lacks."""
+    menu_id = await _seed_menu(admin_session, "system:user:delete")
+    actor = _actor(user_id=2000, permissions={"system:role:list"})
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_role(
+            RoleCreate(name="Esc", code="esc", menu_ids=[menu_id]), actor=actor
+        )
+    assert exc.value.status_code == 403
+
+
+async def test_create_role_with_subset_menu_allowed(
+    admin_session: AsyncSession,
+) -> None:
+    """An actor may grant a menu whose perm it already holds."""
+    menu_id = await _seed_menu(admin_session, "system:user:list")
+    actor = _actor(user_id=2000, permissions={"system:user:list", "system:role:add"})
+    svc = RoleService(admin_session)
+    role, menu_ids, _ = await svc.create_role(
+        RoleCreate(name="Ok", code="okrole", menu_ids=[menu_id]), actor=actor
+    )
+    assert menu_ids == [menu_id]
+
+
+async def test_superadmin_may_grant_any_menu(admin_session: AsyncSession) -> None:
+    menu_id = await _seed_menu(admin_session, "anything:goes:here")
+    svc = RoleService(admin_session)
+    # default _actor() is super-admin (perms {"*:*:*"} + superadmin role code).
+    _, menu_ids, _ = await svc.create_role(
+        RoleCreate(name="Su", code="su", menu_ids=[menu_id]), actor=_actor()
+    )
+    assert menu_ids == [menu_id]
+
+
+async def test_scoped_actor_cannot_grant_all_data_scope(
+    admin_session: AsyncSession,
+) -> None:
+    """A non-unrestricted actor cannot mint an ``all``-scope role."""
+    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:add"})
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_role(
+            RoleCreate(name="All", code="allscope", data_scope=DataScope.all_data),
+            actor=actor,
+        )
+    assert exc.value.status_code == 403
+
+
+async def test_scoped_actor_cannot_grant_custom_dept_outside_scope(
+    admin_session: AsyncSession,
+) -> None:
+    """Custom-scope dept grants must be a subset of the actor's visible depts."""
+    from src.db.models.identity import Department
+
+    admin_session.add_all(
+        [Department(id=d, name=f"d{d}", parent_id=None) for d in (10, 999)]
+    )
+    await admin_session.commit()
+    # Actor's dept role resolves scope to its own department (10) only.
+    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:add"})
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_role(
+            RoleCreate(
+                name="Out",
+                code="outdept",
+                data_scope=DataScope.custom,
+                dept_ids=[999],  # not in actor's visible scope {10}
+            ),
+            actor=actor,
+        )
+    assert exc.value.status_code == 403
+
+
+async def test_scoped_actor_may_grant_custom_dept_within_scope(
+    admin_session: AsyncSession,
+) -> None:
+    from src.db.models.identity import Department
+
+    admin_session.add(Department(id=10, name="d10", parent_id=None))
+    await admin_session.commit()
+    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:add"})
+    svc = RoleService(admin_session)
+    role, _, dept_ids = await svc.create_role(
+        RoleCreate(
+            name="In",
+            code="indept",
+            data_scope=DataScope.custom,
+            dept_ids=[10],  # within actor's visible scope {10}
+        ),
+        actor=actor,
+    )
+    assert dept_ids == [10]
+
+
+async def test_update_role_escalating_menu_rejected(
+    admin_session: AsyncSession,
+) -> None:
+    """A scoped actor cannot edit a role to add a permission it lacks."""
+    menu_id = await _seed_menu(admin_session, "system:user:delete")
+    actor = _actor(user_id=2000, permissions={"system:role:list"})
+    # The role itself is visible to the actor (created_by == actor).
+    role = Role(
+        name="Vis",
+        code="visrole",
+        data_scope="self",
+        status="active",
+        created_by=2000,
+    )
+    admin_session.add(role)
+    await admin_session.commit()
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.update_role(role.id, RoleUpdate(menu_ids=[menu_id]), actor=actor)
+    assert exc.value.status_code == 403
+
+
+async def test_update_role_escalating_scope_to_all_rejected(
+    admin_session: AsyncSession,
+) -> None:
+    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:edit"})
+    role = Role(
+        name="Vis",
+        code="visrole2",
+        data_scope="self",
+        status="active",
+        created_by=2000,
+    )
+    admin_session.add(role)
+    await admin_session.commit()
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.update_role(
+            role.id, RoleUpdate(data_scope=DataScope.all_data), actor=actor
+        )
+    assert exc.value.status_code == 403
+
+
+async def test_update_role_escalation_guard_runs_before_mutation(
+    admin_session: AsyncSession,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A rejected escalating edit must not partially apply (no scalar flush)."""
+    menu_id = await _seed_menu(admin_session, "system:user:delete")
+    actor = _actor(user_id=2000, permissions={"system:role:list"})
+    role = Role(
+        name="Before",
+        code="beforerole",
+        data_scope="self",
+        status="active",
+        sort_order=5,
+        created_by=2000,
+    )
+    admin_session.add(role)
+    await admin_session.commit()
+    svc = RoleService(admin_session)
+    with pytest.raises(AppError):
+        await svc.update_role(
+            role.id,
+            RoleUpdate(name="Renamed", sort_order=99, menu_ids=[menu_id]),
+            actor=actor,
+        )
+    # The name/sort_order change must NOT have been committed. Read back through
+    # a fresh session — the AppError-poisoned one cannot be safely re-queried.
+    async with sqlite_session_factory() as verify_session:
+        reloaded = await verify_session.scalar(
+            select(Role).where(Role.id == role.id)
+        )
+        assert reloaded is not None
+        assert reloaded.name == "Before"
+        assert reloaded.sort_order == 5

@@ -17,6 +17,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from src.auth.service import DataScopeFilter
 from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, UserRole
 from src.db.repository import BaseRepository
+from src.db.scope import data_scope_predicate
 
 
 class RoleRepository(BaseRepository[Role]):
@@ -45,17 +46,13 @@ class RoleRepository(BaseRepository[Role]):
     def _scope_predicate(
         self, scope: DataScopeFilter, *, actor_id: int
     ) -> ColumnElement[bool] | None:
-        """Build the generic management-resource data-scope predicate."""
-        if scope.unrestricted:
-            return None
-        clauses: list[ColumnElement[bool]] = []
-        if scope.department_ids:
-            clauses.append(Role.create_dept.in_(scope.department_ids))
-        if scope.include_self:
-            clauses.append(Role.created_by == actor_id)
-        if not clauses:
-            return Role.id == -1
-        return or_(*clauses)
+        """Generic management-resource data-scope predicate (audit columns).
+
+        Delegates to the shared :func:`data_scope_predicate` so every
+        audit-column-owned business domain (role / api_key / channel / grant /
+        quota) gets the identical visibility rule.
+        """
+        return data_scope_predicate(Role, scope, actor_id=actor_id)
 
     async def list_in_scope(
         self,

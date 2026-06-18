@@ -28,7 +28,7 @@ router = APIRouter(prefix="/online", tags=["admin:online"])
 
 
 def get_online_session_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
 ) -> OnlineSessionService:
     return OnlineSessionService(session, SessionStore(get_redis()))
 

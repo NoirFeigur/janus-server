@@ -25,7 +25,7 @@ router = APIRouter(prefix="/audit", tags=["admin:audit"])
 
 
 def get_audit_query_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
 ) -> AuditQueryService:
     return AuditQueryService(session)
 

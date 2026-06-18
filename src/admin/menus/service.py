@@ -9,9 +9,11 @@ from starlette import status
 
 from src.admin.menus.repository import MenuRepository
 from src.admin.menus.schemas import MenuCreate, MenuUpdate
+from src.auth import perm_cache
 from src.auth.service import AuthenticatedUser
 from src.core.query import BatchResult
 from src.db.models.identity import Menu
+from src.db.session import add_after_commit_hook
 from src.enums import ErrorCode, MenuType
 from src.exceptions import AppError
 
@@ -124,7 +126,7 @@ class MenuService:
             updated_by=actor.user_id,
         )
         await self.repo.create(menu)
-        await self.session.commit()
+        await self.session.flush()
         return menu
 
     async def update_menu(
@@ -147,7 +149,14 @@ class MenuService:
             values["status"] = payload.status.value
         values["updated_by"] = actor.user_id
         await self.repo.update(menu, **values)
-        await self.session.commit()
+        await self.session.flush()
+        # A menu's status or perms string changing alters the permission codes
+        # conferred to EVERY user whose roles link this menu. Rather than walk
+        # RoleMenu⋈UserRole to enumerate them, bump the global generation once —
+        # one INCR invalidates all perm snapshots after commit. Other field edits
+        # (path/visible/icon/...) do not affect list_permission_codes, so skip.
+        if payload.status is not None or "perms" in values:
+            add_after_commit_hook(self.session, perm_cache.invalidate_all)
         return menu
 
     async def delete_menu(self, menu_id: int, *, actor: AuthenticatedUser) -> None:
@@ -158,7 +167,7 @@ class MenuService:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
         menu.updated_by = actor.user_id
         await self.repo.soft_delete(menu)
-        await self.session.commit()
+        await self.session.flush()
 
     async def batch_delete_menus(
         self, ids: Sequence[int], *, actor: AuthenticatedUser
@@ -179,7 +188,7 @@ class MenuService:
             menu.updated_by = actor.user_id
             await self.repo.soft_delete(menu)
             affected += 1
-        await self.session.commit()
+        await self.session.flush()
         return BatchResult.of(
             requested=len(requested_ids), affected=affected, skipped=skipped_ids
         )

@@ -21,6 +21,7 @@ from src.auth.service import AuthenticatedUser
 from src.core.query import ListQuery
 from src.core.security import verify_password_async
 from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
+from src.db.session import commit_session
 from src.enums import ErrorCode, UserStatus
 from src.exceptions import AppError
 
@@ -362,6 +363,11 @@ async def test_reset_password_revokes_target_sessions(
     assert current.user_id == target.id
 
     await svc.reset_password(target.id, "new12345", _superuser())
+
+    # Session revocation is an after-commit hook now (it fires only once the
+    # password write lands), so emulate the request edge: commit the unit of
+    # work, which runs the queued revocation hook.
+    await commit_session(admin_session)
 
     # The pre-reset access token's session is revoked → resolve fails.
     with pytest.raises(AppError) as exc:

@@ -20,6 +20,7 @@ from src.core.snowflake import next_id
 from src.db.models.attach import SysAttach
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Role, RoleDept, UserRole
+from src.db.session import commit_session
 from src.enums import AttachBizType, DataScope, ErrorCode
 from src.exceptions import AppError
 from tests.auth.conftest import grant_permission, seed_user
@@ -732,6 +733,10 @@ async def test_department_mutation_invalidates_scope_cache(
             role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
         ),
     )
+    # The cache-invalidation side effect is an after-commit hook now (it fires
+    # only once the write lands), so emulate the request edge: commit the unit
+    # of work, which runs the queued hooks.
+    await commit_session(auth_session)
 
     # Cache was invalidated on commit → dept 2 no longer in dept 1's subtree.
     after = await service.resolve_data_scope(current_user)
@@ -950,6 +955,10 @@ async def test_change_password_revokes_all_sessions(
     await service.change_current_password(
         current, old_password="old-secret1", new_password="new-secret2"
     )
+    # Session revocation is an after-commit hook now (it fires only once the
+    # password write lands), so emulate the request edge: commit the unit of
+    # work, which runs the queued revocation hook.
+    await commit_session(auth_session)
     # 改密后旧 access token 的会话已被吊销 → 解析报 token_revoked
     with pytest.raises(AppError) as exc:
         await service.resolve_access_token(token)

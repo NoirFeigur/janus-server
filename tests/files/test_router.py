@@ -2,7 +2,7 @@
 
 Proves the upload contract end-to-end against a fake storage: avatar uploads are
 transcoded to webp, generic attachments are stored as-is, the endpoint is
-auth-gated, and image errors surface as the uniform problem+json envelope.
+auth-gated, and image errors surface as the uniform error envelope.
 """
 
 from __future__ import annotations

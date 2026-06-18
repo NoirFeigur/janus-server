@@ -31,7 +31,7 @@ router = APIRouter(prefix="/users", tags=["admin:users"])
 
 
 def get_user_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
 ) -> UserService:
     return UserService(session)
 

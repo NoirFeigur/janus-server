@@ -62,6 +62,11 @@ class AsyncRedisDouble:
             return None
         return self._data.get(key)
 
+    async def mget(self, *keys: str) -> list[str | None]:
+        # Batched get: one value per key in order, ``None`` for missing/expired
+        # (matching the production client used by perm_cache's generation read).
+        return [await self.get(key) for key in keys]
+
     async def set(self, key: str, value: str, ex: int | None = None) -> bool:
         self._data[key] = value
         if ex is not None:

@@ -19,12 +19,16 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from starlette import status
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.config import get_settings
+from src.core.logging import get_logger
 from src.enums import ErrorCode
 from src.responses import error_body
+
+_log = get_logger(__name__)
 
 # HTTP 状态码 → ErrorCode 映射(框架 HTTP 异常用,无精确匹配时回落)。
 _STATUS_TO_CODE: dict[int, ErrorCode] = {
@@ -115,6 +119,28 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
     return error_envelope(request, code=code, status_code=exc.status_code)
 
 
+async def integrity_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """DB 完整性约束冲突 → 稳定 409,而非裸 500。
+
+    并发下「先查重再写入」的非原子模式会让唯一/外键约束在 flush/commit 时抛
+    ``IntegrityError``;若不接管,它会冒到兜底处理器成 500(把一个客户端可纠正的
+    冲突误报成服务端故障)。统一映射为 ``request.conflict`` / 409,前端按 code 提示
+    「已存在/冲突」。不解析底层 DBAPI 文案(各驱动不一、可能含表/列名,不外泄)——
+    只发稳定 code,具体哪个约束由后端日志(含 trace_id)排查。
+    """
+    assert isinstance(exc, IntegrityError)
+    _log.warning(
+        "db.integrity_error",
+        trace_id=getattr(request.state, "trace_id", None),
+        orig=str(getattr(exc, "orig", exc)),
+    )
+    return error_envelope(
+        request,
+        code=ErrorCode.request_conflict,
+        status_code=status.HTTP_409_CONFLICT,
+    )
+
+
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """兜底:任何未捕获异常 → 500 信封。绝不泄漏堆栈(仅 debug 附 detail 供排查)。"""
     params: dict[str, Any] = {}
@@ -132,4 +158,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(AppError, app_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    # IntegrityError before the Exception catch-all: a constraint violation is a
+    # client-correctable 409, not a server 500.
+    app.add_exception_handler(IntegrityError, integrity_error_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)

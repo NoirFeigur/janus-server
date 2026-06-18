@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"  # 业务缓存 / 实时配额计数（db 0）
     redis_arq_url: str = "redis://localhost:6379/1"  # ARQ 任务队列（db 1，与业务缓存隔离）
 
+    # Snowflake worker-id 租约(data-model §0.2)。多副本部署时每个副本必须持有唯一的
+    # 10-bit worker-id(0..1023),否则主键会跨副本撞车。启动时从 Redis 原子租约一个空闲
+    # id,后台心跳续租;拿不到则 fail-fast(生产),local 环境回落 0(单进程开发)。
+    # TTL 须 > 心跳间隔(心跳 = TTL/3),副本崩溃后 TTL 到期自动释放该 id 供复用。
+    snowflake_worker_id_ttl_seconds: int = 30  # worker-id 租约 TTL(秒);崩溃后此时长内自动回收
+
     # 平台自签 JWT(本地账密登录换发)。RS256:签发权(私钥,.env 密钥)与热路径
     # 验签(公钥)分离——副本只需公钥即可验签,不必持有签发密钥(对齐'无状态副本,
     # 公钥验签'的横向扩前提)。算法在 core/security.py 硬锁,不走配置。
@@ -43,6 +49,12 @@ class Settings(BaseSettings):
     platform_jwt_public_key: str | None = None  # 缺省时启动期从私钥推导
     platform_access_token_ttl_seconds: int = 7200  # access token 有效期(2h)
     platform_refresh_token_ttl_seconds: int = 1_209_600  # refresh token 有效期(14d)
+
+    # 鉴权热路径权限缓存(每请求的 RBAC 聚合提速,见 auth/perm_cache.py)。正确性靠
+    # 「分层 generation 版本化 key + commit 后失效」保证,与 TTL 无关;此 TTL 仅为兜底:
+    # 万一某次失效 INCR 静默失败(Redis 写抖动),陈旧权限至多存活这一窗口后随快照过期自愈。
+    # 取值短(60s)以收窄该极端窗口——权限是安全敏感数据,宁可短 TTL 多查库也不留长陈旧窗。
+    permission_cache_ttl_seconds: int = 60  # 权限快照 TTL(秒);失效机制之外的兜底窗口
 
     # 登录防爆破(B6,纯 Redis 计数,无新表)。按「用户名」累计失败,达阈值即锁定一段时间;
     # 锁定期内即便密码正确也拒绝(发 auth.account_locked),登录成功则清零计数。另设「按 IP」
@@ -52,6 +64,12 @@ class Settings(BaseSettings):
     login_failure_window_seconds: int = 900  # 失败计数滑窗(15min);窗口内无新失败则计数自然过期
     login_ip_max_failures: int = 50  # 单 IP 滑窗内失败上限(粗粒度限流,防跨用户名枚举)
     login_ip_window_seconds: int = 300  # 单 IP 失败计数滑窗(5min)
+
+    # 反代信任跳数。副本部署在 nginx 后面,request.client.host 拿到的是代理 IP——直接拿它
+    # 做按-IP 限流会把所有人归一桶。此值 = 我方可信代理层数(nginx=1),按 X-Forwarded-For
+    # 从右往左数第 N 跳取真实客户端 IP。默认 0(不信任 XFF,直连场景);**生产置 1**。
+    # 仅取信任跳数内的条目,杜绝客户端伪造 XFF 头绕过限流(伪造的条目落在信任边界左侧被丢弃)。
+    trusted_proxy_count: int = 0  # 我方可信反代层数;0=不信任 X-Forwarded-For
 
     # 自助改密强度策略(B7)。规模 2000 内部员工,口径取「长度 + 字符多样性」的务实下限
     # (NIST 不强推复杂度规则,但内部基线要求至少含字母与数字,挡纯数字/纯字母弱口令)。
@@ -74,6 +92,13 @@ class Settings(BaseSettings):
     avatar_max_bytes: int = 2 * 1024 * 1024  # 头像原图大小上限(2MB);超限拒绝
     # 通用附件上传约束。后端代理上传 → 仅校验大小,原样落桶(保留原始扩展名/类型,不转码)。
     attachment_max_bytes: int = 10 * 1024 * 1024  # 通用附件大小上限(10MB);超限拒绝
+
+    # 上游厂商 key 的可逆加密密钥(channel_key.api_key_encrypted 用)。Fernet 对称密钥,
+    # 32 字节 url-safe base64(`Fernet.generate_key()` 生成)。是密钥 → 走 .env;缺省为 None,
+    # 此时加解密 accessor 在被调用时 fail-fast(网关装配 Router 解密上游 key 时才需要,
+    # auth/admin 纯管理面不触发)。轮换:支持以逗号分隔多 key,第一个用于加密,其余仅解密
+    # (滚动轮换:先加新 key 到队首重新加密,再下线旧 key)。
+    channel_encryption_keys: SecretStr | None = None  # Fernet key(s),逗号分隔;队首加密
 
     cors_allow_origins: list[str] = Field(default_factory=list)
 

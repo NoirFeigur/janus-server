@@ -28,7 +28,7 @@ router = APIRouter(prefix="/departments", tags=["admin:departments"])
 
 
 def get_department_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
 ) -> DepartmentService:
     return DepartmentService(session)
 

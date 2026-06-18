@@ -22,7 +22,7 @@ from src.exceptions import AppError
 
 
 def get_auth_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
 ) -> AuthService:
     """Construct an :class:`AuthService` bound to the request session."""
     return AuthService(session)

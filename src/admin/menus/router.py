@@ -20,7 +20,7 @@ router = APIRouter(prefix="/menus", tags=["admin:menus"])
 
 
 def get_menu_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
 ) -> MenuService:
     return MenuService(session)
 

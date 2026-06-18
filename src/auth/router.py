@@ -27,6 +27,7 @@ from src.auth.schemas import (
     TokenRead,
 )
 from src.auth.service import AuthenticatedUser, AuthService
+from src.core.client_ip import client_ip
 from src.core.oss import OptionalObjectStorageDep
 from src.responses import SuccessEnvelope, success
 
@@ -59,11 +60,10 @@ async def login(
     trace_id: TraceId,
 ) -> SuccessEnvelope[TokenRead]:
     """Authenticate by username/password and issue a platform access token."""
-    client = request.client
     token, ttl, refresh_token = await service.authenticate_password(
         payload.username,
         payload.password,
-        request_ip=client.host if client is not None else None,
+        request_ip=client_ip(request),
         user_agent=request.headers.get("user-agent"),
         trace_id=trace_id,
     )
@@ -105,10 +105,9 @@ async def refresh(
     is consumed and rotated; an unknown/expired/already-rotated refresh fails
     with ``auth_refresh_invalid`` (reuse additionally revokes the whole session).
     """
-    client = request.client
     token, ttl, refresh_token = await service.refresh_session(
         payload.refresh_token,
-        request_ip=client.host if client is not None else None,
+        request_ip=client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
     return success(

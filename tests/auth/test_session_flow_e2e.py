@@ -29,7 +29,7 @@ from src.db.base import Base
 from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
-from src.db.session import get_session
+from src.db.session import get_session, unit_of_work
 from src.main import create_app
 
 pytestmark = pytest.mark.asyncio
@@ -76,7 +76,12 @@ async def client(
     app.state.session_factory = sqlite_session_factory
 
     async def _override_session() -> AsyncIterator[AsyncSession]:
-        async with sqlite_session_factory() as session:
+        # Mirror the production request edge: a request is one unit of work that
+        # commits on clean exit (firing after-commit hooks like session
+        # revocation) and rolls back on error. Without this the route handlers
+        # only flush and the revocation hook never fires, so a post-password-
+        # change request would still see a live session.
+        async with unit_of_work(sqlite_session_factory) as session:
             yield session
 
     app.dependency_overrides[get_session] = _override_session

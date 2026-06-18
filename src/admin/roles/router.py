@@ -25,7 +25,7 @@ router = APIRouter(prefix="/roles", tags=["admin:roles"])
 
 
 def get_role_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
 ) -> RoleService:
     return RoleService(session)
 

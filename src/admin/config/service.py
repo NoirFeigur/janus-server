@@ -1,6 +1,6 @@
 """Platform config business logic (service layer).
 
-Owns the transaction boundary (commits) and enforces the rules the DB does not:
+Enforces the rules the DB does not:
 
 - ``config_key`` is globally unique among non-deleted rows (create rejects a
   duplicate; the DB unique index is the hard backstop, this is the friendly 400).
@@ -8,8 +8,12 @@ Owns the transaction boundary (commits) and enforces the rules the DB does not:
   ``"abc"``); validated before persist via :func:`parse_config_value`.
 - Builtin rows (``is_builtin = true``) may be updated but never deleted.
 
-Every successful mutation invalidates the runtime cache for that key so other
-replicas pick up the change within the short TTL window.
+The transaction is owned by the request-level Unit of Work, not here: this layer
+only ``flush()``es. Every successful mutation must invalidate the runtime cache
+for that key so other replicas pick up the change within the short TTL window —
+that invalidation is registered as an **after-commit hook** so it fires only
+once the write actually lands (a rolled-back request leaves the cache untouched,
+never publishing a phantom change).
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from src.core.config_accessor import invalidate_config, parse_config_value
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.sys_config import SysConfig
+from src.db.session import add_after_commit_hook
 from src.enums import ConfigValueType, ErrorCode
 from src.exceptions import AppError
 
@@ -95,8 +100,9 @@ class SysConfigService:
             updated_by=actor.user_id,
         )
         await self.repo.create(config)
-        await self.session.commit()
-        await invalidate_config(config.config_key)
+        await self.session.flush()
+        key = config.config_key
+        add_after_commit_hook(self.session, lambda: invalidate_config(key))
         return config
 
     async def update_config(
@@ -112,13 +118,16 @@ class SysConfigService:
             self._validate_value(new_value, new_type)
         values["updated_by"] = actor.user_id
         await self.repo.update(config, **values)
-        await self.session.commit()
         # ``updated_at`` is server-computed via onupdate=func.now(); the UPDATE
-        # flush expires it (the ORM has no value), so refresh before the caller
-        # serializes the row — otherwise a lazy load fires async IO in a sync
-        # context (pydantic model_validate) and raises MissingGreenlet.
+        # flush expires it (the ORM has no value), so refresh (an in-transaction
+        # read) before the caller serializes the row — otherwise a lazy load
+        # fires async IO in a sync context (pydantic model_validate) and raises
+        # MissingGreenlet. Refresh happens pre-commit now (commit moved to the
+        # request UoW edge); the row is already flushed so the read sees it.
+        await self.session.flush()
         await self.session.refresh(config)
-        await invalidate_config(config.config_key)
+        key = config.config_key
+        add_after_commit_hook(self.session, lambda: invalidate_config(key))
         return config
 
     async def delete_config(self, config_id: int, *, actor: AuthenticatedUser) -> None:
@@ -127,5 +136,5 @@ class SysConfigService:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
         config.updated_by = actor.user_id
         await self.repo.soft_delete(config)
-        await self.session.commit()
-        await invalidate_config(config.config_key)
+        key = config.config_key
+        add_after_commit_hook(self.session, lambda: invalidate_config(key))

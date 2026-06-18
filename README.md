@@ -100,7 +100,7 @@ janus-server/
 │   ├── main.py                   # FastAPI app factory + lifespan（挂载各域 router + MCP session_manager）
 │   ├── config.py                 # pydantic-settings（行为配置走 config / settings，密钥走 .env）
 │   ├── enums.py                  # 全局 StrEnum 集中（ActiveStatus/UsageStatus/ErrorCode… 成员强制行内注释）
-│   ├── exceptions.py             # 全局异常 + RFC 9457 problem+json handler
+│   ├── exceptions.py             # 全局异常 + 统一错误信封 handler（方案 B：与成功响应同构的扁平信封，纯 code+params，见 responses.py）
 │   │
 │   ├── db/                       # 持久层（ORM 集中 + 基础仓储）
 │   │   ├── __init__.py
@@ -251,7 +251,7 @@ janus-server/
 
 - **枚举集中在 `src/enums.py`**，用 `StrEnum`；**每个成员强制行内注释**说明业务语义（给后端开发者，非面向用户 label）。
 - **后端 locale-agnostic 只发 code**，前端 i18n 拥有展示文本。**不建字典表、不出 `/system/dict` 接口**。
-- **业务错误走 RFC 9457 `problem+json`**：后端发 `code`（`ErrorCode` 枚举值）+ 结构化 `params`，前端按 code 查 i18n 文案并插值。后端永不拼中文错误文案。
+- **业务错误走统一错误信封**（方案 B，与成功响应同构的扁平结构）：后端发 `code`（`ErrorCode` 枚举值）+ 结构化 `params`，前端按 code 查 i18n 文案并插值。后端永不拼中文错误文案。沿用 RFC 9457 的机器可读 `code`+`params` 理念，但不采用 `application/problem+json` media type（保持成功/错误信封同构，前端 discriminated union 收窄干净，见 [`responses.py`](src/responses.py)）。
 - 例外：Pydantic 422 校验错误、后端外发消息（邮件/IM）由后端按 `preferred_locale` 渲染本地化正文。
 
 ### 配置与密钥
@@ -295,7 +295,7 @@ janus-server/
 | 层 | 测什么 | 怎么测 |
 |---|---|---|
 | service | 业务逻辑分支、边界、异常 | 纯单测，注入 fake session/redis |
-| router | 鉴权门禁、参数校验、状态码、problem+json 格式 | `AsyncClient` 打 ASGI app |
+| router | 鉴权门禁、参数校验、状态码、统一错误信封格式 | `AsyncClient` 打 ASGI app |
 | 关键路径 | 鉴权 / 配额扣减 / 协议路由 / 协议降级 | 集成测试跑真实代码路径，只 mock 最外层上游 |
 | 迁移 | Alembic upgrade/downgrade 可逆 | 临时库跑 head↔base |
 

@@ -1,9 +1,15 @@
 """Admin department business logic (service layer).
 
-Owns the transaction boundary (commits) and enforces the referential rules the
-DB does not (no physical FKs, §0.7): a referenced ``parent_id`` must exist, a
-department cannot become its own ancestor (cycle guard), and a department with
-active children or members cannot be deleted.
+Enforces the referential rules the DB does not (no physical FKs, §0.7): a
+referenced ``parent_id`` must exist, a department cannot become its own ancestor
+(cycle guard), and a department with active children or members cannot be
+deleted.
+
+The transaction is owned by the request-level Unit of Work, not here: this layer
+only ``flush()``es. Every successful mutation must invalidate the cross-replica
+department-tree cache; that invalidation is registered as an **after-commit
+hook** so it fires only once the write lands (a rolled-back request leaves the
+cache untouched).
 
 All "bad request" conditions raise ``AppError(request_invalid, 400)``; a missing
 target raises the same (opaque, locale-agnostic code — the frontend renders text).
@@ -22,6 +28,7 @@ from src.auth.dept_tree_cache import invalidate_department_tree
 from src.auth.service import AuthenticatedUser
 from src.core.query import BatchResult
 from src.db.models.identity import Department
+from src.db.session import add_after_commit_hook
 from src.enums import ErrorCode
 from src.exceptions import AppError
 
@@ -84,8 +91,8 @@ class DepartmentService:
             updated_by=actor.user_id,
         )
         await self.repo.create(dept)
-        await self.session.commit()
-        await invalidate_department_tree()
+        await self.session.flush()
+        add_after_commit_hook(self.session, invalidate_department_tree)
         return dept
 
     async def update_department(
@@ -97,8 +104,8 @@ class DepartmentService:
             await self._validate_reparent(dept_id, values["parent_id"])
         values["updated_by"] = actor.user_id
         await self.repo.update(dept, **values)
-        await self.session.commit()
-        await invalidate_department_tree()
+        await self.session.flush()
+        add_after_commit_hook(self.session, invalidate_department_tree)
         return dept
 
     async def delete_department(self, dept_id: int, *, actor: AuthenticatedUser) -> None:
@@ -109,8 +116,8 @@ class DepartmentService:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
         dept.updated_by = actor.user_id
         await self.repo.soft_delete(dept)
-        await self.session.commit()
-        await invalidate_department_tree()
+        await self.session.flush()
+        add_after_commit_hook(self.session, invalidate_department_tree)
 
     async def batch_delete_departments(
         self, ids: Sequence[int], *, actor: AuthenticatedUser
@@ -135,9 +142,9 @@ class DepartmentService:
             await self.repo.soft_delete(dept)
             affected += 1
 
-        await self.session.commit()
+        await self.session.flush()
         if affected > 0:
-            await invalidate_department_tree()
+            add_after_commit_hook(self.session, invalidate_department_tree)
         return BatchResult.of(
             requested=len(requested_ids), affected=affected, skipped=skipped_ids
         )

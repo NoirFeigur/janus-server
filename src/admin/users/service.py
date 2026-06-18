@@ -1,11 +1,16 @@
 """Admin user business logic (service layer).
 
-Owns the transaction (commits), hashes passwords (argon2), enforces FK-less
-integrity (unique username, referenced dept/roles exist), and — the piece the
-Oracle ruling pinned to the user surface — applies the actor's resolved
-**data scope** on both listing and every single-user mutation. An actor who
-cannot see a target user gets the same opaque 403 as a permission failure;
-there is no "exists but hidden" oracle.
+Hashes passwords (argon2), enforces FK-less integrity (unique username,
+referenced dept/roles exist), and — the piece the Oracle ruling pinned to the
+user surface — applies the actor's resolved **data scope** on both listing and
+every single-user mutation. An actor who cannot see a target user gets the same
+opaque 403 as a permission failure; there is no "exists but hidden" oracle.
+
+The transaction is owned by the request-level Unit of Work, not here: this
+layer only ``flush()``es, and the single commit happens at the request edge
+(:func:`src.db.session.get_session`). Side effects that must run only after the
+commit lands — revoking a target's sessions when their password changes —
+register as after-commit hooks so a rolled-back request never logs anyone out.
 
 Role assignment is a set replace via ``UserRole``. ``password`` is hashed on the
 way in and never read back out (§0.8).
@@ -14,6 +19,7 @@ way in and never read back out (§0.8).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import partial
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,12 +27,14 @@ from starlette import status
 
 from src.admin.users.repository import UserRepository
 from src.admin.users.schemas import UserCreate, UserUpdate
+from src.auth import perm_cache
 from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.config import get_settings
 from src.core.pagination import PageResult, page_result
 from src.core.query import BatchResult, ListQuery, resolve_sort
 from src.core.security import hash_password_async, password_strength_violations
 from src.db.models.identity import Department, Role, User
+from src.db.session import add_after_commit_hook
 from src.enums import ErrorCode
 from src.exceptions import AppError
 
@@ -183,7 +191,6 @@ class UserService:
         )
         await self.repo.create(user)
         await self.repo.replace_roles(user.id, payload.role_ids)
-        await self.session.commit()
         return await self._detail(user)
 
     async def update_user(
@@ -193,6 +200,7 @@ class UserService:
         values = payload.model_dump(
             exclude_unset=True, exclude={"role_ids", "password", "status"}
         )
+        password_changed = payload.password is not None
         if payload.password is not None:
             values["password"] = await hash_password_async(payload.password)
         if payload.status is not None:
@@ -208,7 +216,25 @@ class UserService:
             await self._require_assignable_roles(payload.role_ids, actor)
             await self.repo.replace_roles(user_id, payload.role_ids)
 
-        await self.session.commit()
+        # A role-binding or status change alters this user's cached permission
+        # snapshot, so drop it after the write commits (a rolled-back update must
+        # not invalidate). Status matters because a re-enabled user could
+        # otherwise be served a snapshot cached before a concurrent role change;
+        # invalidating keeps the cache strictly consistent with the DB.
+        if payload.role_ids is not None or payload.status is not None:
+            add_after_commit_hook(
+                self.session, lambda: perm_cache.invalidate_user(user_id)
+            )
+
+        # A password change here must force re-login everywhere, exactly like
+        # reset_password — otherwise an admin-set password through this endpoint
+        # would silently leave the target's old sessions alive (B7). Fires only
+        # after the write commits (after-commit hook), so a rolled-back update
+        # never logs the target out.
+        if password_changed:
+            add_after_commit_hook(
+                self.session, lambda: self.auth.sessions.revoke_all_sessions(user_id)
+            )
         return await self._detail(user)
 
     async def reset_password(
@@ -221,7 +247,9 @@ class UserService:
         admin acting on the target's behalf. Strength is enforced server-side
         (``auth_password_too_weak`` / 400 with machine-readable violation labels).
         On success **all** of the target's sessions are revoked (B7), so any
-        session standing on the old credential dies immediately.
+        session standing on the old credential dies immediately. The revoke
+        fires as an after-commit hook so it only runs once the password write
+        has landed (a rolled-back request never logs the target out).
         """
         user = await self._require_visible(user_id, actor)
         violations = password_strength_violations(
@@ -236,15 +264,18 @@ class UserService:
         user.password = await hash_password_async(new_password)
         user.updated_by = actor.user_id
         await self.repo.session.flush()
-        await self.session.commit()
-        await self.auth.sessions.revoke_all_sessions(user_id)
+        add_after_commit_hook(
+            self.session, lambda: self.auth.sessions.revoke_all_sessions(user_id)
+        )
 
     async def delete_user(self, user_id: int, actor: AuthenticatedUser) -> None:
         user = await self._require_visible(user_id, actor)
         await self.repo.replace_roles(user_id, [])
         user.updated_by = actor.user_id
         await self.repo.soft_delete(user)
-        await self.session.commit()
+        add_after_commit_hook(
+            self.session, lambda: perm_cache.invalidate_user(user_id)
+        )
 
     async def batch_delete_users(
         self, ids: Sequence[int], actor: AuthenticatedUser
@@ -259,7 +290,11 @@ class UserService:
         for user_id in requested_ids:
             if user_id not in skipped:
                 await self.repo.replace_roles(user_id, [])
-        await self.session.commit()
+                # partial binds each id by value (a bare lambda would late-bind
+                # the loop variable to its final value in every hook).
+                add_after_commit_hook(
+                    self.session, partial(perm_cache.invalidate_user, user_id)
+                )
         return BatchResult.of(
             requested=len(requested_ids), affected=affected, skipped=skipped_ids
         )

@@ -25,7 +25,7 @@ router = APIRouter(prefix="/config", tags=["admin:config"])
 
 
 def get_config_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
 ) -> SysConfigService:
     return SysConfigService(session)
 

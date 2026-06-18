@@ -14,6 +14,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.enums import ErrorCode
@@ -49,6 +50,16 @@ def _build_app() -> FastAPI:
     @app.get("/crash")
     async def crash() -> None:
         raise RuntimeError("super secret internal detail leak")
+
+    @app.get("/dup")
+    async def dup() -> None:
+        # Simulate a DB uniqueness/FK violation surfacing from flush/commit. The
+        # orig carries a driver message that must NOT leak into the response.
+        raise IntegrityError(
+            statement="INSERT INTO sys_user ...",
+            params={},
+            orig=Exception("duplicate key value violates unique constraint uq_x"),
+        )
 
     return app
 
@@ -118,6 +129,23 @@ def test_unhandled_exception_returns_500_without_stack_leak() -> None:
     assert "super secret internal detail leak" not in serialized
     assert "Traceback" not in serialized
     assert body["params"] == {}
+
+
+def test_integrity_error_maps_to_409_conflict_without_db_leak() -> None:
+    """A DB constraint violation surfaces as a clean 409 request.conflict, and
+    the raw driver message (table/column names) never leaks into the response."""
+    client = TestClient(_build_app(), raise_server_exceptions=False)
+    resp = client.get("/dup")
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["success"] is False
+    assert body["code"] == ErrorCode.request_conflict.value
+    assert "trace_id" in body
+    # 不外泄底层 DBAPI 文案(约束名/表名/列名)。
+    serialized = resp.text
+    assert "unique constraint" not in serialized
+    assert "uq_x" not in serialized
+    assert "sys_user" not in serialized
 
 
 def _request_with_trace(trace_id: str = "trace-direct") -> Request:

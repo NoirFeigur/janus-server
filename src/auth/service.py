@@ -24,11 +24,11 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette import status
 
 from src.admin.audit.repository import AuditRepository
-from src.auth import dept_tree_cache
+from src.auth import dept_tree_cache, perm_cache
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.credentials import CredentialKind
 from src.auth.dept_tree_cache import DeptPair, invalidate_department_tree
@@ -52,6 +52,10 @@ from src.core.security import (
 from src.core.session_store import RefreshOutcome, SessionStore
 from src.db.models.audit import LoginLog
 from src.db.models.identity import Role
+from src.db.session import (
+    add_after_commit_hook,
+    unit_of_work,
+)
 from src.enums import AuditOutcome, DataScope, ErrorCode, LoginFailureReason
 from src.exceptions import AppError
 
@@ -67,9 +71,11 @@ __all__ = [
 class AuthenticatedUser:
     """Resolved user for one request (from a JWT or an sk-key).
 
-    Frozen value object: permissions are snapshotted at resolution time (per
-    request, straight from DB — never cached in the token), so a role change
-    takes effect on the very next request.
+    Frozen value object: permissions are snapshotted at resolution time. The
+    snapshot is served from a race-free per-user cache (see :mod:`perm_cache`)
+    that is invalidated by an after-commit hook on every role/menu/user-role
+    mutation, so a permission change takes effect on the very next request once
+    the mutation commits — never carried inside the token.
     """
 
     user_id: int
@@ -151,9 +157,25 @@ def _collect_subtree(root_ids: Iterable[int], dept_pairs: Sequence[DeptPair]) ->
 class AuthService:
     """Authentication + authorization use cases for the auth domain."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        audit_session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
         self.repo = AuthRepository(session)
         self.sessions = SessionStore(get_redis())
+        # Login-attempt audit rows are written in their OWN unit of work so a
+        # *failure* row survives the AppError that follows it — the request's own
+        # session is rolled back on that error, which would otherwise erase the
+        # audit trail. When not explicitly injected the factory is derived lazily
+        # (see :meth:`_audit_factory`) from the SAME engine as the request
+        # session: production lands in PG, tests land in the ephemeral SQLite —
+        # no per-call-site wiring, and never a cross-environment leak to the real
+        # PG from a test. Derivation is deferred so merely *constructing* the
+        # service never touches ``session.bind`` (a bare stub session is fine for
+        # the non-login code paths that don't audit).
+        self._injected_audit_factory = audit_session_factory
         settings = get_settings()
         self.throttle = LoginThrottle(
             get_redis(),
@@ -273,12 +295,15 @@ class AuthService:
         user_agent: str | None,
         trace_id: str | None,
     ) -> None:
-        """Append one login-attempt audit row and commit it.
+        """Append one login-attempt audit row in its OWN unit of work.
 
-        Committed here (not left to the caller) so a *failure* row survives the
-        ``AppError`` that follows it. Uses the auth domain's session via the
-        append-only :class:`AuditRepository` (cross-cutting audit infra, not a
-        cross-domain service dependency).
+        Written through an independent session (not the request's) so a *failure*
+        row survives the ``AppError`` that follows it: the request session is
+        rolled back on that error under the request-level Unit of Work, which
+        would otherwise erase the audit trail. The factory is injected so tests
+        bind it to the ephemeral test DB. Audit failures are NOT swallowed
+        (fail-closed): a broken audit path surfaces rather than silently losing
+        the security trail.
         """
         row = LoginLog(
             user_id=user_id,
@@ -289,8 +314,25 @@ class AuthService:
             user_agent=user_agent,
             trace_id=trace_id,
         )
-        await AuditRepository(self.repo.session).append_login_log(row)
-        await self.repo.session.commit()
+        async with unit_of_work(self._audit_factory()) as session:
+            await AuditRepository(session).append_login_log(row)
+
+    def _audit_factory(self) -> async_sessionmaker[AsyncSession]:
+        """Resolve the audit unit-of-work factory, deriving it lazily.
+
+        If one was injected at construction, use it. Otherwise build a factory
+        bound to the SAME engine as the request session (so a test's ephemeral
+        SQLite never leaks an audit write to the real PG) — deferred to here so
+        constructing the service never requires a live ``session.bind`` for code
+        paths that don't audit.
+        """
+        if self._injected_audit_factory is not None:
+            return self._injected_audit_factory
+        return async_sessionmaker(
+            bind=self.repo.session.bind,
+            expire_on_commit=False,
+            autoflush=False,
+        )
 
     async def resolve_access_token(self, token: str) -> AuthenticatedUser:
         """Verify a platform JWT and build the request principal (perms from DB).
@@ -401,14 +443,21 @@ class AuthService:
         if user is None:
             # Credential was valid but the user is gone/disabled since issue.
             raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
-        permissions = await self.repo.list_permission_codes(user_id)
-        role_codes = await self.repo.list_active_role_codes(user_id)
+        # The user row (enabled-status check) stays a per-request DB read — it is
+        # the security floor and must reflect a disable instantly. Only the two
+        # expensive RBAC aggregations are cached, behind perm_cache's race-free
+        # versioned-key scheme (invalidated by after-commit hooks on every
+        # role/menu/user-role mutation).
+        snapshot = await perm_cache.load_snapshot(
+            user_id,
+            lambda: self._load_permission_snapshot(user_id),
+        )
         return AuthenticatedUser(
             user_id=user_id,
             username=user.username,
             department_id=user.department_id,
-            permissions=permissions,
-            role_codes=role_codes,
+            permissions=snapshot.permissions,
+            role_codes=snapshot.role_codes,
             real_name=user.real_name,
             email=user.email,
             mobile=user.mobile,
@@ -416,6 +465,19 @@ class AuthService:
             avatar=user.avatar,
             credential_kind=credential_kind,
             api_key_id=api_key_id,
+        )
+
+    async def _load_permission_snapshot(
+        self, user_id: int
+    ) -> perm_cache.PermissionSnapshot:
+        """Aggregate the user's permission + role codes from the DB (cache loader).
+
+        The cache-miss path for :func:`perm_cache.load_snapshot` — runs the two
+        RBAC aggregations that are otherwise on every request's hot path.
+        """
+        return perm_cache.PermissionSnapshot(
+            permissions=await self.repo.list_permission_codes(user_id),
+            role_codes=await self.repo.list_active_role_codes(user_id),
         )
 
     async def update_current_user(
@@ -442,7 +504,6 @@ class AuthService:
             row.avatar = await self._resolve_avatar_binding(values["avatar"], user)
         row.updated_by = user.user_id
         await self.repo.session.flush()
-        await self.repo.session.commit()
         return await self._build_user(user.user_id, credential_kind=user.credential_kind)
 
     async def _resolve_avatar_binding(
@@ -496,6 +557,9 @@ class AuthService:
         frontend i18n. On success **all** of the user's sessions are revoked
         (B7 — force re-login on every device, including the current one), so a
         leaked-credential change immediately invalidates any hijacked session.
+        The revoke fires as an after-commit hook so it only runs once the
+        password write has actually landed (a rolled-back request never logs the
+        user out).
         """
         violations = password_strength_violations(
             new_password, min_length=get_settings().password_min_length
@@ -516,8 +580,10 @@ class AuthService:
         row.password = await hash_password_async(new_password)
         row.updated_by = user.user_id
         await self.repo.session.flush()
-        await self.repo.session.commit()
-        await self.sessions.revoke_all_sessions(user.user_id)
+        user_id = user.user_id
+        add_after_commit_hook(
+            self.repo.session, lambda: self.sessions.revoke_all_sessions(user_id)
+        )
 
     # ---- authorization ------------------------------------------------------
 
@@ -530,6 +596,10 @@ class AuthService:
     async def permissions_for_roles(self, role_ids: Sequence[int]) -> frozenset[str]:
         """Permission codes a given set of roles would confer (escalation guard)."""
         return await self.repo.list_permission_codes_for_roles(role_ids)
+
+    async def permissions_for_menus(self, menu_ids: Sequence[int]) -> frozenset[str]:
+        """Permission codes a given set of menus would confer (role-edit guard)."""
+        return await self.repo.list_permission_codes_for_menus(menu_ids)
 
     async def resolve_data_scope(self, user: AuthenticatedUser) -> DataScopeFilter:
         """Resolve the user's effective data scope (broadest role wins).

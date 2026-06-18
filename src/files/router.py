@@ -32,7 +32,7 @@ router = APIRouter(prefix="/attach", tags=["attach"])
 
 
 def get_attach_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
     storage: ObjectStorageDep,
 ) -> AttachService:
     return AttachService(session, storage)
