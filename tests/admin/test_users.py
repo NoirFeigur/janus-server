@@ -3,11 +3,44 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
+from src.admin.users.schemas import UserRead
+from src.auth.service import AuthenticatedUser
+from src.core.query import mask_fields
 from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
 from tests.admin.conftest import ADMIN_ID, AdminCtx
 
 pytestmark = pytest.mark.asyncio
+
+
+async def _set_dept_scoped_actor(
+    admin_ctx: AdminCtx, *, department_id: int, perms: set[str]
+) -> None:
+    await admin_ctx.session.execute(
+        UserRole.__table__.delete().where(UserRole.user_id == ADMIN_ID)
+    )
+    scoped = Role(
+        name=f"d{department_id}role",
+        code=f"d{department_id}role",
+        data_scope="dept",
+        status="active",
+    )
+    admin_ctx.session.add(scoped)
+    await admin_ctx.session.flush()
+    admin_ctx.session.add(UserRole(user_id=ADMIN_ID, role_id=scoped.id))
+    await admin_ctx.session.commit()
+    admin_ctx.state.department_id = department_id
+    admin_ctx.state.perms = perms
+
+
+def _non_super_actor(*, department_id: int, perms: set[str]) -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=ADMIN_ID,
+        username="admin",
+        department_id=department_id,
+        permissions=frozenset(perms),
+    )
 
 
 async def test_create_user_hashes_password_and_hides_it(admin_ctx: AdminCtx) -> None:
@@ -131,6 +164,175 @@ async def test_list_users_respects_data_scope(admin_ctx: AdminCtx) -> None:
     assert page["total"] >= 1
     assert "in500" in usernames
     assert "in600" not in usernames  # out of scope
+
+
+async def test_list_users_keyword_filters_by_username(admin_ctx: AdminCtx) -> None:
+    admin_ctx.session.add_all(
+        [
+            User(id=2101, username="alpha-match", employee_no="E-2101"),
+            User(id=2102, username="beta-only", employee_no="E-2102"),
+        ]
+    )
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.get("/admin/users?keyword=ALPHA")
+    assert resp.status_code == 200, resp.text
+    usernames = {item["username"] for item in resp.json()["data"]["items"]}
+    assert usernames == {"alpha-match"}
+
+
+async def test_list_users_sort_by_username_desc(admin_ctx: AdminCtx) -> None:
+    admin_ctx.session.add_all(
+        [
+            User(id=2111, username="anna", employee_no="E-2111"),
+            User(id=2112, username="zoe", employee_no="E-2112"),
+            User(id=2113, username="mike", employee_no="E-2113"),
+        ]
+    )
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.get(
+        "/admin/users?sort_by=username&sort_order=desc&limit=3"
+    )
+    assert resp.status_code == 200, resp.text
+    usernames = [item["username"] for item in resp.json()["data"]["items"]]
+    assert usernames == ["zoe", "mike", "anna"]
+
+
+async def test_list_users_invalid_sort_by_returns_400(admin_ctx: AdminCtx) -> None:
+    resp = await admin_ctx.client.get("/admin/users?sort_by=evil")
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "request.invalid"
+
+
+async def test_list_users_masks_pii_for_non_superuser(admin_ctx: AdminCtx) -> None:
+    admin_ctx.session.add(Department(id=2120, name="d2120", parent_id=None))
+    await admin_ctx.session.commit()
+    created = await admin_ctx.client.post(
+        "/admin/users",
+        json={
+            "username": "pii-scoped",
+            "employee_no": "E-2120",
+            "department_id": "2120",
+            "email": "alice@example.com",
+            "mobile": "13800001111",
+        },
+    )
+    assert created.status_code == 200, created.text
+    created_read = UserRead.model_validate(created.json()["data"])
+    await _set_dept_scoped_actor(
+        admin_ctx, department_id=2120, perms={"system:user:list"}
+    )
+
+    resp = await admin_ctx.client.get("/admin/users?keyword=pii-scoped")
+    assert resp.status_code == 200, resp.text
+    listed = resp.json()["data"]["items"][0]
+    expected = mask_fields(
+        created_read,
+        actor=_non_super_actor(
+            department_id=2120, perms={"system:user:list"}
+        ),
+        sensitive=("mobile", "email"),
+    )
+    assert listed["mobile"] == expected.mobile
+    assert listed["email"] == expected.email
+
+
+async def test_list_users_superuser_sees_unmasked_pii(admin_ctx: AdminCtx) -> None:
+    created = await admin_ctx.client.post(
+        "/admin/users",
+        json={
+            "username": "pii-super",
+            "employee_no": "E-2130",
+            "email": "bob@example.com",
+            "mobile": "13900002222",
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    resp = await admin_ctx.client.get("/admin/users?keyword=pii-super")
+    assert resp.status_code == 200, resp.text
+    listed = resp.json()["data"]["items"][0]
+    assert listed["mobile"] == "13900002222"
+    assert listed["email"] == "bob@example.com"
+
+
+async def test_batch_delete_users_skips_out_of_scope(admin_ctx: AdminCtx) -> None:
+    role = Role(name="batch-member", code="batch-member", data_scope="self", status="active")
+    in_scope = User(id=2141, username="batch-in", employee_no="E-2141", department_id=2140)
+    out_scope = User(
+        id=2142, username="batch-out", employee_no="E-2142", department_id=2142
+    )
+    admin_ctx.session.add_all(
+        [
+            Department(id=2140, name="d2140", parent_id=None),
+            Department(id=2142, name="d2142", parent_id=None),
+            role,
+            in_scope,
+            out_scope,
+        ]
+    )
+    await admin_ctx.session.flush()
+    admin_ctx.session.add_all(
+        [
+            UserRole(user_id=in_scope.id, role_id=role.id),
+            UserRole(user_id=out_scope.id, role_id=role.id),
+        ]
+    )
+    await _set_dept_scoped_actor(
+        admin_ctx, department_id=2140, perms={"system:user:remove"}
+    )
+
+    resp = await admin_ctx.client.post(
+        "/admin/users/batch-delete",
+        json={"ids": [str(in_scope.id), str(out_scope.id)]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data == {
+        "requested": 2,
+        "affected": 1,
+        "skipped_ids": [str(out_scope.id)],
+    }
+
+    await admin_ctx.session.refresh(in_scope)
+    await admin_ctx.session.refresh(out_scope)
+    assert in_scope.is_deleted is True
+    assert out_scope.is_deleted is False
+    links = await admin_ctx.session.scalars(
+        select(UserRole.user_id)
+        .where(UserRole.user_id.in_([in_scope.id, out_scope.id]))
+        .order_by(UserRole.user_id)
+    )
+    assert list(links.all()) == [out_scope.id]
+
+
+async def test_batch_delete_users_empty_or_all_skipped(admin_ctx: AdminCtx) -> None:
+    out_scope = User(
+        id=2152, username="batch-all-skip", employee_no="E-2152", department_id=2152
+    )
+    admin_ctx.session.add_all(
+        [
+            Department(id=2150, name="d2150", parent_id=None),
+            Department(id=2152, name="d2152", parent_id=None),
+            out_scope,
+        ]
+    )
+    await _set_dept_scoped_actor(
+        admin_ctx, department_id=2150, perms={"system:user:remove"}
+    )
+
+    resp = await admin_ctx.client.post(
+        "/admin/users/batch-delete", json={"ids": [str(out_scope.id)]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == {
+        "requested": 1,
+        "affected": 0,
+        "skipped_ids": [str(out_scope.id)],
+    }
+    await admin_ctx.session.refresh(out_scope)
+    assert out_scope.is_deleted is False
 
 
 async def test_mutation_out_of_scope_forbidden(admin_ctx: AdminCtx) -> None:

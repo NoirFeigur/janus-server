@@ -29,8 +29,11 @@ from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.dependencies import get_current_jwt_user
 from src.auth.service import AuthenticatedUser
 from src.config import get_settings
+from src.core.redis import get_redis
 from src.core.security import issue_access_token
+from src.core.session_store import SessionStore
 from src.db.base import Base
+from src.db.models.audit import LoginLog, OperLog
 from src.db.models.credential import ApiKey
 from src.db.models.identity import (
     Department,
@@ -41,6 +44,7 @@ from src.db.models.identity import (
     User,
     UserRole,
 )
+from src.db.models.sys_config import SysConfig
 from src.db.session import get_session
 from src.main import create_app
 
@@ -48,7 +52,19 @@ ADMIN_ID = 1000
 
 _TABLES = [
     Base.metadata.tables[m.__tablename__]
-    for m in (User, Department, Role, Menu, UserRole, RoleMenu, RoleDept, ApiKey)
+    for m in (
+        User,
+        Department,
+        Role,
+        Menu,
+        UserRole,
+        RoleMenu,
+        RoleDept,
+        ApiKey,
+        OperLog,
+        LoginLog,
+        SysConfig,
+    )
 ]
 
 
@@ -152,7 +168,16 @@ async def admin_ctx(
     app.state.session_factory = sqlite_session_factory
 
     transport = ASGITransport(app=app)
-    token, _ = issue_access_token(user_id=ADMIN_ID)
+    token, ttl, jti = issue_access_token(user_id=ADMIN_ID)
+    # The AuthMiddleware resolves this token on every request and now enforces the
+    # session allowlist, so the minted token must have a live session registered.
+    await SessionStore(get_redis()).create_session(
+        user_id=ADMIN_ID,
+        access_jti=jti,
+        access_ttl=ttl,
+        refresh_hash="admin-fixture-refresh",
+        refresh_ttl=ttl,
+    )
     async with httpx.AsyncClient(
         transport=transport,
         base_url="http://test",

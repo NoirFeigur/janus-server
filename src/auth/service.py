@@ -27,22 +27,31 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
+from src.admin.audit.repository import AuditRepository
 from src.auth import dept_tree_cache
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.credentials import CredentialKind
 from src.auth.dept_tree_cache import DeptPair, invalidate_department_tree
 from src.auth.repository import AuthRepository
+from src.config import get_settings
 from src.core import cache
+from src.core.login_throttle import LoginThrottle, ThrottlePolicy
+from src.core.redis import get_redis
 from src.core.security import (
     TokenError,
     decode_access_token,
     hash_api_key,
     hash_password_async,
+    hash_refresh_token,
     issue_access_token,
+    issue_refresh_token,
+    password_strength_violations,
     verify_password_async,
 )
+from src.core.session_store import RefreshOutcome, SessionStore
+from src.db.models.audit import LoginLog
 from src.db.models.identity import Role
-from src.enums import DataScope, ErrorCode
+from src.enums import AuditOutcome, DataScope, ErrorCode, LoginFailureReason
 from src.exceptions import AppError
 
 __all__ = [
@@ -142,24 +151,153 @@ class AuthService:
 
     def __init__(self, session: AsyncSession) -> None:
         self.repo = AuthRepository(session)
+        self.sessions = SessionStore(get_redis())
+        settings = get_settings()
+        self.throttle = LoginThrottle(
+            get_redis(),
+            ThrottlePolicy(
+                max_failures=settings.login_max_failures,
+                lockout_seconds=settings.login_lockout_seconds,
+                failure_window_seconds=settings.login_failure_window_seconds,
+                ip_max_failures=settings.login_ip_max_failures,
+                ip_window_seconds=settings.login_ip_window_seconds,
+            ),
+        )
 
     # ---- authentication ----------------------------------------------------
 
-    async def authenticate_password(self, username: str, password: str) -> tuple[str, int]:
-        """Verify username/password, issue a platform access token (token, ttl).
+    async def authenticate_password(
+        self,
+        username: str,
+        password: str,
+        *,
+        request_ip: str | None = None,
+        user_agent: str | None = None,
+        trace_id: str | None = None,
+    ) -> tuple[str, int, str]:
+        """Verify username/password, open a session, return (access, ttl, refresh).
 
         Wrong user, SSO-only user (null password), and wrong password all
-        collapse to one opaque 401 — no user-enumeration oracle.
+        collapse to one opaque 401 — no user-enumeration oracle. Every attempt
+        (success or failure) appends one ``login_log`` row recording the *real*
+        internal :class:`LoginFailureReason`; that reason is audit-only and is
+        never surfaced to the client.
+
+        On success the access token's ``jti`` is registered in the Redis session
+        allowlist and an opaque refresh token is stored (hashed), so the session
+        is revocable (logout/kick) and the refresh is rotatable.
+
+        Brute-force defense (B6): a per-username lockout and a per-IP sliding
+        window are checked *before* the DB lookup + argon2 verify, so a locked or
+        flooding caller is refused cheaply (no wasted hashing — a DoS guard). The
+        lockout applies identically to real and non-existent usernames, so the
+        ``auth_account_locked`` (429) response is **not** a user-enumeration
+        oracle. A successful login clears the username's failure counter.
         """
+        if await self.throttle.is_locked(username) or (
+            request_ip is not None and await self.throttle.is_ip_limited(request_ip)
+        ):
+            await self._record_login(
+                user_id=None,
+                username=username,
+                outcome=AuditOutcome.failure,
+                failure_reason=LoginFailureReason.account_locked,
+                request_ip=request_ip,
+                user_agent=user_agent,
+                trace_id=trace_id,
+            )
+            raise AppError(
+                ErrorCode.auth_account_locked, status.HTTP_429_TOO_MANY_REQUESTS
+            )
         user = await self.repo.get_user_by_username(username)
-        if user is None or user.password is None:
+        if user is None:
+            await self._record_login(
+                user_id=None,
+                username=username,
+                outcome=AuditOutcome.failure,
+                failure_reason=LoginFailureReason.user_not_found,
+                request_ip=request_ip,
+                user_agent=user_agent,
+                trace_id=trace_id,
+            )
+            await self.throttle.record_failure(username, ip=request_ip)
             raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
-        if not await verify_password_async(user.password, password):
+        if user.password is None or not await verify_password_async(
+            user.password, password
+        ):
+            await self._record_login(
+                user_id=user.id,
+                username=username,
+                outcome=AuditOutcome.failure,
+                failure_reason=LoginFailureReason.bad_credentials,
+                request_ip=request_ip,
+                user_agent=user_agent,
+                trace_id=trace_id,
+            )
+            await self.throttle.record_failure(username, ip=request_ip)
             raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
-        return issue_access_token(user.id)
+
+        await self.throttle.reset(username)
+        token, ttl, access_jti = issue_access_token(user.id)
+        refresh_plain, refresh_hash = issue_refresh_token()
+        await self.sessions.create_session(
+            user_id=user.id,
+            access_jti=access_jti,
+            access_ttl=ttl,
+            refresh_hash=refresh_hash,
+            refresh_ttl=get_settings().platform_refresh_token_ttl_seconds,
+            ip=request_ip,
+            user_agent=user_agent,
+        )
+        await self._record_login(
+            user_id=user.id,
+            username=username,
+            outcome=AuditOutcome.success,
+            failure_reason=None,
+            request_ip=request_ip,
+            user_agent=user_agent,
+            trace_id=trace_id,
+        )
+        return token, ttl, refresh_plain
+
+    async def _record_login(
+        self,
+        *,
+        user_id: int | None,
+        username: str,
+        outcome: AuditOutcome,
+        failure_reason: LoginFailureReason | None,
+        request_ip: str | None,
+        user_agent: str | None,
+        trace_id: str | None,
+    ) -> None:
+        """Append one login-attempt audit row and commit it.
+
+        Committed here (not left to the caller) so a *failure* row survives the
+        ``AppError`` that follows it. Uses the auth domain's session via the
+        append-only :class:`AuditRepository` (cross-cutting audit infra, not a
+        cross-domain service dependency).
+        """
+        row = LoginLog(
+            user_id=user_id,
+            username=username,
+            status=outcome.value,
+            failure_reason=failure_reason.value if failure_reason is not None else None,
+            request_ip=request_ip,
+            user_agent=user_agent,
+            trace_id=trace_id,
+        )
+        await AuditRepository(self.repo.session).append_login_log(row)
+        await self.repo.session.commit()
 
     async def resolve_access_token(self, token: str) -> AuthenticatedUser:
-        """Verify a platform JWT and build the request principal (perms from DB)."""
+        """Verify a platform JWT and build the request principal (perms from DB).
+
+        Beyond signature/claims validation, the token's ``jti`` must still be in
+        the Redis session allowlist; a revoked session (logout / kick / refresh
+        reuse) fails with ``auth_token_revoked`` even while the JWT is otherwise
+        cryptographically valid and unexpired.
+        """
         try:
             claims = decode_access_token(token)
             user_id = int(claims.sub)
@@ -167,7 +305,76 @@ class AuthService:
             raise AppError(
                 ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED
             ) from exc
+        if not await self.sessions.is_access_active(claims.jti):
+            raise AppError(
+                ErrorCode.auth_token_revoked, status.HTTP_401_UNAUTHORIZED
+            )
         return await self._build_user(user_id, credential_kind=CredentialKind.jwt)
+
+    async def logout(self, token: str) -> None:
+        """Revoke the session behind a platform access token (logout).
+
+        Decodes for the ``jti`` and drops the session (access allowlist entry,
+        user-index member, and the bound refresh). Idempotent: a token whose
+        session is already gone is a no-op. An undecodable token is rejected so
+        a malformed logout can't masquerade as success.
+        """
+        try:
+            claims = decode_access_token(token)
+        except TokenError as exc:
+            raise AppError(
+                ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED
+            ) from exc
+        await self.sessions.revoke_access(claims.jti)
+
+    async def refresh_session(
+        self,
+        refresh_token: str,
+        *,
+        request_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> tuple[str, int, str]:
+        """Rotate a refresh token into a fresh (access, ttl, refresh) triple.
+
+        Atomically consumes the presented refresh (only one concurrent caller
+        wins); on success mints a new access+refresh pair, registers the new
+        session, and revokes the old access token so the rotated-away access
+        stops working immediately. A refresh that is unknown, expired, or already
+        rotated (reuse — the store has by then revoked the whole user session as
+        a theft signal) fails with ``auth_refresh_invalid``. Refresh uses a
+        sliding window: each rotation grants a fresh full refresh lifetime.
+
+        ``request_ip``/``user_agent`` are re-captured onto the rotated session so
+        the online-session list (B5) reflects the latest client context.
+        """
+        refresh_hash = hash_refresh_token(refresh_token)
+        settings = get_settings()
+        refresh_ttl = settings.platform_refresh_token_ttl_seconds
+        result = await self.sessions.consume_refresh(
+            refresh_hash, used_marker_ttl=refresh_ttl
+        )
+        if (
+            result.outcome is not RefreshOutcome.ok
+            or result.user_id is None
+            or result.old_access_jti is None
+        ):
+            raise AppError(
+                ErrorCode.auth_refresh_invalid, status.HTTP_401_UNAUTHORIZED
+            )
+
+        token, ttl, access_jti = issue_access_token(result.user_id)
+        new_refresh_plain, new_refresh_hash = issue_refresh_token()
+        await self.sessions.create_session(
+            user_id=result.user_id,
+            access_jti=access_jti,
+            access_ttl=ttl,
+            refresh_hash=new_refresh_hash,
+            refresh_ttl=refresh_ttl,
+            ip=request_ip,
+            user_agent=user_agent,
+        )
+        await self.sessions.revoke_access(result.old_access_jti)
+        return token, ttl, new_refresh_plain
 
     async def resolve_api_key(self, plaintext: str) -> AuthenticatedUser:
         """Resolve an sk-key to its owner principal (hash → lookup → expiry)."""
@@ -230,7 +437,24 @@ class AuthService:
     async def change_current_password(
         self, user: AuthenticatedUser, *, old_password: str, new_password: str
     ) -> None:
-        """Change the current user's password after verifying the old one."""
+        """Change the current user's password after verifying the old one.
+
+        Enforces the strength policy (length + must contain a letter and a digit)
+        before hashing; a weak password fails with ``auth_password_too_weak``
+        (400) carrying the machine-readable violation labels in ``params`` for
+        frontend i18n. On success **all** of the user's sessions are revoked
+        (B7 — force re-login on every device, including the current one), so a
+        leaked-credential change immediately invalidates any hijacked session.
+        """
+        violations = password_strength_violations(
+            new_password, min_length=get_settings().password_min_length
+        )
+        if violations:
+            raise AppError(
+                ErrorCode.auth_password_too_weak,
+                status.HTTP_400_BAD_REQUEST,
+                params={"violations": violations},
+            )
         row = await self.repo.get_user_by_id(user.user_id)
         if row is None:
             raise AppError(ErrorCode.auth_invalid_token, status.HTTP_401_UNAUTHORIZED)
@@ -242,6 +466,7 @@ class AuthService:
         row.updated_by = user.user_id
         await self.repo.session.flush()
         await self.repo.session.commit()
+        await self.sessions.revoke_all_sessions(user.user_id)
 
     # ---- authorization ------------------------------------------------------
 

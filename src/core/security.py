@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import secrets
 import time
+import uuid
 import weakref
 
 import jwt
@@ -80,6 +81,24 @@ async def verify_password_async(password_hash: str, plain: str) -> bool:
         return await asyncio.to_thread(verify_password, password_hash, plain)
 
 
+def password_strength_violations(plain: str, *, min_length: int) -> list[str]:
+    """检查密码强度,返回违规项列表(空列表 = 合格)。
+
+    纯横切原语:只判定、返回机器可读的违规标签,**不抛 ``AppError``**(由上层 service
+    翻译成带 ``ErrorCode`` 的响应)。基线规则(见 config 注释):长度下限 + 至少含一个
+    字母与一个数字(挡纯数字/纯字母弱口令);不强推大小写/符号复杂度(对齐 NIST 取向)。
+    违规标签随 ``AppError.params`` 透传给前端做 i18n 插值。
+    """
+    violations: list[str] = []
+    if len(plain) < min_length:
+        violations.append("too_short")
+    if not any(c.isalpha() for c in plain):
+        violations.append("no_letter")
+    if not any(c.isdigit() for c in plain):
+        violations.append("no_digit")
+    return violations
+
+
 # ---- sk-key(高熵随机串,sha256 快哈希) -------------------------------------
 
 _SK_PREFIX = "sk-"
@@ -122,6 +141,7 @@ class PlatformAccessClaims(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sub: str  # sys_user.id (stringified)
+    jti: str  # token 唯一 id（UUID4 hex）；会话吊销/登出按 jti 在 Redis 标记
     iat: int  # 签发时刻(unix 秒)
     exp: int  # 过期时刻(unix 秒)
     token_use: str  # 固定 "access";为 M6 加 refresh 留前向兼容判别位
@@ -154,13 +174,19 @@ def _load_public_key_pem() -> str:
     return public_pem.decode("utf-8")
 
 
-def issue_access_token(user_id: int) -> tuple[str, int]:
-    """为用户签发 access token,返回 (token, 有效秒数)。RS256 私钥签名。"""
+def issue_access_token(user_id: int) -> tuple[str, int, str]:
+    """为用户签发 access token,返回 (token, 有效秒数, jti)。RS256 私钥签名。
+
+    回传 ``jti`` 供会话层把该 token 注册进 Redis 白名单(登出/踢下线按 jti 吊销);
+    它已是 token 内的 claim,一并返回省得调用方再解码取。
+    """
     settings = get_settings()
     ttl = settings.platform_access_token_ttl_seconds
     now = int(time.time())
+    jti = uuid.uuid4().hex
     claims = {
         "sub": str(user_id),
+        "jti": jti,
         "iat": now,
         "exp": now + ttl,
         "token_use": "access",
@@ -171,7 +197,22 @@ def issue_access_token(user_id: int) -> tuple[str, int]:
         )
     except (jwt.PyJWTError, ValueError) as exc:
         raise TokenError(f"failed to sign access token: {exc}") from exc
-    return token, ttl
+    return token, ttl, jti
+
+
+def issue_refresh_token() -> tuple[str, str]:
+    """签发一个不透明 refresh token,返回 (明文, sha256 哈希)。
+
+    明文(高熵随机串)仅返回给客户端,服务端只存其 sha256(Redis 等值查表);与 sk-key
+    同套「高熵 → 快哈希」思路。refresh 不携带身份,身份/绑定关系存于 Redis 会话记录。
+    """
+    plaintext = secrets.token_urlsafe(48)
+    return plaintext, hash_refresh_token(plaintext)
+
+
+def hash_refresh_token(plaintext: str) -> str:
+    """对 refresh token 明文取 sha256 十六进制摘要(用于 Redis 等值查表)。"""
+    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
 
 
 def decode_access_token(token: str) -> PlatformAccessClaims:

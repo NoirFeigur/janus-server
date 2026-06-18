@@ -5,6 +5,7 @@ full metadata by importing one place. Import side effects register each model
 on ``Base.metadata``.
 """
 
+from src.db.models.audit import LoginLog, OperLog
 from src.db.models.credential import ApiKey
 from src.db.models.grant import UserModelGrant
 from src.db.models.identity import (
@@ -24,6 +25,7 @@ from src.db.models.model_catalog import (
     UpstreamChannel,
 )
 from src.db.models.quota import Quota
+from src.db.models.sys_config import SysConfig
 from src.db.models.usage import UsageRecord
 
 __all__ = [
@@ -48,4 +50,9 @@ __all__ = [
     # usage & quota
     "UsageRecord",
     "Quota",
+    # audit
+    "OperLog",
+    "LoginLog",
+    # platform config
+    "SysConfig",
 ]

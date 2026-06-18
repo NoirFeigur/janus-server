@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
-from src.db.models.identity import Department, Menu
-from tests.admin.conftest import AdminCtx
+from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
+from tests.admin.conftest import ADMIN_ID, AdminCtx
 
 pytestmark = pytest.mark.asyncio
 
@@ -22,6 +23,26 @@ async def _seed_depts(admin_ctx: AdminCtx, *dept_ids: int) -> None:
         [Department(id=d, name=f"d{d}", parent_id=None) for d in dept_ids]
     )
     await admin_ctx.session.commit()
+
+
+async def _set_dept_scoped_actor(
+    admin_ctx: AdminCtx, *, department_id: int, perms: set[str]
+) -> None:
+    await admin_ctx.session.execute(
+        UserRole.__table__.delete().where(UserRole.user_id == ADMIN_ID)
+    )
+    scoped = Role(
+        name=f"d{department_id}role",
+        code=f"d{department_id}role",
+        data_scope="dept",
+        status="active",
+    )
+    admin_ctx.session.add(scoped)
+    await admin_ctx.session.flush()
+    admin_ctx.session.add(UserRole(user_id=ADMIN_ID, role_id=scoped.id))
+    await admin_ctx.session.commit()
+    admin_ctx.state.department_id = department_id
+    admin_ctx.state.perms = perms
 
 
 async def test_create_role_with_menus(admin_ctx: AdminCtx) -> None:
@@ -138,8 +159,6 @@ async def test_delete_role(admin_ctx: AdminCtx) -> None:
 
 async def test_delete_role_removes_user_assignments(admin_ctx: AdminCtx) -> None:
     """IMPORTANT-3: deleting a role must drop its UserRole links (no stale ids)."""
-    from src.db.models.identity import User, UserRole
-
     created = await admin_ctx.client.post(
         "/admin/roles", json={"name": "Assigned", "code": "assigned"}
     )
@@ -155,12 +174,176 @@ async def test_delete_role_removes_user_assignments(admin_ctx: AdminCtx) -> None
     assert resp.status_code == 200
 
     # No UserRole row should remain for the deleted role.
-    from sqlalchemy import select
-
     remaining = await admin_ctx.session.scalars(
         select(UserRole.id).where(UserRole.role_id == role_id)
     )
     assert remaining.all() == []
+
+
+async def test_list_roles_keyword_filters_by_name_or_code(admin_ctx: AdminCtx) -> None:
+    admin_ctx.session.add_all(
+        [
+            Role(name="Alpha Match", code="role-alpha", data_scope="self", status="active"),
+            Role(name="Beta Only", code="beta-only", data_scope="self", status="active"),
+            Role(name="Code Hit", code="code-alpha-hit", data_scope="self", status="active"),
+        ]
+    )
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.get("/admin/roles?keyword=ALPHA")
+    assert resp.status_code == 200, resp.text
+    codes = {item["code"] for item in resp.json()["data"]["items"]}
+    assert codes == {"role-alpha", "code-alpha-hit"}
+
+
+async def test_list_roles_sort_by_name_desc(admin_ctx: AdminCtx) -> None:
+    admin_ctx.session.add_all(
+        [
+            Role(name="anna", code="role-anna", data_scope="self", status="active"),
+            Role(name="zoe", code="role-zoe", data_scope="self", status="active"),
+            Role(name="mike", code="role-mike", data_scope="self", status="active"),
+        ]
+    )
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.get(
+        "/admin/roles?sort_by=name&sort_order=desc&limit=3"
+    )
+    assert resp.status_code == 200, resp.text
+    names = [item["name"] for item in resp.json()["data"]["items"]]
+    assert names == ["zoe", "mike", "anna"]
+
+
+async def test_list_roles_invalid_sort_by_returns_400(admin_ctx: AdminCtx) -> None:
+    resp = await admin_ctx.client.get("/admin/roles?sort_by=evil")
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "request.invalid"
+
+
+async def test_batch_delete_roles_skips_out_of_scope(admin_ctx: AdminCtx) -> None:
+    menu = Menu(name="m.batch", menu_type="button", perms="system:role:list", status="active")
+    in_scope = Role(
+        name="Batch In",
+        code="batch-in",
+        data_scope="custom",
+        status="active",
+        created_by=123,
+        create_dept=3100,
+    )
+    out_scope = Role(
+        name="Batch Out",
+        code="batch-out",
+        data_scope="custom",
+        status="active",
+        created_by=123,
+        create_dept=3200,
+    )
+    assignee = User(id=3199, username="role-member", employee_no="E-3199", status="active")
+    admin_ctx.session.add_all(
+        [
+            Department(id=3100, name="d3100", parent_id=None),
+            Department(id=3200, name="d3200", parent_id=None),
+            menu,
+            in_scope,
+            out_scope,
+            assignee,
+        ]
+    )
+    await admin_ctx.session.flush()
+    admin_ctx.session.add_all(
+        [
+            RoleMenu(role_id=in_scope.id, menu_id=menu.id),
+            RoleMenu(role_id=out_scope.id, menu_id=menu.id),
+            RoleDept(role_id=in_scope.id, dept_id=3100),
+            RoleDept(role_id=out_scope.id, dept_id=3200),
+            UserRole(user_id=assignee.id, role_id=in_scope.id),
+            UserRole(user_id=assignee.id, role_id=out_scope.id),
+        ]
+    )
+    await _set_dept_scoped_actor(
+        admin_ctx, department_id=3100, perms={"system:role:remove"}
+    )
+
+    resp = await admin_ctx.client.post(
+        "/admin/roles/batch-delete",
+        json={"ids": [str(in_scope.id), str(out_scope.id)]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data == {
+        "requested": 2,
+        "affected": 1,
+        "skipped_ids": [str(out_scope.id)],
+    }
+
+    await admin_ctx.session.refresh(in_scope)
+    await admin_ctx.session.refresh(out_scope)
+    assert in_scope.is_deleted is True
+    assert out_scope.is_deleted is False
+    role_menus = await admin_ctx.session.scalars(
+        select(RoleMenu.role_id)
+        .where(RoleMenu.role_id.in_([in_scope.id, out_scope.id]))
+        .order_by(RoleMenu.role_id)
+    )
+    role_depts = await admin_ctx.session.scalars(
+        select(RoleDept.role_id)
+        .where(RoleDept.role_id.in_([in_scope.id, out_scope.id]))
+        .order_by(RoleDept.role_id)
+    )
+    user_roles = await admin_ctx.session.scalars(
+        select(UserRole.role_id)
+        .where(UserRole.role_id.in_([in_scope.id, out_scope.id]))
+        .order_by(UserRole.role_id)
+    )
+    assert list(role_menus.all()) == [out_scope.id]
+    assert list(role_depts.all()) == [out_scope.id]
+    assert list(user_roles.all()) == [out_scope.id]
+
+
+async def test_batch_delete_roles_clears_all_links_for_affected(
+    admin_ctx: AdminCtx,
+) -> None:
+    menu = Menu(name="m.clear", menu_type="button", perms="system:role:edit", status="active")
+    role = Role(
+        name="Clear Links",
+        code="clear-links",
+        data_scope="custom",
+        status="active",
+    )
+    assignee = User(id=3299, username="clear-member", employee_no="E-3299", status="active")
+    admin_ctx.session.add_all(
+        [Department(id=3300, name="d3300", parent_id=None), menu, role, assignee]
+    )
+    await admin_ctx.session.flush()
+    admin_ctx.session.add_all(
+        [
+            RoleMenu(role_id=role.id, menu_id=menu.id),
+            RoleDept(role_id=role.id, dept_id=3300),
+            UserRole(user_id=assignee.id, role_id=role.id),
+        ]
+    )
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.post(
+        "/admin/roles/batch-delete", json={"ids": [str(role.id)]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == {"requested": 1, "affected": 1, "skipped_ids": []}
+
+    await admin_ctx.session.refresh(role)
+    assert role.is_deleted is True
+    role_menus = await admin_ctx.session.scalars(
+        select(RoleMenu.id).where(RoleMenu.role_id == role.id)
+    )
+    role_depts = await admin_ctx.session.scalars(
+        select(RoleDept.id).where(RoleDept.role_id == role.id)
+    )
+    user_roles = await admin_ctx.session.scalars(
+        select(UserRole.id).where(UserRole.role_id == role.id)
+    )
+    assert role_menus.all() == []
+    assert role_depts.all() == []
+    assert user_roles.all() == []
 
 
 async def test_role_endpoints_require_permission(admin_ctx: AdminCtx) -> None:

@@ -64,6 +64,9 @@ def error_envelope(
     errors: list[dict[str, Any]] | None = None,
 ) -> JSONResponse:
     """构造统一错误信封响应(与成功响应同构)。"""
+    # 暂存 code 供操作审计中间件读取(失败留痕的 error_code 来源);中间件在
+    # call_next 返回后从 request.state 取,避免回读已流式化的响应体。
+    request.state.error_code = code.value
     body = error_body(
         code=code,
         trace_id=_trace_id(request),

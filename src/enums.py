@@ -12,6 +12,18 @@ class UsageStatus(StrEnum):
     timeout = "timeout"  # LLM call timed out.
 
 
+class AuditOutcome(StrEnum):
+    success = "success"  # Operation/login succeeded.
+    failure = "failure"  # Operation/login failed.
+
+
+class LoginFailureReason(StrEnum):
+    bad_credentials = "bad_credentials"  # Username/password mismatch.
+    user_disabled = "user_disabled"  # Account is disabled.
+    user_not_found = "user_not_found"  # No such username.
+    account_locked = "account_locked"  # Login refused: too many recent failures (lockout).
+
+
 class UserStatus(StrEnum):
     active = "active"  # Active employee user.
     disabled = "disabled"  # Disabled or departed employee user.
@@ -74,8 +86,19 @@ class QuotaMetric(StrEnum):
     cost = "cost"  # Internal cost-point quota.
 
 
+class ConfigValueType(StrEnum):
+    string = "string"  # Raw string value, used as-is.
+    int = "int"  # Parsed as a base-10 integer.
+    bool = "bool"  # Parsed as boolean (true/1/yes/on → True).
+    json = "json"  # Parsed as a JSON document (object/array/scalar).
+
+
 class ErrorCode(StrEnum):
     auth_invalid_token = "auth.invalid_token"  # JWT or sk-key is invalid or expired.
+    auth_token_revoked = "auth.token_revoked"  # Token's session was revoked (logout/kick/reuse).
+    auth_refresh_invalid = "auth.refresh_invalid"  # Refresh token unknown/expired/already rotated.
+    auth_account_locked = "auth.account_locked"  # Login refused: too many recent failures.
+    auth_password_too_weak = "auth.password_too_weak"  # New password fails strength policy.
     auth_user_disabled = "auth.user_disabled"  # Authenticated user is disabled.
     auth_forbidden = "auth.forbidden"  # Authenticated principal lacks permission.
     model_not_granted = "model.not_granted"  # Principal is not granted the logical model.

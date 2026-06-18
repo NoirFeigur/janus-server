@@ -14,14 +14,16 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
+from src.auth.credentials import extract_credential
 from src.auth.dependencies import CurrentJwtUser, TraceId, get_auth_service
 from src.auth.schemas import (
     ChangePasswordRequest,
     CurrentUserRead,
     CurrentUserUpdate,
     LoginRequest,
+    RefreshRequest,
     TokenRead,
 )
 from src.auth.service import AuthenticatedUser, AuthService
@@ -47,13 +49,65 @@ def _to_current_user_read(user: AuthenticatedUser) -> CurrentUserRead:
 @router.post("/login", response_model=SuccessEnvelope[TokenRead])
 async def login(
     payload: LoginRequest,
+    request: Request,
     service: Annotated[AuthService, Depends(get_auth_service)],
     trace_id: TraceId,
 ) -> SuccessEnvelope[TokenRead]:
     """Authenticate by username/password and issue a platform access token."""
-    token, ttl = await service.authenticate_password(payload.username, payload.password)
+    client = request.client
+    token, ttl, refresh_token = await service.authenticate_password(
+        payload.username,
+        payload.password,
+        request_ip=client.host if client is not None else None,
+        user_agent=request.headers.get("user-agent"),
+        trace_id=trace_id,
+    )
     return success(
-        TokenRead(access_token=token, expires_in=ttl),
+        TokenRead(access_token=token, expires_in=ttl, refresh_token=refresh_token),
+        trace_id=trace_id,
+    )
+
+
+@router.post("/logout", response_model=SuccessEnvelope[None])
+async def logout(
+    request: Request,
+    user: CurrentJwtUser,
+    service: Annotated[AuthService, Depends(get_auth_service)],
+    trace_id: TraceId,
+) -> SuccessEnvelope[None]:
+    """Revoke the current session so its access token stops working immediately.
+
+    Gated by :data:`CurrentJwtUser` (a valid, non-revoked JWT). The same bearer
+    token is then revoked from the session allowlist, dropping its refresh too.
+    """
+    credential = extract_credential(
+        request.headers.get("authorization"), None, allow_api_key=False
+    )
+    await service.logout(credential.value)
+    return success(None, trace_id=trace_id)
+
+
+@router.post("/refresh", response_model=SuccessEnvelope[TokenRead])
+async def refresh(
+    payload: RefreshRequest,
+    request: Request,
+    service: Annotated[AuthService, Depends(get_auth_service)],
+    trace_id: TraceId,
+) -> SuccessEnvelope[TokenRead]:
+    """Rotate a refresh token into a fresh access+refresh pair.
+
+    Public path (the access token may already be expired). The presented refresh
+    is consumed and rotated; an unknown/expired/already-rotated refresh fails
+    with ``auth_refresh_invalid`` (reuse additionally revokes the whole session).
+    """
+    client = request.client
+    token, ttl, refresh_token = await service.refresh_session(
+        payload.refresh_token,
+        request_ip=client.host if client is not None else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    return success(
+        TokenRead(access_token=token, expires_in=ttl, refresh_token=refresh_token),
         trace_id=trace_id,
     )
 

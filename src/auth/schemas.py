@@ -5,9 +5,9 @@ service layer speaks domain objects (``AuthenticatedUser``), these are the
 HTTP boundary.
 
 ``UserRead`` never carries ``password`` (§0.8 iron rule): the column stores a
-hash, but no read model ever exposes it. ``TokenRead`` reserves an optional
-``refresh_token`` (always ``None`` in M1) so the M6 refresh-token rollout is a
-field population, not a contract break.
+hash, but no read model ever exposes it. ``TokenRead`` carries an optional
+``refresh_token`` populated on login (the rotation/revocation rollout); it stays
+optional so non-login token issuers can omit it without a contract change.
 """
 
 from __future__ import annotations
@@ -38,13 +38,19 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=1, max_length=128)
 
 
+class RefreshRequest(BaseModel):
+    """Refresh-token rotation payload (opaque token from a prior login/refresh)."""
+
+    refresh_token: str = Field(min_length=1, max_length=512)
+
+
 class TokenRead(BaseModel):
-    """Issued platform access token (+ forward-compat refresh slot)."""
+    """Issued platform access token (+ opaque refresh token on login)."""
 
     access_token: str
     token_type: str = "Bearer"
     expires_in: int  # Access-token lifetime in seconds.
-    refresh_token: str | None = None  # Reserved for M6; always None in M1.
+    refresh_token: str | None = None  # Opaque refresh token; present on login.
 
 
 class CurrentUserRead(BaseModel):

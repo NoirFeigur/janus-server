@@ -42,6 +42,20 @@ class Settings(BaseSettings):
     platform_jwt_private_key: SecretStr | None = None  # PKCS8 PEM;仅签发方(登录)需要
     platform_jwt_public_key: str | None = None  # 缺省时启动期从私钥推导
     platform_access_token_ttl_seconds: int = 7200  # access token 有效期(2h)
+    platform_refresh_token_ttl_seconds: int = 1_209_600  # refresh token 有效期(14d)
+
+    # 登录防爆破(B6,纯 Redis 计数,无新表)。按「用户名」累计失败,达阈值即锁定一段时间;
+    # 锁定期内即便密码正确也拒绝(发 auth.account_locked),登录成功则清零计数。另设「按 IP」
+    # 滑窗计数作为粗粒度限流(同一来源短时间海量尝试),防止枚举大量用户名绕开单账户锁。
+    login_max_failures: int = 5  # 单用户名连续失败上限,达到即锁定
+    login_lockout_seconds: int = 900  # 锁定时长(15min);锁定期内拒绝登录
+    login_failure_window_seconds: int = 900  # 失败计数滑窗(15min);窗口内无新失败则计数自然过期
+    login_ip_max_failures: int = 50  # 单 IP 滑窗内失败上限(粗粒度限流,防跨用户名枚举)
+    login_ip_window_seconds: int = 300  # 单 IP 失败计数滑窗(5min)
+
+    # 自助改密强度策略(B7)。规模 2000 内部员工,口径取「长度 + 字符多样性」的务实下限
+    # (NIST 不强推复杂度规则,但内部基线要求至少含字母与数字,挡纯数字/纯字母弱口令)。
+    password_min_length: int = 8  # 新密码最短长度
 
     default_locale: str = "zh-CN"
     supported_locales: tuple[str, ...] = ("zh-CN", "en-US")

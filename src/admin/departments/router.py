@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.departments.schemas import (
@@ -20,6 +20,7 @@ from src.admin.departments.schemas import (
 from src.admin.departments.service import DepartmentService
 from src.auth.dependencies import RequiredPerms, TraceId
 from src.auth.service import AuthenticatedUser
+from src.core.query import BatchIdsRequest, BatchResult
 from src.db.session import get_session
 from src.responses import SuccessEnvelope, success
 
@@ -40,8 +41,9 @@ async def list_departments(
     service: ServiceDep,
     trace_id: TraceId,
     _: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:dept:list"))],
+    keyword: Annotated[str | None, Query()] = None,
 ) -> SuccessEnvelope[list[DepartmentRead]]:
-    departments = await service.list_departments()
+    departments = await service.list_departments(keyword=keyword)
     return success(
         [DepartmentRead.model_validate(d) for d in departments], trace_id=trace_id
     )
@@ -68,6 +70,19 @@ async def update_department(
 ) -> SuccessEnvelope[DepartmentRead]:
     dept = await service.update_department(dept_id, payload, actor=user)
     return success(DepartmentRead.model_validate(dept), trace_id=trace_id)
+
+
+@router.post("/batch-delete", response_model=SuccessEnvelope[BatchResult])
+async def batch_delete_departments(
+    payload: BatchIdsRequest,
+    service: ServiceDep,
+    trace_id: TraceId,
+    user: Annotated[
+        AuthenticatedUser, Depends(RequiredPerms("system:dept:remove"))
+    ],
+) -> SuccessEnvelope[BatchResult]:
+    result = await service.batch_delete_departments(payload.ids, actor=user)
+    return success(result, trace_id=trace_id)
 
 
 @router.delete("/{dept_id}", response_model=SuccessEnvelope[None])

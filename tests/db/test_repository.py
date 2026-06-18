@@ -108,3 +108,70 @@ async def test_list_limit_and_offset(session: AsyncSession) -> None:
         await repo.create(SampleEntity(name=f"row-{i}"))
     page = await repo.list(limit=2, offset=1)
     assert len(page) == 2
+
+
+async def test_soft_delete_many_skips_out_of_scope_ids(session: AsyncSession) -> None:
+    repo = SampleRepository(session)
+    visible = await repo.create(SampleEntity(name="visible"))
+    hidden = await repo.create(SampleEntity(name="hidden"))
+
+    affected, skipped_ids = await repo.soft_delete_many(
+        [visible.id, hidden.id],
+        scope_predicate=SampleEntity.id == visible.id,
+    )
+
+    assert affected == 1
+    assert skipped_ids == [hidden.id]
+
+    deleted = await repo.get(visible.id, include_deleted=True)
+    skipped = await repo.get(hidden.id, include_deleted=True)
+    assert deleted is not None
+    assert skipped is not None
+    assert deleted.is_deleted is True
+    assert skipped.is_deleted is False
+
+
+async def test_soft_delete_many_empty_ids_noop(session: AsyncSession) -> None:
+    repo = SampleRepository(session)
+    row = await repo.create(SampleEntity(name="keep"))
+
+    affected, skipped_ids = await repo.soft_delete_many([])
+
+    assert affected == 0
+    assert skipped_ids == []
+    kept = await repo.get(row.id)
+    assert kept is not None
+    assert kept.is_deleted is False
+
+
+async def test_soft_delete_many_unrestricted_deletes_all(session: AsyncSession) -> None:
+    repo = SampleRepository(session)
+    first = await repo.create(SampleEntity(name="first"))
+    second = await repo.create(SampleEntity(name="second"))
+
+    affected, skipped_ids = await repo.soft_delete_many([first.id, second.id])
+
+    assert affected == 2
+    assert skipped_ids == []
+
+    deleted_rows = await repo.list(include_deleted=True)
+    assert {row.id for row in deleted_rows} == {first.id, second.id}
+    assert all(row.is_deleted is True for row in deleted_rows)
+
+
+async def test_soft_delete_many_already_deleted_counted_as_skipped(
+    session: AsyncSession,
+) -> None:
+    repo = SampleRepository(session)
+    already_deleted = await repo.create(SampleEntity(name="already-deleted"))
+    active = await repo.create(SampleEntity(name="active"))
+    await repo.soft_delete(already_deleted)
+
+    affected, skipped_ids = await repo.soft_delete_many([already_deleted.id, active.id])
+
+    assert affected == 1
+    assert skipped_ids == [already_deleted.id]
+
+    rows = await repo.list(include_deleted=True)
+    assert {row.id for row in rows} == {already_deleted.id, active.id}
+    assert all(row.is_deleted is True for row in rows)

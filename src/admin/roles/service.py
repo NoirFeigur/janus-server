@@ -17,12 +17,22 @@ from src.admin.roles.repository import RoleRepository
 from src.admin.roles.schemas import RoleCreate, RoleUpdate
 from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.core.pagination import PageResult, page_result
+from src.core.query import BatchResult, ListQuery, resolve_sort
 from src.db.models.identity import Role
 from src.enums import DataScope, ErrorCode
 from src.exceptions import AppError
 
 RoleDetail = tuple[Role, list[int], list[int]]
 RolePage = PageResult[RoleDetail]
+
+ROLE_SORT_COLUMNS = {
+    "id": Role.id,
+    "name": Role.name,
+    "code": Role.code,
+    "sort_order": Role.sort_order,
+    "status": Role.status,
+    "created_at": Role.created_at,
+}
 
 
 class RoleService:
@@ -67,12 +77,24 @@ class RoleService:
         return role, menu_ids, dept_ids
 
     async def list_roles(
-        self, actor: AuthenticatedUser, *, limit: int = 50, offset: int = 0
+        self,
+        actor: AuthenticatedUser,
+        *,
+        query: ListQuery | None = None,
     ) -> RolePage:
+        query = query or ListQuery()
         scope = await self._scope(actor)
-        total = await self.repo.count_in_scope(scope, actor_id=actor.user_id)
+        sort = resolve_sort(query, allowed=ROLE_SORT_COLUMNS, default="sort_order")
+        total = await self.repo.count_in_scope(
+            scope, actor_id=actor.user_id, keyword=query.keyword
+        )
         roles = await self.repo.list_in_scope(
-            scope, actor_id=actor.user_id, limit=limit, offset=offset
+            scope,
+            actor_id=actor.user_id,
+            keyword=query.keyword,
+            sort=sort,
+            limit=query.limit,
+            offset=query.offset,
         )
         # Two bulk lookups for the whole page (was 1+2R: two queries per role).
         role_ids = [role.id for role in roles]
@@ -82,7 +104,7 @@ class RoleService:
             (role, menu_map.get(role.id, []), dept_map.get(role.id, []))
             for role in roles
         ]
-        return page_result(items, total=total, limit=limit, offset=offset)
+        return page_result(items, total=total, limit=query.limit, offset=query.offset)
 
     async def get_role(self, role_id: int, actor: AuthenticatedUser) -> RoleDetail:
         return await self._detail(await self._require_visible(role_id, actor))
@@ -151,3 +173,23 @@ class RoleService:
         role.updated_by = actor.user_id
         await self.repo.soft_delete(role)
         await self.session.commit()
+
+    async def batch_delete_roles(
+        self, ids: Sequence[int], *, actor: AuthenticatedUser
+    ) -> BatchResult:
+        requested_ids = list(dict.fromkeys(ids))
+        scope = await self._scope(actor)
+        affected, skipped_ids = await self.repo.soft_delete_many(
+            requested_ids,
+            scope_predicate=self.repo._scope_predicate(scope, actor_id=actor.user_id),
+        )
+        skipped = set(skipped_ids)
+        for role_id in requested_ids:
+            if role_id not in skipped:
+                await self.repo.replace_menus(role_id, [])
+                await self.repo.replace_depts(role_id, [])
+                await self.repo.delete_user_links(role_id)
+        await self.session.commit()
+        return BatchResult.of(
+            requested=len(requested_ids), affected=affected, skipped=skipped_ids
+        )

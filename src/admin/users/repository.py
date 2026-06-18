@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
 
 from src.auth.service import DataScopeFilter
@@ -21,6 +22,19 @@ from src.db.repository import BaseRepository
 
 class UserRepository(BaseRepository[User]):
     model = User
+
+    def _keyword_predicate(self, keyword: str | None) -> ColumnElement[bool] | None:
+        if keyword is None:
+            return None
+        normalized = keyword.strip().lower()
+        if not normalized:
+            return None
+        pattern = f"%{normalized}%"
+        return or_(
+            func.lower(User.username).like(pattern),
+            func.lower(User.employee_no).like(pattern),
+            func.lower(User.real_name).like(pattern),
+        )
 
     async def get_by_username(self, username: str) -> User | None:
         """Non-deleted user by username (uniqueness guard; any status)."""
@@ -53,6 +67,8 @@ class UserRepository(BaseRepository[User]):
         scope: DataScopeFilter,
         *,
         actor_id: int,
+        keyword: str | None = None,
+        sort: tuple[InstrumentedAttribute[object], bool] | None = None,
         limit: int | None = None,
         offset: int | None = None,
     ) -> Sequence[User]:
@@ -61,7 +77,14 @@ class UserRepository(BaseRepository[User]):
         predicate = self._scope_predicate(scope, actor_id=actor_id)
         if predicate is not None:
             stmt = stmt.where(predicate)
-        stmt = stmt.order_by(User.id)
+        keyword_predicate = self._keyword_predicate(keyword)
+        if keyword_predicate is not None:
+            stmt = stmt.where(keyword_predicate)
+        if sort is None:
+            stmt = stmt.order_by(User.id)
+        else:
+            sort_column, descending = sort
+            stmt = stmt.order_by(sort_column.desc() if descending else sort_column.asc())
         if offset is not None:
             stmt = stmt.offset(offset)
         if limit is not None:
@@ -74,12 +97,16 @@ class UserRepository(BaseRepository[User]):
         scope: DataScopeFilter,
         *,
         actor_id: int,
+        keyword: str | None = None,
     ) -> int:
         """Count non-deleted users visible under the data scope."""
         stmt = select(func.count()).select_from(User).where(User.is_deleted.is_(False))
         predicate = self._scope_predicate(scope, actor_id=actor_id)
         if predicate is not None:
             stmt = stmt.where(predicate)
+        keyword_predicate = self._keyword_predicate(keyword)
+        if keyword_predicate is not None:
+            stmt = stmt.where(keyword_predicate)
         total = await self.session.scalar(stmt)
         return int(total or 0)
 

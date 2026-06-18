@@ -18,6 +18,7 @@ from src.admin.users.schemas import UserCreate, UserUpdate
 from src.admin.users.service import UserService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
+from src.core.query import ListQuery
 from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
 from src.enums import UserStatus
 from src.exceptions import AppError
@@ -302,7 +303,7 @@ async def test_list_users_bulk_roles(admin_session: AsyncSession) -> None:
         UserCreate(username="a", employee_no="E-a", role_ids=[role.id]), _superuser()
     )
     await svc.create_user(UserCreate(username="b", employee_no="E-b"), _superuser())
-    listing = await svc.list_users(_superuser(), limit=50, offset=0)
+    listing = await svc.list_users(_superuser(), query=ListQuery(limit=50, offset=0))
     by_name = {u.username: roles for u, roles in listing.items}
     assert listing.total == 2
     assert by_name["a"] == [role.id]

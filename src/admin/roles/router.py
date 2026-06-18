@@ -7,7 +7,7 @@ permission. The service returns a ``(role, menu_ids, dept_ids)`` tuple which
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,7 @@ from src.admin.roles.service import RoleDetail, RoleService
 from src.auth.dependencies import RequiredPerms, TraceId
 from src.auth.service import AuthenticatedUser
 from src.core.pagination import Page, page
+from src.core.query import BatchIdsRequest, BatchResult, ListQuery
 from src.db.session import get_session
 from src.responses import SuccessEnvelope, success
 
@@ -45,10 +46,20 @@ async def list_roles(
     service: ServiceDep,
     trace_id: TraceId,
     user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:role:list"))],
+    keyword: str | None = None,
+    sort_by: str | None = None,
+    sort_order: Literal["asc", "desc"] = "asc",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> SuccessEnvelope[Page[RoleRead]]:
-    result = await service.list_roles(user, limit=limit, offset=offset)
+    query = ListQuery(
+        keyword=keyword,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        limit=limit,
+        offset=offset,
+    )
+    result = await service.list_roles(user, query=query)
     return success(
         page(
             [_to_read(d) for d in result.items],
@@ -69,6 +80,19 @@ async def create_role(
 ) -> SuccessEnvelope[RoleRead]:
     detail = await service.create_role(payload, actor=user)
     return success(_to_read(detail), trace_id=trace_id)
+
+
+@router.post("/batch-delete", response_model=SuccessEnvelope[BatchResult])
+async def batch_delete_roles(
+    payload: BatchIdsRequest,
+    service: ServiceDep,
+    trace_id: TraceId,
+    user: Annotated[
+        AuthenticatedUser, Depends(RequiredPerms("system:role:remove"))
+    ],
+) -> SuccessEnvelope[BatchResult]:
+    result = await service.batch_delete_roles(payload.ids, actor=user)
+    return success(result, trace_id=trace_id)
 
 
 @router.put("/{role_id}", response_model=SuccessEnvelope[RoleRead])

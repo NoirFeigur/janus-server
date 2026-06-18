@@ -10,6 +10,7 @@ from starlette import status
 from src.admin.menus.repository import MenuRepository
 from src.admin.menus.schemas import MenuCreate, MenuUpdate
 from src.auth.service import AuthenticatedUser
+from src.core.query import BatchResult
 from src.db.models.identity import Menu
 from src.enums import ErrorCode, MenuType
 from src.exceptions import AppError
@@ -20,8 +21,43 @@ class MenuService:
         self.session = session
         self.repo = MenuRepository(session)
 
-    async def list_menus(self) -> Sequence[Menu]:
-        return await self.repo.list_all()
+    async def list_menus(self, *, keyword: str | None = None) -> Sequence[Menu]:
+        all_menus = await self.repo.list_all()
+        normalized_keyword = keyword.strip().lower() if keyword is not None else ""
+        if not normalized_keyword:
+            return all_menus
+        return self._filter_with_ancestors(all_menus, normalized_keyword)
+
+    def _filter_with_ancestors(
+        self, all_menus: Sequence[Menu], keyword: str
+    ) -> list[Menu]:
+        menus_by_id = {menu.id: menu for menu in all_menus}
+        included_ids: set[int] = set()
+
+        for menu in all_menus:
+            if not self._matches_keyword(menu, keyword):
+                continue
+            included_ids.add(menu.id)
+            cursor = menu
+            seen_ids = {menu.id}
+            while cursor.parent_id is not None:
+                if cursor.parent_id in seen_ids:
+                    break
+                seen_ids.add(cursor.parent_id)
+                parent = menus_by_id.get(cursor.parent_id)
+                if parent is None:
+                    break
+                included_ids.add(parent.id)
+                cursor = parent
+
+        return [menu for menu in all_menus if menu.id in included_ids]
+
+    def _matches_keyword(self, menu: Menu, keyword: str) -> bool:
+        return any(
+            keyword in value.lower()
+            for value in (menu.name, menu.perms, menu.path)
+            if value is not None
+        )
 
     async def list_current_user_menus(self, user: AuthenticatedUser) -> Sequence[Menu]:
         return await self.repo.list_active_visible_for_user(
@@ -123,3 +159,27 @@ class MenuService:
         menu.updated_by = actor.user_id
         await self.repo.soft_delete(menu)
         await self.session.commit()
+
+    async def batch_delete_menus(
+        self, ids: Sequence[int], *, actor: AuthenticatedUser
+    ) -> BatchResult:
+        requested_ids = list(dict.fromkeys(ids))
+        affected = 0
+        skipped_ids: list[int] = []
+        for menu_id in requested_ids:
+            menu = await self.repo.get(menu_id)
+            if menu is None:
+                skipped_ids.append(menu_id)
+                continue
+            if await self.repo.has_children(menu_id) or await self.repo.is_role_granted(
+                menu_id
+            ):
+                skipped_ids.append(menu_id)
+                continue
+            menu.updated_by = actor.user_id
+            await self.repo.soft_delete(menu)
+            affected += 1
+        await self.session.commit()
+        return BatchResult.of(
+            requested=len(requested_ids), affected=affected, skipped=skipped_ids
+        )

@@ -13,10 +13,11 @@ Discipline:
 
 from __future__ import annotations
 
+import builtins
 from collections.abc import Sequence
 from typing import Any, Generic, TypeVar
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.base import BaseEntity
@@ -76,3 +77,39 @@ class BaseRepository(Generic[Model]):
         instance.is_deleted = True
         await self.session.flush()
         return instance
+
+    async def soft_delete_many(
+        self,
+        ids: Sequence[int],
+        *,
+        scope_predicate: ColumnElement[bool] | None = None,
+    ) -> tuple[int, builtins.list[int]]:
+        """Soft-delete rows whose id is in ``ids`` and visible under scope.
+
+        ``scope_predicate`` of ``None`` means unrestricted. Already-deleted rows
+        are not re-counted. Returns ``(affected_count, skipped_ids)`` where
+        ``skipped_ids`` are requested ids that were not soft-deleted.
+        """
+        requested_ids = list(dict.fromkeys(ids))
+        if not requested_ids:
+            return 0, []
+
+        stmt = select(self.model.id).where(
+            self.model.id.in_(requested_ids),
+            self.model.is_deleted.is_(False),
+        )
+        if scope_predicate is not None:
+            stmt = stmt.where(scope_predicate)
+
+        affected_ids = list(await self.session.scalars(stmt))
+        affected_id_set = set(affected_ids)
+        if affected_ids:
+            await self.session.execute(
+                update(self.model)
+                .where(self.model.id.in_(affected_ids))
+                .values(is_deleted=True)
+            )
+            await self.session.flush()
+
+        skipped_ids = sorted(id_ for id_ in requested_ids if id_ not in affected_id_set)
+        return len(affected_id_set), skipped_ids

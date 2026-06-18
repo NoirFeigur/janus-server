@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
 from src.db.models.identity import Menu, Role, RoleMenu, UserRole
 from tests.admin.conftest import ADMIN_ID, AdminCtx
@@ -33,6 +34,174 @@ async def test_create_update_and_list_menu(admin_ctx: AdminCtx) -> None:
     listing = await admin_ctx.client.get("/admin/menus")
     names = [item["name"] for item in listing.json()["data"]]
     assert "menu.system.updated" in names
+
+
+async def test_list_menus_keyword_includes_matched_and_ancestors(
+    admin_ctx: AdminCtx,
+) -> None:
+    root = Menu(name="menu.root", menu_type="catalog", sort_order=1)
+    unrelated = Menu(name="menu.unrelated", menu_type="menu", sort_order=2)
+    admin_ctx.session.add_all([root, unrelated])
+    await admin_ctx.session.flush()
+    parent = Menu(
+        name="menu.parent",
+        menu_type="menu",
+        parent_id=root.id,
+        sort_order=3,
+    )
+    sibling = Menu(
+        name="menu.sibling",
+        menu_type="menu",
+        parent_id=root.id,
+        sort_order=4,
+    )
+    admin_ctx.session.add_all([parent, sibling])
+    await admin_ctx.session.flush()
+    leaf = Menu(
+        name="Leaf Keyword Only",
+        menu_type="menu",
+        parent_id=parent.id,
+        sort_order=5,
+    )
+    admin_ctx.session.add(leaf)
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.get("/admin/menus?keyword=keyword")
+    assert resp.status_code == 200, resp.text
+    names = [item["name"] for item in resp.json()["data"]]
+    assert names == ["menu.root", "menu.parent", "Leaf Keyword Only"]
+
+
+async def test_list_menus_keyword_matches_perms_or_path(admin_ctx: AdminCtx) -> None:
+    root = Menu(name="menu.settings", menu_type="catalog", sort_order=1)
+    admin_ctx.session.add(root)
+    await admin_ctx.session.flush()
+    button = Menu(
+        name="button.audit",
+        menu_type="button",
+        parent_id=root.id,
+        perms="system:audit:export",
+        sort_order=2,
+    )
+    route = Menu(
+        name="menu.logs",
+        menu_type="menu",
+        parent_id=root.id,
+        path="/admin/logs/special-path",
+        sort_order=3,
+    )
+    unrelated = Menu(name="menu.other", menu_type="menu", sort_order=4)
+    admin_ctx.session.add_all([button, route, unrelated])
+    await admin_ctx.session.commit()
+
+    perms_resp = await admin_ctx.client.get("/admin/menus?keyword=AUDIT")
+    assert perms_resp.status_code == 200, perms_resp.text
+    assert [item["name"] for item in perms_resp.json()["data"]] == [
+        "menu.settings",
+        "button.audit",
+    ]
+
+    path_resp = await admin_ctx.client.get("/admin/menus?keyword=special-path")
+    assert path_resp.status_code == 200, path_resp.text
+    assert [item["name"] for item in path_resp.json()["data"]] == [
+        "menu.settings",
+        "menu.logs",
+    ]
+
+
+async def test_list_menus_no_keyword_returns_full_tree(admin_ctx: AdminCtx) -> None:
+    root = Menu(name="menu.full.root", menu_type="catalog", sort_order=1)
+    sibling = Menu(name="menu.full.sibling", menu_type="menu", sort_order=2)
+    admin_ctx.session.add_all([root, sibling])
+    await admin_ctx.session.flush()
+    child = Menu(
+        name="menu.full.child",
+        menu_type="menu",
+        parent_id=root.id,
+        sort_order=3,
+    )
+    admin_ctx.session.add(child)
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.get("/admin/menus")
+    assert resp.status_code == 200, resp.text
+    names = [item["name"] for item in resp.json()["data"]]
+    assert names == ["menu.full.root", "menu.full.sibling", "menu.full.child"]
+
+
+async def test_batch_delete_menus_skips_nodes_with_children(admin_ctx: AdminCtx) -> None:
+    parent = Menu(name="menu.batch.parent", menu_type="catalog", sort_order=1)
+    leaf = Menu(name="menu.batch.leaf", menu_type="menu", sort_order=2)
+    admin_ctx.session.add_all([parent, leaf])
+    await admin_ctx.session.flush()
+    child = Menu(
+        name="menu.batch.child",
+        menu_type="menu",
+        parent_id=parent.id,
+        sort_order=3,
+    )
+    admin_ctx.session.add(child)
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.post(
+        "/admin/menus/batch-delete",
+        json={"ids": [str(parent.id), str(leaf.id)]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == {
+        "requested": 2,
+        "affected": 1,
+        "skipped_ids": [str(parent.id)],
+    }
+
+    await admin_ctx.session.refresh(parent)
+    await admin_ctx.session.refresh(leaf)
+    assert parent.is_deleted is False
+    assert leaf.is_deleted is True
+
+
+async def test_batch_delete_menus_skips_role_granted(admin_ctx: AdminCtx) -> None:
+    granted = Menu(
+        name="button.batch.granted",
+        menu_type="button",
+        perms="system:batch:granted",
+        sort_order=1,
+    )
+    role = Role(name="menu-batch-grant", code="menu-batch-grant", data_scope="self")
+    admin_ctx.session.add_all([granted, role])
+    await admin_ctx.session.flush()
+    admin_ctx.session.add(RoleMenu(role_id=role.id, menu_id=granted.id))
+    await admin_ctx.session.commit()
+
+    resp = await admin_ctx.client.post(
+        "/admin/menus/batch-delete", json={"ids": [str(granted.id)]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == {
+        "requested": 1,
+        "affected": 0,
+        "skipped_ids": [str(granted.id)],
+    }
+
+    await admin_ctx.session.refresh(granted)
+    assert granted.is_deleted is False
+
+
+async def test_batch_delete_menus_skips_nonexistent(admin_ctx: AdminCtx) -> None:
+    missing_id = 9_999_999
+
+    resp = await admin_ctx.client.post(
+        "/admin/menus/batch-delete", json={"ids": [str(missing_id)]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == {
+        "requested": 1,
+        "affected": 0,
+        "skipped_ids": [str(missing_id)],
+    }
+
+    rows = await admin_ctx.session.scalars(select(Menu.id))
+    assert missing_id not in set(rows.all())
 
 
 async def test_button_requires_permission_code(admin_ctx: AdminCtx) -> None:

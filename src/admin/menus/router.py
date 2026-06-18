@@ -11,6 +11,7 @@ from src.admin.menus.schemas import MenuCreate, MenuRead, MenuUpdate
 from src.admin.menus.service import MenuService
 from src.auth.dependencies import CurrentJwtUser, RequiredPerms, TraceId
 from src.auth.service import AuthenticatedUser
+from src.core.query import BatchIdsRequest, BatchResult
 from src.db.models.identity import Menu
 from src.db.session import get_session
 from src.responses import SuccessEnvelope, success
@@ -36,8 +37,9 @@ async def list_menus(
     service: ServiceDep,
     trace_id: TraceId,
     _: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:menu:list"))],
+    keyword: str | None = None,
 ) -> SuccessEnvelope[list[MenuRead]]:
-    menus = await service.list_menus()
+    menus = await service.list_menus(keyword=keyword)
     return success([_to_read(m) for m in menus], trace_id=trace_id)
 
 
@@ -60,6 +62,19 @@ async def create_menu(
 ) -> SuccessEnvelope[MenuRead]:
     menu = await service.create_menu(payload, actor=user)
     return success(_to_read(menu), trace_id=trace_id)
+
+
+@router.post("/batch-delete", response_model=SuccessEnvelope[BatchResult])
+async def batch_delete_menus(
+    payload: BatchIdsRequest,
+    service: ServiceDep,
+    trace_id: TraceId,
+    user: Annotated[
+        AuthenticatedUser, Depends(RequiredPerms("system:menu:remove"))
+    ],
+) -> SuccessEnvelope[BatchResult]:
+    result = await service.batch_delete_menus(payload.ids, actor=user)
+    return success(result, trace_id=trace_id)
 
 
 @router.put("/{menu_id}", response_model=SuccessEnvelope[MenuRead])

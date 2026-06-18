@@ -10,8 +10,10 @@ from fastapi import FastAPI, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.auth.middleware import AuthMiddleware
-from src.core.security import generate_api_key
+from src.auth.service import AuthService
+from src.core.security import generate_api_key, hash_password
 from src.db.base import Base
+from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
 
@@ -19,7 +21,7 @@ pytestmark = pytest.mark.asyncio
 
 _TABLES = [
     Base.metadata.tables[m.__tablename__]
-    for m in (User, Department, Role, Menu, UserRole, RoleMenu, RoleDept, ApiKey)
+    for m in (User, Department, Role, Menu, UserRole, RoleMenu, RoleDept, ApiKey, LoginLog)
 ]
 
 
@@ -154,3 +156,56 @@ async def test_resource_management_paths_reject_sk_key(
             resp = await client.get(path, headers={"Authorization": "Bearer sk-test"})
             assert resp.status_code == 401
             assert resp.json()["code"] == "auth.invalid_token"
+
+
+async def test_revoked_session_rejected_through_middleware(
+    sqlite_engine,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end via the real AuthMiddleware: a logged-in token works, then after
+    logout the same token is rejected with ``auth.token_revoked`` (the allowlist
+    revocation check fires in the middleware, not just the service)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from pydantic import SecretStr
+
+    from src.config import get_settings
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("utf-8")
+    settings = get_settings()
+    monkeypatch.setattr(settings, "platform_jwt_private_key", SecretStr(priv_pem))
+    monkeypatch.setattr(settings, "platform_jwt_public_key", None)
+
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_TABLES)
+        )
+    async for client, session in _client(sqlite_session_factory):
+        session.add(
+            User(
+                username="alice",
+                employee_no="E-1",
+                status="active",
+                password=hash_password("secret123"),
+            )
+        )
+        await session.commit()
+
+        service = AuthService(session)
+        token, _, _ = await service.authenticate_password("alice", "secret123")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        ok = await client.get("/admin/ping", headers=headers)
+        assert ok.status_code == 200
+
+        await service.logout(token)
+
+        revoked = await client.get("/admin/ping", headers=headers)
+        assert revoked.status_code == 401
+        assert revoked.json()["code"] == "auth.token_revoked"

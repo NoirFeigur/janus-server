@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from src.admin.audit.middleware import AdminAuditMiddleware
 from src.admin.router import router as admin_router
 from src.auth.middleware import AuthMiddleware
 from src.auth.router import router as auth_router
@@ -58,6 +59,11 @@ def create_app() -> FastAPI:
     app.state.session_factory = async_session_factory
     app.state.api_prefix = settings.api_prefix
 
+    # add_middleware 是 LIFO 包裹:后加的在外层。入站执行序需为
+    # Locale → TraceId → Auth → AdminAudit → route,故按相反顺序添加
+    # (AdminAudit 最先加 = 最内层,在 Auth 之后、路由之前运行,此时
+    # request.state.user / trace_id 均已就绪)。
+    app.add_middleware(AdminAuditMiddleware)
     app.add_middleware(AuthMiddleware)
     app.add_middleware(TraceIdMiddleware)
     app.add_middleware(LocaleMiddleware)

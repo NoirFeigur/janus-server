@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
 
 from src.auth.service import DataScopeFilter
@@ -20,6 +21,18 @@ from src.db.repository import BaseRepository
 
 class RoleRepository(BaseRepository[Role]):
     model = Role
+
+    def _keyword_predicate(self, keyword: str | None) -> ColumnElement[bool] | None:
+        if keyword is None:
+            return None
+        normalized = keyword.strip().lower()
+        if not normalized:
+            return None
+        pattern = f"%{normalized}%"
+        return or_(
+            func.lower(Role.name).like(pattern),
+            func.lower(Role.code).like(pattern),
+        )
 
     async def get_by_code(self, code: str) -> Role | None:
         """Active-or-disabled, non-deleted role by unique code (uniqueness guard)."""
@@ -49,6 +62,8 @@ class RoleRepository(BaseRepository[Role]):
         scope: DataScopeFilter,
         *,
         actor_id: int,
+        keyword: str | None = None,
+        sort: tuple[InstrumentedAttribute[object], bool] | None = None,
         limit: int | None = None,
         offset: int | None = None,
     ) -> Sequence[Role]:
@@ -57,7 +72,16 @@ class RoleRepository(BaseRepository[Role]):
         predicate = self._scope_predicate(scope, actor_id=actor_id)
         if predicate is not None:
             stmt = stmt.where(predicate)
-        stmt = stmt.order_by(Role.sort_order, Role.id)
+        keyword_predicate = self._keyword_predicate(keyword)
+        if keyword_predicate is not None:
+            stmt = stmt.where(keyword_predicate)
+        if sort is None:
+            stmt = stmt.order_by(Role.sort_order, Role.id)
+        else:
+            sort_column, descending = sort
+            stmt = stmt.order_by(
+                sort_column.desc() if descending else sort_column.asc(), Role.id
+            )
         if offset is not None:
             stmt = stmt.offset(offset)
         if limit is not None:
@@ -70,12 +94,16 @@ class RoleRepository(BaseRepository[Role]):
         scope: DataScopeFilter,
         *,
         actor_id: int,
+        keyword: str | None = None,
     ) -> int:
         """Count non-deleted roles visible under generic data scope."""
         stmt = select(func.count()).select_from(Role).where(Role.is_deleted.is_(False))
         predicate = self._scope_predicate(scope, actor_id=actor_id)
         if predicate is not None:
             stmt = stmt.where(predicate)
+        keyword_predicate = self._keyword_predicate(keyword)
+        if keyword_predicate is not None:
+            stmt = stmt.where(keyword_predicate)
         total = await self.session.scalar(stmt)
         return int(total or 0)
 

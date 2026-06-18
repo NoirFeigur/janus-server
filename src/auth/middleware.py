@@ -23,6 +23,7 @@ RequestHandler = Callable[[Request], Awaitable[Response]]
 PUBLIC_PATHS = frozenset(
     {
         "/auth/login",
+        "/auth/refresh",
         "/health/live",
         "/health/ready",
         "/docs",

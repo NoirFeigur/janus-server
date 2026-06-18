@@ -29,6 +29,7 @@ from src.core.security import (
     hash_password,
     hash_password_async,
     issue_access_token,
+    password_strength_violations,
     verify_password,
     verify_password_async,
 )
@@ -55,6 +56,38 @@ def test_verify_password_malformed_hash_returns_false() -> None:
 def test_hash_password_is_salted() -> None:
     """同一密码两次哈希应不同(盐随机)。"""
     assert hash_password("same") != hash_password("same")
+
+
+# ---- password strength policy (B7) -----------------------------------------
+
+
+def test_strong_password_has_no_violations() -> None:
+    assert password_strength_violations("new-secret1", min_length=8) == []
+
+
+def test_short_password_flagged_too_short() -> None:
+    assert "too_short" in password_strength_violations("ab1", min_length=8)
+
+
+def test_letterless_password_flagged_no_letter() -> None:
+    assert "no_letter" in password_strength_violations("12345678", min_length=8)
+
+
+def test_digitless_password_flagged_no_digit() -> None:
+    assert "no_digit" in password_strength_violations("abcdefgh", min_length=8)
+
+
+def test_weak_password_can_have_multiple_violations() -> None:
+    """纯短字母串同时触发 too_short + no_digit(违规可累计)。"""
+    violations = password_strength_violations("abc", min_length=8)
+    assert "too_short" in violations
+    assert "no_digit" in violations
+
+
+def test_min_length_is_configurable() -> None:
+    """长度下限随参数变化:同一密码在更高下限下才判 too_short。"""
+    assert password_strength_violations("ab12", min_length=4) == []
+    assert "too_short" in password_strength_violations("ab12", min_length=8)
 
 
 # ---- password (async wrappers + concurrency gate) --------------------------
@@ -145,13 +178,23 @@ def rsa_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[Settings]:
 
 
 def test_issue_then_decode_roundtrip(rsa_settings: Settings) -> None:
-    token, ttl = issue_access_token(user_id=12345)
+    token, ttl, jti = issue_access_token(user_id=12345)
     assert ttl == 3600
     claims = decode_access_token(token)
     assert isinstance(claims, PlatformAccessClaims)
     assert claims.sub == "12345"
     assert claims.token_use == "access"
     assert claims.exp - claims.iat == 3600
+    assert claims.jti == jti  # 返回的 jti 与 token 内 claim 一致
+
+
+def test_issued_tokens_have_unique_jti(rsa_settings: Settings) -> None:
+    """每次签发 jti 必须唯一——会话吊销/登出按 jti 定位单个 token。"""
+    token_a, _, jti_a = issue_access_token(user_id=1)
+    token_b, _, jti_b = issue_access_token(user_id=1)
+    assert jti_a != jti_b
+    assert decode_access_token(token_a).jti == jti_a
+    assert decode_access_token(token_b).jti == jti_b
 
 
 def test_issue_without_private_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,7 +210,13 @@ def test_decode_expired_token_raises(rsa_settings: Settings) -> None:
     assert priv is not None
     now = int(time.time())
     expired = jwt.encode(
-        {"sub": "1", "iat": now - 7200, "exp": now - 3600, "token_use": "access"},
+        {
+            "sub": "1",
+            "jti": "j1",
+            "iat": now - 7200,
+            "exp": now - 3600,
+            "token_use": "access",
+        },
         priv.get_secret_value().replace("\\n", "\n"),
         algorithm="RS256",
     )
@@ -181,7 +230,13 @@ def test_decode_wrong_token_use_raises(rsa_settings: Settings) -> None:
     assert priv is not None
     now = int(time.time())
     refresh_like = jwt.encode(
-        {"sub": "1", "iat": now, "exp": now + 3600, "token_use": "refresh"},
+        {
+            "sub": "1",
+            "jti": "j1",
+            "iat": now,
+            "exp": now + 3600,
+            "token_use": "refresh",
+        },
         priv.get_secret_value().replace("\\n", "\n"),
         algorithm="RS256",
     )
@@ -190,7 +245,7 @@ def test_decode_wrong_token_use_raises(rsa_settings: Settings) -> None:
 
 
 def test_decode_tampered_token_raises(rsa_settings: Settings) -> None:
-    token, _ = issue_access_token(user_id=1)
+    token, _, _ = issue_access_token(user_id=1)
     tampered = token[:-4] + ("AAAA" if not token.endswith("AAAA") else "BBBB")
     with pytest.raises(TokenError):
         decode_access_token(tampered)
@@ -202,7 +257,7 @@ def test_decode_missing_claims_raises(rsa_settings: Settings) -> None:
     assert priv is not None
     now = int(time.time())
     incomplete = jwt.encode(
-        {"iat": now, "exp": now + 3600, "token_use": "access"},  # 缺 sub
+        {"jti": "j1", "iat": now, "exp": now + 3600, "token_use": "access"},  # 缺 sub
         priv.get_secret_value().replace("\\n", "\n"),
         algorithm="RS256",
     )
@@ -221,7 +276,7 @@ def test_decode_rejects_hs256_algorithm_confusion(rsa_settings: Settings) -> Non
     now = int(time.time())
     # validly-signed HS256 with a plain secret; wrong algorithm must still be rejected
     forged = jwt.encode(
-        {"sub": "1", "iat": now, "exp": now + 3600, "token_use": "access"},
+        {"sub": "1", "jti": "j1", "iat": now, "exp": now + 3600, "token_use": "access"},
         "attacker-controlled-secret-padded-to-32-bytes-min",
         algorithm="HS256",
     )
@@ -237,6 +292,7 @@ def test_decode_rejects_extra_claims(rsa_settings: Settings) -> None:
     bloated = jwt.encode(
         {
             "sub": "1",
+            "jti": "j1",
             "iat": now,
             "exp": now + 3600,
             "token_use": "access",
@@ -272,7 +328,7 @@ def test_decode_uses_configured_public_key(
     monkeypatch.setattr(settings, "platform_jwt_public_key", pub_pem)  # 配置公钥分支
     monkeypatch.setattr(settings, "platform_access_token_ttl_seconds", 3600)
 
-    token, _ = issue_access_token(user_id=7)
+    token, _, _ = issue_access_token(user_id=7)
     claims = decode_access_token(token)
     assert claims.sub == "7"
 
@@ -299,7 +355,7 @@ def test_decode_non_dict_payload_raises(
     正常 JWT 规范下 payload 必是对象,pyjwt 也会拦截非对象 payload;这里直接
     打桩 ``jwt.decode`` 返回一个列表,验证服务层的 isinstance 守卫确实生效。
     """
-    token, _ = issue_access_token(user_id=1)
+    token, _, _ = issue_access_token(user_id=1)
     monkeypatch.setattr(
         security.jwt, "decode", lambda *_a, **_k: ["not", "a", "dict"]
     )

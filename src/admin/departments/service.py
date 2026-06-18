@@ -20,6 +20,7 @@ from src.admin.departments.repository import DepartmentRepository
 from src.admin.departments.schemas import DepartmentCreate, DepartmentUpdate
 from src.auth.dept_tree_cache import invalidate_department_tree
 from src.auth.service import AuthenticatedUser
+from src.core.query import BatchResult
 from src.db.models.identity import Department
 from src.enums import ErrorCode
 from src.exceptions import AppError
@@ -40,8 +41,31 @@ class DepartmentService:
         if parent_id is not None and await self.repo.get(parent_id) is None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
-    async def list_departments(self) -> Sequence[Department]:
-        return await self.repo.list_all()
+    async def list_departments(
+        self, *, keyword: str | None = None
+    ) -> Sequence[Department]:
+        departments = await self.repo.list_all()
+        if keyword is None:
+            return departments
+
+        needle = keyword.casefold()
+        all_depts = {dept.id: dept for dept in departments}
+        included_ids: set[int] = set()
+        for dept in departments:
+            if needle not in dept.name.casefold():
+                continue
+
+            cursor: int | None = dept.id
+            seen: set[int] = set()
+            while cursor is not None and cursor not in seen:
+                seen.add(cursor)
+                current = all_depts.get(cursor)
+                if current is None:
+                    break
+                included_ids.add(current.id)
+                cursor = current.parent_id
+
+        return [dept for dept in departments if dept.id in included_ids]
 
     async def get_department(self, dept_id: int) -> Department:
         return await self._require(dept_id)
@@ -87,6 +111,36 @@ class DepartmentService:
         await self.repo.soft_delete(dept)
         await self.session.commit()
         await invalidate_department_tree()
+
+    async def batch_delete_departments(
+        self, ids: Sequence[int], *, actor: AuthenticatedUser
+    ) -> BatchResult:
+        requested_ids = list(dict.fromkeys(ids))
+        skipped_ids: list[int] = []
+        affected = 0
+
+        for dept_id in requested_ids:
+            dept = await self.repo.get(dept_id)
+            if dept is None:
+                skipped_ids.append(dept_id)
+                continue
+            if await self.repo.has_active_children(dept_id):
+                skipped_ids.append(dept_id)
+                continue
+            if await self.repo.has_active_members(dept_id):
+                skipped_ids.append(dept_id)
+                continue
+
+            dept.updated_by = actor.user_id
+            await self.repo.soft_delete(dept)
+            affected += 1
+
+        await self.session.commit()
+        if affected > 0:
+            await invalidate_department_tree()
+        return BatchResult.of(
+            requested=len(requested_ids), affected=affected, skipped=skipped_ids
+        )
 
     async def _validate_reparent(self, dept_id: int, new_parent: int | None) -> None:
         """Reject a parent that doesn't exist, is self, or is a descendant."""
