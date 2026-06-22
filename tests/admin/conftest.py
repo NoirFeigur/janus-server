@@ -23,7 +23,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport
 from pydantic import SecretStr
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.schema import CreateIndex
 
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.dependencies import get_current_jwt_user
@@ -35,6 +38,7 @@ from src.core.session_store import SessionStore
 from src.db.base import Base
 from src.db.models.audit import LoginLog, OperLog
 from src.db.models.credential import ApiKey
+from src.db.models.grant import UserModelGrant
 from src.db.models.identity import (
     Department,
     Menu,
@@ -44,11 +48,31 @@ from src.db.models.identity import (
     User,
     UserRole,
 )
+from src.db.models.model_catalog import (
+    ChannelKey,
+    LogicalModel,
+    ModelDeployment,
+    UpstreamChannel,
+)
+from src.db.models.quota import Quota
 from src.db.models.sys_config import SysConfig
+from src.db.models.usage import UsageRecord
 from src.db.session import get_session
 from src.main import create_app
 
 ADMIN_ID = 1000
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(element: JSONB, compiler, **kw) -> str:
+    return "JSON"
+
+
+@compiles(CreateIndex, "sqlite")
+def _compile_index_for_sqlite(element: CreateIndex, compiler, **kw) -> str:
+    if element.element.name == "uq_grant_one_default":
+        return "SELECT 1"
+    return compiler.visit_create_index(element, **kw)
 
 _TABLES = [
     Base.metadata.tables[m.__tablename__]
@@ -61,6 +85,13 @@ _TABLES = [
         RoleMenu,
         RoleDept,
         ApiKey,
+        UpstreamChannel,
+        ChannelKey,
+        LogicalModel,
+        ModelDeployment,
+        UserModelGrant,
+        Quota,
+        UsageRecord,
         OperLog,
         LoginLog,
         SysConfig,

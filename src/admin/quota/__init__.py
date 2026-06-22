@@ -1,0 +1,1 @@
+"""Admin quota rule management."""
