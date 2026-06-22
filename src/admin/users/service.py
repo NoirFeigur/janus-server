@@ -117,7 +117,11 @@ class UserService:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
     async def _require_assignable_roles(
-        self, role_ids: Sequence[int], actor: AuthenticatedUser
+        self,
+        role_ids: Sequence[int],
+        actor: AuthenticatedUser,
+        *,
+        holder_department_id: int | None,
     ) -> None:
         """Privilege-escalation guard for role assignment (three layers).
 
@@ -131,10 +135,14 @@ class UserService:
            check is blind to: ``is_superuser`` is *code*-based, so a ``superadmin``
            role with no menus confers an EMPTY perm set that trivially passes the
            subset test — yet assigning it would hand out full super-admin.
-        3. **Data-scope breadth** — the role's visibility may not exceed the
-           actor's own (``all`` is refused outright; ``custom`` depts must fall
-           within the actor's visible department set). A perms-light, scope-heavy
-           role (e.g. ``all``-scope with zero menus) otherwise slips through.
+        3. **Data-scope breadth** — the visibility the role would confer on the
+           eventual holder (resolved against ``holder_department_id``) must not
+           exceed the actor's own. ``all`` is refused outright; every other scope
+           is resolved to a concrete department set and required to fall within
+           the actor's visible set. A relative scope like ``dept_and_child`` is
+           NOT waved through: for the holder's department it can resolve to a
+           strictly broader subtree than the actor can see, which is the
+           escalation this guard closes.
         """
         if actor.is_superuser or not role_ids:
             return
@@ -145,32 +153,47 @@ class UserService:
         roles = await self.auth.roles_for_assignment(role_ids)
         if any(role.code == SUPERADMIN_ROLE_CODE for role in roles):
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-        await self._require_roles_within_scope(roles, actor)
+        await self._require_roles_within_scope(
+            roles, actor, holder_department_id=holder_department_id
+        )
 
     async def _require_roles_within_scope(
-        self, roles: Sequence[Role], actor: AuthenticatedUser
+        self,
+        roles: Sequence[Role],
+        actor: AuthenticatedUser,
+        *,
+        holder_department_id: int | None,
     ) -> None:
-        """Reject assigning any role whose data scope exceeds the actor's own.
+        """Reject assigning any role whose resolved scope exceeds the actor's own.
 
         An unrestricted actor (super-admin or an ``all``-scope role) may assign
-        any scope. A scoped actor may not assign a role that is ``all`` (strictly
-        broader than the actor) nor a ``custom`` role whose granted departments
-        leak outside the actor's visible set. Relative scopes (``dept`` /
-        ``dept_and_child`` / ``self`` / ``dept_and_child_or_self``) are bounded by
-        the eventual holder's own position, so they confer no breadth the actor
-        lacks and are allowed.
+        any scope. For a scoped actor, each role's effective visibility is
+        resolved against the eventual holder's department: ``all`` is broader than
+        the actor and refused; every other scope resolves to a concrete department
+        set (``self_only`` resolves to none) that must be a subset of the actor's
+        own. This is what makes ``dept_and_child`` safe ONLY when the holder's
+        subtree already lies inside the actor's scope — a ``dept_only`` actor
+        granting ``dept_and_child`` to a holder in its department is rejected
+        because the holder's subtree reaches child departments the actor cannot
+        see.
         """
         actor_scope = await self._scope(actor)
         if actor_scope.unrestricted:
             return
-        if any(role.data_scope == DataScope.all_data.value for role in roles):
-            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-        custom_role_ids = [
-            role.id for role in roles if role.data_scope == DataScope.custom.value
-        ]
-        if custom_role_ids:
-            granted = await self.auth.role_department_ids(custom_role_ids)
-            if not granted.issubset(actor_scope.department_ids):
+        custom_dept_ids = await self.auth.role_department_ids(
+            [role.id for role in roles if role.data_scope == DataScope.custom.value]
+        )
+        for role in roles:
+            granted = await self.auth.resolve_role_scope(
+                DataScope(role.data_scope),
+                list(custom_dept_ids)
+                if role.data_scope == DataScope.custom.value
+                else [],
+                holder_department_id=holder_department_id,
+            )
+            if granted.unrestricted or not granted.department_ids.issubset(
+                actor_scope.department_ids
+            ):
                 raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
     async def _require_dominance(
@@ -196,10 +219,16 @@ class UserService:
         if actor.is_superuser:
             return
         target_role_ids = await self.repo.list_role_ids(target.id)
-        await self._require_assignable_roles(target_role_ids, actor)
+        await self._require_assignable_roles(
+            target_role_ids, actor, holder_department_id=target.department_id
+        )
 
     async def _dominates_roles(
-        self, role_ids: Sequence[int], actor: AuthenticatedUser
+        self,
+        role_ids: Sequence[int],
+        actor: AuthenticatedUser,
+        *,
+        holder_department_id: int | None,
     ) -> bool:
         """Boolean form of :meth:`_require_dominance` for bulk pre-filtering.
 
@@ -211,7 +240,9 @@ class UserService:
         if actor.is_superuser or not role_ids:
             return True
         try:
-            await self._require_assignable_roles(role_ids, actor)
+            await self._require_assignable_roles(
+                role_ids, actor, holder_department_id=holder_department_id
+            )
         except AppError:
             return False
         return True
@@ -284,7 +315,9 @@ class UserService:
         await self._validate_department(payload.department_id)
         await self._require_department_in_scope(payload.department_id, actor)
         await self._validate_roles(payload.role_ids)
-        await self._require_assignable_roles(payload.role_ids, actor)
+        await self._require_assignable_roles(
+            payload.role_ids, actor, holder_department_id=payload.department_id
+        )
         if payload.password is not None:
             self._require_password_strength(payload.password)
         password_hash = (
@@ -331,7 +364,13 @@ class UserService:
 
         if payload.role_ids is not None:
             await self._validate_roles(payload.role_ids)
-            await self._require_assignable_roles(payload.role_ids, actor)
+            # Resolve the role guard against the holder's department AFTER this
+            # update — moving a user into a child dept while granting a relative
+            # scope would otherwise be evaluated against the stale old dept.
+            new_department_id = values.get("department_id", user.department_id)
+            await self._require_assignable_roles(
+                payload.role_ids, actor, holder_department_id=new_department_id
+            )
             await self.repo.replace_roles(user_id, payload.role_ids)
 
         # A role-binding or status change alters this user's cached permission
@@ -428,9 +467,14 @@ class UserService:
         deletable_ids = requested_ids
         if not actor.is_superuser:
             role_map = await self.repo.list_role_ids_for_users(requested_ids)
+            dept_map = await self.repo.department_ids_for_users(requested_ids)
             deletable_ids = []
             for user_id in requested_ids:
-                if await self._dominates_roles(role_map.get(user_id, []), actor):
+                if await self._dominates_roles(
+                    role_map.get(user_id, []),
+                    actor,
+                    holder_department_id=dept_map.get(user_id),
+                ):
                     deletable_ids.append(user_id)
                 else:
                     dominance_skipped.append(user_id)

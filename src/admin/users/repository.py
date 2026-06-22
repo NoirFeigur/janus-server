@@ -132,6 +132,21 @@ class UserRepository(BaseRepository[User]):
         result = await self.session.scalars(stmt)
         return list(result.all())
 
+    async def department_ids_for_users(
+        self, user_ids: Sequence[int]
+    ) -> dict[int, int | None]:
+        """Map ``user_id -> department_id`` for many users in one query.
+
+        Used by the batch-dominance pre-filter to resolve each target's relative
+        role scope against its OWN department (not the actor's). Absent ids are
+        defaulted by the caller's ``.get``.
+        """
+        if not user_ids:
+            return {}
+        stmt = select(User.id, User.department_id).where(User.id.in_(user_ids))
+        result = await self.session.execute(stmt)
+        return {user_id: department_id for user_id, department_id in result.all()}
+
     async def list_role_ids_for_users(
         self, user_ids: Sequence[int]
     ) -> dict[int, list[int]]:

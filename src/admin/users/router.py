@@ -87,7 +87,10 @@ async def create_user(
     user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:user:add"))],
 ) -> SuccessEnvelope[UserRead]:
     detail = await service.create_user(payload, user)
-    return success(_to_read(detail), trace_id=trace_id)
+    return success(
+        mask_fields(_to_read(detail), actor=user, sensitive=("mobile", "email")),
+        trace_id=trace_id,
+    )
 
 
 @router.post("/batch-delete", response_model=SuccessEnvelope[BatchResult])
@@ -112,7 +115,10 @@ async def update_user(
     user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:user:edit"))],
 ) -> SuccessEnvelope[UserRead]:
     detail = await service.update_user(user_id, payload, user)
-    return success(_to_read(detail), trace_id=trace_id)
+    return success(
+        mask_fields(_to_read(detail), actor=user, sensitive=("mobile", "email")),
+        trace_id=trace_id,
+    )
 
 
 @router.post("/{user_id}/reset-password", response_model=SuccessEnvelope[None])

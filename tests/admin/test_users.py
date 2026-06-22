@@ -254,6 +254,65 @@ async def test_list_users_masks_pii_for_non_superuser(admin_ctx: AdminCtx) -> No
     assert listed["email"] == expected.email
 
 
+async def test_create_user_readback_masks_pii_for_non_superuser(
+    admin_ctx: AdminCtx,
+) -> None:
+    """A scoped (non-super) creator must see masked contacts in the readback too,
+    exactly like the list endpoint — not unmasked raw email/mobile."""
+    admin_ctx.session.add(Department(id=2160, name="d2160", parent_id=None))
+    await admin_ctx.session.commit()
+    await _set_dept_scoped_actor(
+        admin_ctx, department_id=2160, perms={"system:user:add"}
+    )
+
+    resp = await admin_ctx.client.post(
+        "/admin/users",
+        json={
+            "username": "create-mask",
+            "employee_no": "E-2160",
+            "department_id": "2160",
+            "email": "alice@example.com",
+            "mobile": "13800001111",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["email"] == "a***@example.com"
+    assert data["mobile"] == "138****1111"
+
+
+async def test_update_user_readback_masks_pii_for_non_superuser(
+    admin_ctx: AdminCtx,
+) -> None:
+    """The update readback must mask contacts for a scoped editor — a no-op edit
+    must not leak unmasked email/mobile of a visible user."""
+    admin_ctx.session.add_all(
+        [
+            Department(id=2170, name="d2170", parent_id=None),
+            User(
+                id=2171,
+                username="upd-mask",
+                employee_no="E-2171",
+                department_id=2170,
+                email="bob@example.com",
+                mobile="13900002222",
+            ),
+        ]
+    )
+    await admin_ctx.session.commit()
+    await _set_dept_scoped_actor(
+        admin_ctx, department_id=2170, perms={"system:user:edit"}
+    )
+
+    resp = await admin_ctx.client.put(
+        "/admin/users/2171", json={"real_name": "Bob R."}
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["email"] == "b***@example.com"
+    assert data["mobile"] == "139****2222"
+
+
 async def test_list_users_superuser_sees_unmasked_pii(admin_ctx: AdminCtx) -> None:
     created = await admin_ctx.client.post(
         "/admin/users",

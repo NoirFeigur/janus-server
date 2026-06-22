@@ -615,6 +615,60 @@ class AuthService:
         """Custom-scope department ids granted to a set of roles (scope guard)."""
         return await self.repo.list_role_department_ids(role_ids)
 
+    async def resolve_role_scope(
+        self,
+        data_scope: DataScope,
+        dept_ids: Sequence[int],
+        *,
+        holder_department_id: int | None,
+    ) -> DataScopeFilter:
+        """Resolve the department visibility a single role confers on a holder.
+
+        The privilege-escalation guards use this to compare a *prospective*
+        grant against the actor's own scope: a scoped actor may assign/mint a
+        role only if the visibility it would confer on the eventual holder is a
+        subset of the actor's own ``department_ids``. This is the piece the old
+        guards got wrong — they waved relative scopes through as "bounded by the
+        holder", but for the SAME holder ``dept_and_child`` resolves to a strictly
+        broader set than ``dept_only``, so an actor minting/assigning the wider
+        relative scope gains breadth it never had.
+
+        Resolution mirrors :meth:`_accumulate_scope` for one role: ``all`` is
+        unrestricted; ``custom`` grants the explicit dept set; ``dept_only`` =
+        ``{holder_dept}``; ``dept_and_child`` / ``dept_and_child_or_self`` =
+        subtree(holder_dept); ``self_only`` confers NO department visibility (only
+        the self flag), so it is always within any actor's scope.
+        """
+        if data_scope == DataScope.all_data:
+            return DataScopeFilter(
+                unrestricted=True, department_ids=frozenset(), include_self=False
+            )
+        department_ids: set[int] = set()
+        include_self = False
+        if data_scope == DataScope.custom:
+            department_ids |= set(dept_ids)
+        elif data_scope == DataScope.dept_only:
+            if holder_department_id is not None:
+                department_ids.add(holder_department_id)
+        elif data_scope == DataScope.dept_and_child:
+            if holder_department_id is not None:
+                department_ids |= _collect_subtree(
+                    {holder_department_id}, await self._load_dept_tree()
+                )
+        elif data_scope == DataScope.self_only:
+            include_self = True
+        elif data_scope == DataScope.dept_and_child_or_self:
+            if holder_department_id is not None:
+                department_ids |= _collect_subtree(
+                    {holder_department_id}, await self._load_dept_tree()
+                )
+            include_self = True
+        return DataScopeFilter(
+            unrestricted=False,
+            department_ids=frozenset(department_ids),
+            include_self=include_self,
+        )
+
     async def resolve_data_scope(self, user: AuthenticatedUser) -> DataScopeFilter:
         """Resolve the user's effective data scope (broadest role wins).
 

@@ -29,6 +29,10 @@ class OnlineSessionRepository:
         """
         if not user_ids:
             return {}
-        stmt = select(User.id, User.username).where(User.id.in_(set(user_ids)))
+        stmt = (
+            select(User.id, User.username)
+            .where(User.id.in_(set(user_ids)))
+            .where(User.is_deleted.is_(False))
+        )
         result = await self.session.execute(stmt)
         return {user_id: username for user_id, username in result.all()}

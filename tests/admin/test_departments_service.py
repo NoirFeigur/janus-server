@@ -44,7 +44,7 @@ async def test_create_top_level_department(admin_session: AsyncSession) -> None:
     assert dept.parent_id is None
     assert dept.created_by == ACTOR.user_id
     assert dept.create_dept == ACTOR.department_id
-    listed = await svc.list_departments()
+    listed = await svc.list_departments(ACTOR)
     assert any(d.name == "Engineering" for d in listed)
 
 
@@ -73,8 +73,10 @@ async def test_create_child_with_bad_parent_rejected(
 async def test_get_department_not_found_raises(admin_session: AsyncSession) -> None:
     svc = DepartmentService(admin_session)
     with pytest.raises(AppError) as exc:
-        await svc.get_department(123456)
-    assert exc.value.status_code == 404
+        await svc.get_department(123456, actor=ACTOR)
+    # Missing department → opaque 403 (no exists-but-hidden oracle; same as the
+    # user surface). The scope guard fires before any 404 path.
+    assert exc.value.status_code == 403
 
 
 async def test_update_department_name(admin_session: AsyncSession) -> None:
@@ -94,7 +96,8 @@ async def test_update_department_not_found_raises(
         await svc.update_department(
             555555, DepartmentUpdate(name="X"), actor=ACTOR
         )
-    assert exc.value.status_code == 404
+    # Missing department → opaque 403 (scope guard fires before the 404 path).
+    assert exc.value.status_code == 403
 
 
 async def test_reparent_to_valid_parent(admin_session: AsyncSession) -> None:
@@ -181,7 +184,7 @@ async def test_delete_empty_department_succeeds(admin_session: AsyncSession) -> 
     dept = await svc.create_department(DepartmentCreate(name="Temp"), actor=ACTOR)
     await svc.delete_department(dept.id, actor=ACTOR)
     with pytest.raises(AppError):
-        await svc.get_department(dept.id)  # soft-deleted → gone
+        await svc.get_department(dept.id, actor=ACTOR)  # soft-deleted → gone
 
 
 async def test_delete_department_not_found_raises(
@@ -190,7 +193,8 @@ async def test_delete_department_not_found_raises(
     svc = DepartmentService(admin_session)
     with pytest.raises(AppError) as exc:
         await svc.delete_department(777777, actor=ACTOR)
-    assert exc.value.status_code == 404
+    # Missing department → opaque 403 (scope guard fires before the 404 path).
+    assert exc.value.status_code == 403
 
 
 async def test_delete_department_with_child_blocked(

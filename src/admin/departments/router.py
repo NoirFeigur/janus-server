@@ -40,10 +40,10 @@ ServiceDep = Annotated[DepartmentService, Depends(get_department_service)]
 async def list_departments(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:dept:list"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("system:dept:list"))],
     keyword: Annotated[str | None, Query()] = None,
 ) -> SuccessEnvelope[list[DepartmentRead]]:
-    departments = await service.list_departments(keyword=keyword)
+    departments = await service.list_departments(user, keyword=keyword)
     return success(
         [DepartmentRead.model_validate(d) for d in departments], trace_id=trace_id
     )

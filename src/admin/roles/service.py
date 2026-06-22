@@ -119,21 +119,25 @@ class RoleService:
         """Privilege-escalation guard for a role's data-scope breadth.
 
         An unrestricted actor (super-admin or an ``all`` role) may grant any
-        scope. A scoped actor may not:
-        - grant ``all`` (would mint a role strictly broader than the actor's own
-          visibility), nor
-        - grant ``custom`` departments outside their own visible department set
-          (no write-outside-scope hole).
-        Relative scopes (``dept`` / ``dept_and_child`` / ``self`` /
-        ``dept_and_child_or_self``) are bounded by the eventual role holder's own
-        position, so they confer no breadth the actor lacks and are allowed.
+        scope. For a scoped actor the prospective grant is resolved against the
+        actor itself as the stand-in holder (the role is not yet bound to a user),
+        and the resulting department visibility must be a subset of the actor's
+        own. ``all`` is refused outright. ``self_only`` confers no department
+        visibility and always passes.
+
+        Treating the actor as the holder is sound because the per-assignment guard
+        (:meth:`UserService._require_assignable_roles`) re-resolves the scope
+        against the REAL holder when the role is later assigned — so a relative
+        scope that happens to be safe for the actor-as-holder but broader for some
+        other holder is still caught at assignment time.
         """
         actor_scope = await self._scope(actor)
         if actor_scope.unrestricted:
             return
-        if data_scope == DataScope.all_data:
-            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-        if data_scope == DataScope.custom and not set(dept_ids).issubset(
+        granted = await self.auth.resolve_role_scope(
+            data_scope, dept_ids, holder_department_id=actor.department_id
+        )
+        if granted.unrestricted or not granted.department_ids.issubset(
             actor_scope.department_ids
         ):
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
@@ -285,7 +289,17 @@ class RoleService:
                 if payload.data_scope is not None
                 else DataScope(role.data_scope)
             )
-            guard_depts = payload.dept_ids if payload.dept_ids is not None else []
+            # When the effective scope is custom but the payload doesn't carry new
+            # dept_ids (e.g. editing only data_scope or menus), the guard must see
+            # the role's CURRENT dept grants — using [] would let a scope change
+            # past the breadth check while the existing custom depts silently
+            # persist (and exceed the actor's scope).
+            if payload.dept_ids is not None:
+                guard_depts: Sequence[int] = payload.dept_ids
+            elif effective == DataScope.custom:
+                guard_depts = await self.repo.list_dept_ids(role.id)
+            else:
+                guard_depts = []
             await self._require_assignable_scope(effective, guard_depts, actor)
 
         scalar_values = payload.model_dump(

@@ -138,6 +138,34 @@ async def test_service_username_none_when_user_absent(
     assert sessions[0].username is None
 
 
+async def test_service_username_none_when_user_soft_deleted(
+    admin_session: AsyncSession, store: SessionStore
+) -> None:
+    """A soft-deleted user with a stale Redis session must NOT resolve a username
+    — the docstring promises deleted users are absent from the map (P2-1)."""
+    admin_session.add(
+        User(
+            id=801,
+            username="ghosted",
+            employee_no="E-801",
+            status="active",
+            is_deleted=True,
+        )
+    )
+    await admin_session.commit()
+    await store.create_session(
+        user_id=801,
+        access_jti="acc-deleted",
+        access_ttl=7200,
+        refresh_hash="ref-deleted",
+        refresh_ttl=1000,
+    )
+    service = OnlineSessionService(admin_session, store)
+    sessions = await service.list_sessions()
+    deleted_row = next(s for s in sessions if s.access_jti == "acc-deleted")
+    assert deleted_row.username is None
+
+
 async def test_service_sorts_recent_first(admin_session: AsyncSession, store: SessionStore) -> None:
     """Most-recent login_at surfaces first."""
     await store.create_session(
