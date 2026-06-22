@@ -143,6 +143,54 @@ async def test_delete_passes_bucket_and_key() -> None:
     }
 
 
+async def test_presign_get_with_force_download() -> None:
+    """force_download=True bakes Content-Disposition: attachment into the signed params."""
+    rec: dict[str, Any] = {}
+    storage = _make_storage(rec)
+
+    url = await storage.presign_get("attachment/2026/06/doc.pdf", force_download=True)
+
+    assert rec["presign"]["Params"]["ResponseContentDisposition"] == "attachment"
+    assert url.startswith("https://signed.example/attachment/2026/06/doc.pdf")
+
+
+def test_bucket_property_exposes_configured_bucket() -> None:
+    rec: dict[str, Any] = {}
+    storage = _make_storage(rec)
+    assert storage.bucket == "private"
+
+
+def test_get_object_storage_optional_returns_none_when_no_creds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Optional dep returns None instead of raising when OSS is unconfigured."""
+
+    from src.config import get_settings
+    from src.core.oss import get_object_storage_optional
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "oss_access_key", None)
+    monkeypatch.setattr(settings, "oss_secret_key", None)
+    assert get_object_storage_optional() is None
+
+
+def test_get_object_storage_optional_returns_instance_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Optional dep returns ObjectStorage when credentials are present."""
+    from pydantic import SecretStr
+
+    from src.config import get_settings
+    from src.core.oss import get_object_storage_optional
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "oss_access_key", SecretStr("AK"))
+    monkeypatch.setattr(settings, "oss_secret_key", SecretStr("SK"))
+    result = get_object_storage_optional()
+    assert result is not None
+    assert result.bucket == settings.oss_bucket
+
+
 def test_missing_credentials_raise_at_construction() -> None:
     with pytest.raises(ValueError, match="credentials"):
         ObjectStorage(

@@ -149,6 +149,130 @@ async def test_superuser_may_set_any_menu_perm(admin_session) -> None:
     assert menu.perms == "any:thing:here"
 
 
+async def test_list_menus_keyword_filter_by_name(admin_session) -> None:
+    """Keyword search matches menu name (case-insensitive) and pulls ancestors."""
+    svc = MenuService(admin_session)
+    parent = await svc.create_menu(
+        MenuCreate(name="System", menu_type="catalog"), actor=_actor()
+    )
+    await svc.create_menu(
+        MenuCreate(name="User Management", menu_type="menu", parent_id=parent.id),
+        actor=_actor(),
+    )
+    await svc.create_menu(
+        MenuCreate(name="Unrelated", menu_type="menu"), actor=_actor()
+    )
+    result = await svc.list_menus(keyword="user")
+    names = {m.name for m in result}
+    # The keyword match ("User Management") + its ancestor ("System") are included.
+    assert "User Management" in names
+    assert "System" in names
+    # Unrelated is excluded.
+    assert "Unrelated" not in names
+
+
+async def test_list_menus_keyword_filter_by_perms(admin_session) -> None:
+    """Keyword search also matches the perms field."""
+    svc = MenuService(admin_session)
+    await svc.create_menu(
+        MenuCreate(name="Add Btn", menu_type="button", perms="system:user:add"),
+        actor=_actor(),
+    )
+    await svc.create_menu(
+        MenuCreate(name="Other Btn", menu_type="button", perms="system:role:list"),
+        actor=_actor(),
+    )
+    result = await svc.list_menus(keyword="user:add")
+    assert len(result) == 1
+    assert result[0].name == "Add Btn"
+
+
+async def test_list_menus_empty_keyword_returns_all(admin_session) -> None:
+    """A whitespace-only keyword is treated as no filter."""
+    svc = MenuService(admin_session)
+    await svc.create_menu(MenuCreate(name="A", menu_type="catalog"), actor=_actor())
+    await svc.create_menu(MenuCreate(name="B", menu_type="catalog"), actor=_actor())
+    result = await svc.list_menus(keyword="   ")
+    assert len(result) == 2
+
+
+async def test_kind_validation_button_requires_perms(admin_session) -> None:
+    """A menu of type ``button`` MUST have a non-empty perms code."""
+    svc = MenuService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_menu(
+            MenuCreate(name="btn", menu_type="button", perms=None), actor=_actor()
+        )
+    assert exc.value.status_code == 400
+
+
+async def test_kind_validation_non_button_rejects_perms(admin_session) -> None:
+    """A ``catalog`` or ``menu`` node MUST NOT carry a perms code."""
+    svc = MenuService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_menu(
+            MenuCreate(name="cat", menu_type="catalog", perms="system:user:list"),
+            actor=_actor(),
+        )
+    assert exc.value.status_code == 400
+
+
+async def test_delete_menu_with_children_blocked(admin_session) -> None:
+    """A menu with active children cannot be deleted."""
+    svc = MenuService(admin_session)
+    parent = await svc.create_menu(
+        MenuCreate(name="Parent", menu_type="catalog"), actor=_actor()
+    )
+    await svc.create_menu(
+        MenuCreate(name="Child", menu_type="menu", parent_id=parent.id),
+        actor=_actor(),
+    )
+    with pytest.raises(AppError) as exc:
+        await svc.delete_menu(parent.id, actor=_actor())
+    assert exc.value.status_code == 400
+
+
+async def test_delete_menu_with_role_grant_blocked(admin_session) -> None:
+    """A menu still linked to a role cannot be deleted."""
+    svc = MenuService(admin_session)
+    menu = await svc.create_menu(
+        MenuCreate(name="Granted", menu_type="menu"), actor=_actor()
+    )
+    role = Role(name="r", code="r", data_scope="all", status="active")
+    admin_session.add(role)
+    await admin_session.flush()
+    admin_session.add(RoleMenu(role_id=role.id, menu_id=menu.id))
+    await admin_session.commit()
+    with pytest.raises(AppError) as exc:
+        await svc.delete_menu(menu.id, actor=_actor())
+    assert exc.value.status_code == 400
+
+
+async def test_batch_delete_menus_mixed(admin_session) -> None:
+    """Batch delete: deletable items succeed, blocked/missing items are skipped."""
+    svc = MenuService(admin_session)
+    deletable = await svc.create_menu(
+        MenuCreate(name="Del", menu_type="menu"), actor=_actor()
+    )
+    parent_with_child = await svc.create_menu(
+        MenuCreate(name="Blocked", menu_type="catalog"), actor=_actor()
+    )
+    await svc.create_menu(
+        MenuCreate(name="Kid", menu_type="menu", parent_id=parent_with_child.id),
+        actor=_actor(),
+    )
+    await admin_session.commit()
+
+    result = await svc.batch_delete_menus(
+        [deletable.id, parent_with_child.id, 999999], actor=_actor()
+    )
+    assert result.affected == 1
+    assert int(result.skipped_ids[0]) == parent_with_child.id or 999999 in [
+        int(s) for s in result.skipped_ids
+    ]
+    assert len(result.skipped_ids) == 2
+
+
 async def test_current_user_menu_filter(admin_session) -> None:
     visible = Menu(name="visible", menu_type="menu", status="active", visible=True)
     invisible = Menu(name="invisible", menu_type="menu", status="active", visible=False)

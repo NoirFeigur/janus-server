@@ -9,7 +9,7 @@ import pytest
 from fastapi import FastAPI, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.auth.middleware import AuthMiddleware
+from src.auth.middleware import AuthMiddleware, _strip_api_prefix
 from src.auth.service import AuthService
 from src.core.security import generate_api_key, hash_password
 from src.db.base import Base
@@ -18,6 +18,32 @@ from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
 
 pytestmark = pytest.mark.asyncio
+
+
+# ---- _strip_api_prefix unit tests (pure function, no HTTP) ------------------
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
+class TestStripApiPrefix:
+    """Sync tests grouped — pure function, no HTTP."""
+
+    def test_empty_is_noop(self) -> None:
+        assert _strip_api_prefix("/admin/users", "") == "/admin/users"
+
+    def test_slash_only_is_noop(self) -> None:
+        assert _strip_api_prefix("/admin/users", "/") == "/admin/users"
+
+    def test_removes_prefix(self) -> None:
+        assert _strip_api_prefix("/api/v1/admin/users", "/api/v1") == "/admin/users"
+
+    def test_exact_match_returns_root(self) -> None:
+        assert _strip_api_prefix("/api/v1", "/api/v1") == "/"
+
+    def test_no_match_returns_path(self) -> None:
+        assert _strip_api_prefix("/other/path", "/api/v1") == "/other/path"
+
+    def test_trailing_slash_on_prefix(self) -> None:
+        assert _strip_api_prefix("/api/v1/admin/users", "/api/v1/") == "/admin/users"
 
 _TABLES = [
     Base.metadata.tables[m.__tablename__]
@@ -156,6 +182,55 @@ async def test_resource_management_paths_reject_sk_key(
             resp = await client.get(path, headers={"Authorization": "Bearer sk-test"})
             assert resp.status_code == 401
             assert resp.json()["code"] == "auth.invalid_token"
+
+
+async def test_x_api_key_header_rejected_on_admin_path(
+    sqlite_engine,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """X-API-Key header on an admin path (allow_api_key=False) → 401."""
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_TABLES)
+        )
+    async for client, _session in _client(sqlite_session_factory):
+        resp = await client.get("/admin/ping", headers={"X-API-Key": "sk-test123"})
+        assert resp.status_code == 401
+        assert resp.json()["code"] == "auth.invalid_token"
+
+
+async def test_malformed_authorization_header_rejected(
+    sqlite_engine,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Non-Bearer Authorization header (e.g. Basic) → 401."""
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_TABLES)
+        )
+    async for client, _session in _client(sqlite_session_factory):
+        resp = await client.get(
+            "/admin/ping", headers={"Authorization": "Basic dXNlcjpwYXNz"}
+        )
+        assert resp.status_code == 401
+        assert resp.json()["code"] == "auth.invalid_token"
+
+
+async def test_bearer_empty_value_rejected(
+    sqlite_engine,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Bearer with empty value → 401."""
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync_conn: Base.metadata.create_all(sync_conn, tables=_TABLES)
+        )
+    async for client, _session in _client(sqlite_session_factory):
+        resp = await client.get(
+            "/admin/ping", headers={"Authorization": "Bearer "}
+        )
+        assert resp.status_code == 401
+        assert resp.json()["code"] == "auth.invalid_token"
 
 
 async def test_revoked_session_rejected_through_middleware(

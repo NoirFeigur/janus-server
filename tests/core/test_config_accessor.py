@@ -199,6 +199,26 @@ async def test_invalidate_forces_reload(
     assert await config_accessor.get_str("inv.key") == "new"
 
 
+async def test_get_bool_unparseable_returns_default(
+    seeded_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A stored value that does not parse as bool returns the caller's default."""
+    await _seed(seeded_factory, key="bad.bool", value="maybe", value_type=ConfigValueType.string)
+    assert await config_accessor.get_bool("bad.bool", default=True) is True
+
+
+async def test_get_json_unparseable_returns_default(
+    seeded_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A stored value that does not parse as JSON returns the caller's default."""
+    await _seed(
+        seeded_factory, key="bad.json", value="{not json}",
+        value_type=ConfigValueType.string,
+    )
+    result = await config_accessor.get_json("bad.json", default={"fallback": 1})
+    assert result == {"fallback": 1}
+
+
 async def test_missing_key_is_cached(
     seeded_factory: async_sessionmaker[AsyncSession],
     fake_redis: AsyncRedisDouble,

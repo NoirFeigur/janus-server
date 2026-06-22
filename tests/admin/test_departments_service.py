@@ -212,6 +212,107 @@ async def test_delete_department_with_child_blocked(
     assert exc.value.status_code == 400
 
 
+async def test_list_keyword_includes_ancestors(admin_session: AsyncSession) -> None:
+    """Keyword search returns matching depts plus all their ancestors."""
+    svc = DepartmentService(admin_session)
+    root = await svc.create_department(DepartmentCreate(name="Company"), actor=ACTOR)
+    eng = await svc.create_department(
+        DepartmentCreate(name="Engineering", parent_id=root.id), actor=ACTOR
+    )
+    await svc.create_department(
+        DepartmentCreate(name="Backend Team", parent_id=eng.id), actor=ACTOR
+    )
+    await svc.create_department(DepartmentCreate(name="Sales"), actor=ACTOR)
+
+    result = await svc.list_departments(ACTOR, keyword="Backend")
+    names = {d.name for d in result}
+    # Match + ancestor chain included, unrelated excluded.
+    assert "Backend Team" in names
+    assert "Engineering" in names
+    assert "Company" in names
+    assert "Sales" not in names
+
+
+async def test_list_keyword_no_match_returns_empty(
+    admin_session: AsyncSession,
+) -> None:
+    svc = DepartmentService(admin_session)
+    await svc.create_department(DepartmentCreate(name="Engineering"), actor=ACTOR)
+    result = await svc.list_departments(ACTOR, keyword="zzzzz")
+    assert len(result) == 0
+
+
+async def test_batch_delete_skips_out_of_scope(admin_session: AsyncSession) -> None:
+    """Batch delete skips departments not in the actor's data scope."""
+    svc = DepartmentService(admin_session)
+    dept = await svc.create_department(DepartmentCreate(name="Dept"), actor=ACTOR)
+    await admin_session.commit()
+
+    # Scoped actor whose department_ids does NOT include dept.id → skip.
+    scoped_actor = AuthenticatedUser(
+        user_id=2000,
+        username="scoped",
+        department_id=9999,
+        permissions=frozenset({"system:dept:remove"}),
+        role_codes=frozenset(),
+    )
+    # The actor has scope=self (not unrestricted) and dept.id is not in their depts.
+    result = await svc.batch_delete_departments([dept.id], actor=scoped_actor)
+    assert result.affected == 0
+    assert len(result.skipped_ids) == 1
+
+
+async def test_batch_delete_skips_with_children(admin_session: AsyncSession) -> None:
+    """Batch delete skips departments that have active children."""
+    svc = DepartmentService(admin_session)
+    parent = await svc.create_department(DepartmentCreate(name="Parent"), actor=ACTOR)
+    await svc.create_department(
+        DepartmentCreate(name="Child", parent_id=parent.id), actor=ACTOR
+    )
+    await admin_session.commit()
+
+    result = await svc.batch_delete_departments([parent.id], actor=ACTOR)
+    assert result.affected == 0
+    assert int(result.skipped_ids[0]) == parent.id
+
+
+async def test_batch_delete_skips_with_members(admin_session: AsyncSession) -> None:
+    """Batch delete skips departments that still have active users."""
+    svc = DepartmentService(admin_session)
+    dept = await svc.create_department(DepartmentCreate(name="Staffed"), actor=ACTOR)
+    admin_session.add(
+        User(
+            id=5000,
+            username="member",
+            employee_no="E-5000",
+            department_id=dept.id,
+            status="active",
+        )
+    )
+    await admin_session.commit()
+
+    result = await svc.batch_delete_departments([dept.id], actor=ACTOR)
+    assert result.affected == 0
+    assert int(result.skipped_ids[0]) == dept.id
+
+
+async def test_batch_delete_mixed_results(admin_session: AsyncSession) -> None:
+    """Batch delete: deletable items succeed, blocked/missing items are skipped."""
+    svc = DepartmentService(admin_session)
+    ok = await svc.create_department(DepartmentCreate(name="OK"), actor=ACTOR)
+    has_child = await svc.create_department(DepartmentCreate(name="HasChild"), actor=ACTOR)
+    await svc.create_department(
+        DepartmentCreate(name="Kid", parent_id=has_child.id), actor=ACTOR
+    )
+    await admin_session.commit()
+
+    result = await svc.batch_delete_departments(
+        [ok.id, has_child.id, 777777], actor=ACTOR
+    )
+    assert result.affected == 1
+    assert len(result.skipped_ids) == 2
+
+
 async def test_delete_department_with_member_blocked(
     admin_session: AsyncSession,
 ) -> None:
