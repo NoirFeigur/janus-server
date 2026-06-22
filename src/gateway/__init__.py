@@ -1,2 +1,1 @@
 """LLM gateway domain."""
-

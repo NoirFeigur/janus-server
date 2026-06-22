@@ -111,6 +111,7 @@ class ErrorCode(StrEnum):
     attach_too_large = "attach.too_large"  # Uploaded file exceeds the size limit.
     model_not_granted = "model.not_granted"  # Principal is not granted the logical model.
     model_not_found = "model.not_found"  # Logical model does not exist or is disabled.
+    model_unavailable = "model.unavailable"  # Logical model has no active deployments.
     model_no_channel = "model.no_available_channel"  # Logical model has no usable channel.
     quota_exceeded = "quota.exceeded"  # Quota limit has been reached.
     upstream_error = "upstream.error"  # Upstream provider returned an error.
