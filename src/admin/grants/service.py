@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
@@ -11,6 +12,8 @@ from src.auth.service import AuthenticatedUser
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.grant import UserModelGrant
+from src.db.models.identity import Department, User
+from src.db.models.model_catalog import LogicalModel
 from src.enums import ErrorCode
 from src.exceptions import AppError
 
@@ -82,6 +85,34 @@ class GrantService:
     async def create_grant(
         self, payload: GrantCreate, *, actor: AuthenticatedUser
     ) -> UserModelGrant:
+        if payload.scope == "user":
+            exists = await self.session.scalar(
+                select(User.id).where(
+                    User.id == payload.scope_id,
+                    User.is_deleted.is_(False),
+                )
+            )
+            if exists is None:
+                raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+        elif payload.scope == "department":
+            exists = await self.session.scalar(
+                select(Department.id).where(
+                    Department.id == payload.scope_id,
+                    Department.is_deleted.is_(False),
+                )
+            )
+            if exists is None:
+                raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+
+        model_exists = await self.session.scalar(
+            select(LogicalModel.id).where(
+                LogicalModel.id == payload.logical_model_id,
+                LogicalModel.is_deleted.is_(False),
+            )
+        )
+        if model_exists is None:
+            raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+
         existing = await self.grants.get_existing(
             scope=payload.scope,
             scope_id=payload.scope_id,

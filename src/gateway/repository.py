@@ -162,14 +162,30 @@ class GatewayRepository:
         )
         return await self.session.scalar(stmt)
 
-    async def get_active_quotas(self, user_id: int, logical_model_id: int) -> list[Quota]:
+    async def get_active_quotas(
+        self,
+        user_id: int,
+        department_id: int | None,
+        logical_model_id: int | None = None,
+    ) -> list[Quota]:
+        if logical_model_id is None:
+            logical_model_id = int(department_id or 0)
+            department_id = None
+        predicates = [
+            and_(Quota.scope == QuotaScope.user.value, Quota.scope_id == user_id),
+            and_(Quota.scope == QuotaScope.global_.value, Quota.scope_id.is_(None)),
+        ]
+        if department_id is not None:
+            predicates.append(
+                and_(
+                    Quota.scope == QuotaScope.department.value,
+                    Quota.scope_id == department_id,
+                )
+            )
         stmt = select(Quota).where(
             Quota.is_deleted.is_(False),
             Quota.status == ActiveStatus.active.value,
-            or_(
-                and_(Quota.scope == QuotaScope.user.value, Quota.scope_id == user_id),
-                and_(Quota.scope == QuotaScope.global_.value, Quota.scope_id.is_(None)),
-            ),
+            or_(*predicates),
             or_(Quota.logical_model_id == logical_model_id, Quota.logical_model_id.is_(None)),
         )
         return list((await self.session.scalars(stmt)).all())

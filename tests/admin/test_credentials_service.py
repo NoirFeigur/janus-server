@@ -10,6 +10,7 @@ from src.admin.credentials.service import CredentialService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.core.query import ListQuery
+from src.db.models.identity import User
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -32,7 +33,18 @@ def _key_payload(**overrides: object) -> ApiKeyCreate:
     return ApiKeyCreate(**defaults)
 
 
+async def _seed_users(session: AsyncSession) -> None:
+    session.add_all(
+        [
+            User(id=1, username="alice", employee_no="E001", status="active"),
+            User(id=2, username="bob", employee_no="E002", status="active"),
+        ]
+    )
+    await session.commit()
+
+
 async def test_create_key_returns_plain_key(admin_session: AsyncSession) -> None:
+    await _seed_users(admin_session)
     svc = CredentialService(admin_session)
 
     _, plain_key = await svc.create_key(_key_payload(), actor=ACTOR)
@@ -43,6 +55,7 @@ async def test_create_key_returns_plain_key(admin_session: AsyncSession) -> None
 async def test_create_key_stores_hash_not_plaintext(
     admin_session: AsyncSession,
 ) -> None:
+    await _seed_users(admin_session)
     svc = CredentialService(admin_session)
 
     key, plain_key = await svc.create_key(_key_payload(), actor=ACTOR)
@@ -52,6 +65,7 @@ async def test_create_key_stores_hash_not_plaintext(
 
 
 async def test_create_key_sets_prefix(admin_session: AsyncSession) -> None:
+    await _seed_users(admin_session)
     svc = CredentialService(admin_session)
 
     key, plain_key = await svc.create_key(_key_payload(), actor=ACTOR)
@@ -60,6 +74,7 @@ async def test_create_key_sets_prefix(admin_session: AsyncSession) -> None:
 
 
 async def test_list_keys_by_user_id(admin_session: AsyncSession) -> None:
+    await _seed_users(admin_session)
     svc = CredentialService(admin_session)
     await svc.create_key(_key_payload(user_id=1, name="first"), actor=ACTOR)
     await svc.create_key(_key_payload(user_id=2, name="second"), actor=ACTOR)
@@ -71,6 +86,7 @@ async def test_list_keys_by_user_id(admin_session: AsyncSession) -> None:
 
 
 async def test_update_key_status_to_disabled(admin_session: AsyncSession) -> None:
+    await _seed_users(admin_session)
     svc = CredentialService(admin_session)
     key, _ = await svc.create_key(_key_payload(), actor=ACTOR)
 
@@ -82,6 +98,7 @@ async def test_update_key_status_to_disabled(admin_session: AsyncSession) -> Non
 
 
 async def test_delete_key_soft_deletes(admin_session: AsyncSession) -> None:
+    await _seed_users(admin_session)
     svc = CredentialService(admin_session)
     key, _ = await svc.create_key(_key_payload(), actor=ACTOR)
 

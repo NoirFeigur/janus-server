@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
@@ -39,10 +41,27 @@ class GatewayService:
             )
         return logical_model
 
-    async def check_quota(self, user_id: int, logical_model_id: int) -> QuotaCheckResult:
-        quotas = await self.repo.get_active_quotas(user_id, logical_model_id)
+    async def check_quota(
+        self,
+        user_id: int,
+        department_id: int | None,
+        logical_model_id: int | None = None,
+    ) -> QuotaCheckResult:
+        legacy_call = logical_model_id is None
+        if logical_model_id is None:
+            logical_model_id = int(department_id or 0)
+            department_id = None
+        quotas = await self.repo.get_active_quotas(
+            user_id, department_id, logical_model_id
+        )
         try:
-            return await self.quota.check_and_increment(user_id, logical_model_id, quotas)
+            if legacy_call:
+                return await self.quota.check_and_increment(
+                    user_id, logical_model_id, quotas
+                )
+            return await self.quota.check_and_increment(
+                user_id, department_id, logical_model_id, quotas
+            )
         except QuotaLimitExceeded as exc:
             raise AppError(
                 ErrorCode.quota_exceeded,
@@ -55,3 +74,23 @@ class GatewayService:
                     "current": str(exc.exceeded.current),
                 },
             ) from exc
+
+    async def settle_quota(
+        self,
+        user_id: int,
+        department_id: int | None,
+        logical_model_id: int,
+        actual_tokens: int,
+        actual_cost: Decimal | None,
+    ) -> None:
+        quotas = await self.repo.get_active_quotas(
+            user_id, department_id, logical_model_id
+        )
+        await self.quota.settle(
+            user_id,
+            department_id,
+            logical_model_id,
+            quotas,
+            actual_tokens,
+            actual_cost,
+        )

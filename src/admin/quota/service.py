@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
@@ -10,6 +11,7 @@ from src.admin.quota.schemas import QuotaCreate, QuotaUpdate
 from src.auth.service import AuthenticatedUser
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
+from src.db.models.identity import Department, User
 from src.db.models.quota import Quota
 from src.enums import ErrorCode
 from src.exceptions import AppError
@@ -79,6 +81,25 @@ class QuotaService:
         self, payload: QuotaCreate, *, actor: AuthenticatedUser
     ) -> Quota:
         self._validate_scope(payload.scope, payload.scope_id)
+        if payload.scope == "user" and payload.scope_id is not None:
+            exists = await self.session.scalar(
+                select(User.id).where(
+                    User.id == payload.scope_id,
+                    User.is_deleted.is_(False),
+                )
+            )
+            if exists is None:
+                raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+        elif payload.scope == "department" and payload.scope_id is not None:
+            exists = await self.session.scalar(
+                select(Department.id).where(
+                    Department.id == payload.scope_id,
+                    Department.is_deleted.is_(False),
+                )
+            )
+            if exists is None:
+                raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+
         existing = await self.repo.get_existing(
             scope=payload.scope,
             scope_id=payload.scope_id,

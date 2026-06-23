@@ -18,6 +18,7 @@ class AnthropicRequest(BaseModel):
 
     model: str | None = None
     stream: bool = False
+    system: Any | None = None
     messages: list[Any]
 
 

@@ -72,10 +72,10 @@ async def test_record_usage_swallows_exceptions(
     model = await seed_logical_model()
 
     class RaisingFactory:
-        def __call__(self) -> "RaisingFactory":
+        def __call__(self) -> RaisingFactory:
             return self
 
-        async def __aenter__(self) -> "RaisingFactory":
+        async def __aenter__(self) -> RaisingFactory:
             raise RuntimeError("session failed")
 
         async def __aexit__(self, *_: object) -> None:

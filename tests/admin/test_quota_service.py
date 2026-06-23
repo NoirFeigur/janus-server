@@ -11,6 +11,7 @@ from src.admin.quota.schemas import QuotaCreate, QuotaUpdate
 from src.admin.quota.service import QuotaService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
+from src.db.models.identity import User
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -37,7 +38,13 @@ def _quota_payload(**overrides: object) -> QuotaCreate:
     return QuotaCreate(**defaults)
 
 
+async def _seed_user(session: AsyncSession) -> None:
+    session.add(User(id=1, username="alice", employee_no="E001", status="active"))
+    await session.commit()
+
+
 async def test_create_quota_and_get_quota(admin_session: AsyncSession) -> None:
+    await _seed_user(admin_session)
     svc = QuotaService(admin_session)
     quota = await svc.create_quota(_quota_payload(), actor=ACTOR)
 
@@ -48,6 +55,7 @@ async def test_create_quota_and_get_quota(admin_session: AsyncSession) -> None:
 
 
 async def test_create_quota_duplicate_conflicts(admin_session: AsyncSession) -> None:
+    await _seed_user(admin_session)
     svc = QuotaService(admin_session)
     await svc.create_quota(_quota_payload(), actor=ACTOR)
 
@@ -83,6 +91,7 @@ async def test_create_quota_user_without_scope_id_rejected(
 
 
 async def test_update_quota_limit_value(admin_session: AsyncSession) -> None:
+    await _seed_user(admin_session)
     svc = QuotaService(admin_session)
     quota = await svc.create_quota(_quota_payload(), actor=ACTOR)
 
@@ -96,6 +105,7 @@ async def test_update_quota_limit_value(admin_session: AsyncSession) -> None:
 
 
 async def test_delete_quota_soft_deletes(admin_session: AsyncSession) -> None:
+    await _seed_user(admin_session)
     svc = QuotaService(admin_session)
     quota = await svc.create_quota(_quota_payload(), actor=ACTOR)
 

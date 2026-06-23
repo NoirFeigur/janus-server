@@ -24,20 +24,25 @@ class RouterManager:
     _lock = asyncio.Lock()
     _rebuild_interval_seconds: int = 30
     _poll_task: asyncio.Task[None] | None = None
+    _sub_task: asyncio.Task[None] | None = None
+    _session_factory: async_sessionmaker[AsyncSession] | None = None
 
     @classmethod
     async def startup(cls, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        cls._session_factory = session_factory
         await cls.rebuild(session_factory)
         cls._poll_task = asyncio.create_task(cls._poll(session_factory))
+        cls._sub_task = asyncio.create_task(cls._subscribe(session_factory))
 
     @classmethod
     async def shutdown(cls) -> None:
-        if cls._poll_task is None:
-            return
-        cls._poll_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await cls._poll_task
+        for task in (cls._poll_task, cls._sub_task):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         cls._poll_task = None
+        cls._sub_task = None
 
     @classmethod
     async def rebuild(cls, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -62,3 +67,28 @@ class RouterManager:
                 await cls.rebuild(session_factory)
             except Exception:
                 _log.exception("gateway.router.rebuild_failed")
+
+    @classmethod
+    async def _subscribe(
+        cls, session_factory: async_sessionmaker[AsyncSession]
+    ) -> NoReturn:
+        """Listen for catalog invalidation events from admin writes."""
+        from src.core.redis import get_redis
+
+        redis = get_redis()
+        pubsub = redis.pubsub()
+        await pubsub.subscribe("gateway:router:invalidate")
+        try:
+            while True:
+                msg = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if msg is not None and msg.get("type") == "message":
+                    _log.info("gateway.router.invalidate_received")
+                    try:
+                        await cls.rebuild(session_factory)
+                    except Exception:
+                        _log.exception("gateway.router.rebuild_after_invalidate_failed")
+        finally:
+            await pubsub.unsubscribe("gateway:router:invalidate")
+            await pubsub.aclose()

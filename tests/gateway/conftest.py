@@ -5,14 +5,14 @@ from decimal import Decimal
 
 import pytest
 import pytest_asyncio
+from cryptography.fernet import Fernet
+from pydantic import SecretStr
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.ext.compiler import compiles
-from cryptography.fernet import Fernet
-from pydantic import SecretStr
 
-from src.core.channel_crypto import encrypt_channel_key
 from src.config import get_settings
+from src.core.channel_crypto import encrypt_channel_key
 from src.db.base import Base
 from src.db.models.grant import UserModelGrant
 from src.db.models.model_catalog import (

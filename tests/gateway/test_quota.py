@@ -52,7 +52,8 @@ async def test_check_and_increment_passes_under_limit(
 
     assert result.passed is True
     assert result.warnings == []
-    assert redis._data["quota:100:10:%s:requests" % QuotaEnforcer._period_key("daily")] == 1
+    period = QuotaEnforcer._period_key("daily")
+    assert redis._data[f"quota:100:10:{period}:requests"] == 1
 
 
 async def test_check_and_increment_raises_when_hard_quota_exceeded(

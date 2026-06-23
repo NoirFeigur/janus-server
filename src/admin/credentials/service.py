@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
@@ -14,6 +15,7 @@ from src.auth.service import AuthenticatedUser
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.credential import ApiKey
+from src.db.models.identity import User
 from src.enums import ErrorCode
 from src.exceptions import AppError
 
@@ -71,6 +73,15 @@ class CredentialService:
     async def create_key(
         self, payload: ApiKeyCreate, *, actor: AuthenticatedUser
     ) -> tuple[ApiKey, str]:
+        user_exists = await self.session.scalar(
+            select(User.id).where(
+                User.id == payload.user_id,
+                User.is_deleted.is_(False),
+            )
+        )
+        if user_exists is None:
+            raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+
         plain_key = f"sk-{secrets.token_hex(24)}"
         key = ApiKey(
             user_id=payload.user_id,

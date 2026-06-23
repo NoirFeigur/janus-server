@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
+from contextlib import suppress
+from decimal import Decimal
 from time import monotonic
 from typing import Annotated, Any, TypeVar
 from uuid import uuid4
@@ -30,6 +32,10 @@ router = APIRouter(tags=["gateway"])
 
 GatewayServiceDep = Annotated[GatewayService, Depends(get_gateway_service)]
 RequestSchemaT = TypeVar("RequestSchemaT", bound=BaseModel)
+
+_MAX_BODY_BYTES = 1_048_576
+_STREAM_MAX_DURATION_SECONDS = 1800
+_STREAM_IDLE_TIMEOUT_SECONDS = 60
 
 
 @router.post("/v1/chat/completions", response_model=None)
@@ -59,7 +65,7 @@ async def anthropic_messages(
 ) -> JSONResponse | StreamingResponse:
     payload = await _parse_body(request, AnthropicRequest)
     params = payload.model_dump(exclude={"model", "messages", "stream", "system"})
-    messages = _anthropic_to_openai_messages(payload.messages, params.pop("system", None))
+    messages = _anthropic_to_openai_messages(payload.messages, payload.system)
     response = await _execute_completion(
         request=request,
         user=user,
@@ -104,8 +110,14 @@ async def gemini_generate_content(
 
 
 async def _parse_body(request: Request, schema: type[RequestSchemaT]) -> RequestSchemaT:
+    body = await request.body()
+    if len(body) > _MAX_BODY_BYTES:
+        raise AppError(
+            ErrorCode.request_invalid,
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        )
     try:
-        return schema.model_validate(await request.json())
+        return schema.model_validate_json(body)
     except (ValidationError, ValueError) as exc:
         raise AppError(
             ErrorCode.request_invalid,
@@ -125,7 +137,9 @@ async def _execute_completion(
 ) -> JSONResponse | StreamingResponse:
     request_id = _request_id(request)
     logical_model = await service.resolve_model(user, requested_model)
-    quota_result = await service.check_quota(user.user_id, logical_model.id)
+    quota_result = await service.check_quota(
+        user.user_id, user.department_id, logical_model.id
+    )
     started_at = monotonic()
     llm_router = RouterManager.get_router()
     if stream:
@@ -138,7 +152,7 @@ async def _execute_completion(
             **params,
         )
     except Exception as exc:
-        await _compensate_quota(service, user.user_id, logical_model.id)
+        await _compensate_quota(service, user, logical_model.id)
         _record_usage_task(
             user=user,
             logical_model=logical_model,
@@ -163,6 +177,14 @@ async def _execute_completion(
         )
 
     usage = _extract_usage(response)
+    channel_id, upstream_model = _extract_routing_info(response)
+    await service.settle_quota(
+        user.user_id,
+        user.department_id,
+        logical_model.id,
+        usage["total_tokens"],
+        _actual_cost(response),
+    )
     _record_usage_task(
         user=user,
         logical_model=logical_model,
@@ -170,6 +192,8 @@ async def _execute_completion(
         status_value=UsageStatus.success.value,
         latency_ms=_latency_ms(started_at),
         request_id=request_id,
+        channel_id=channel_id,
+        upstream_model=upstream_model,
     )
     return JSONResponse(
         content=jsonable_encoder(_dump_model(response)),
@@ -187,38 +211,75 @@ async def _stream_openai(
     request_id: str,
 ) -> AsyncIterator[str]:
     usage = _empty_usage()
+    status_value = UsageStatus.success.value
+    channel_id: int | None = None
+    upstream_model: str | None = None
+    stream_start = monotonic()
+    last_chunk_at = monotonic()
     try:
         async for chunk in response:
+            now = monotonic()
+            if now - stream_start > _STREAM_MAX_DURATION_SECONDS:
+                status_value = UsageStatus.timeout.value
+                await _compensate_quota(service, user, logical_model.id)
+                break
+            if now - last_chunk_at > _STREAM_IDLE_TIMEOUT_SECONDS:
+                status_value = UsageStatus.timeout.value
+                await _compensate_quota(service, user, logical_model.id)
+                break
+            last_chunk_at = now
+            chunk_channel_id, chunk_upstream_model = _extract_routing_info(chunk)
+            channel_id = channel_id or chunk_channel_id
+            upstream_model = upstream_model or chunk_upstream_model
             chunk_usage = _extract_usage(chunk)
             if chunk_usage["total_tokens"]:
                 usage = chunk_usage
             yield f"data: {_dump_json(chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+        if status_value == UsageStatus.success.value:
+            yield "data: [DONE]\n\n"
+    except asyncio.CancelledError:
+        status_value = UsageStatus.error.value
+        await _compensate_quota(service, user, logical_model.id)
+        raise
     except Exception as exc:
-        await _compensate_quota(service, user.user_id, logical_model.id)
-        _record_usage_task(
-            user=user,
-            logical_model=logical_model,
-            usage=_empty_usage(),
-            status_value=_usage_status_for_exception(exc),
-            latency_ms=_latency_ms(started_at),
-            request_id=request_id,
-        )
+        status_value = _usage_status_for_exception(exc)
+        await _compensate_quota(service, user, logical_model.id)
         raise _upstream_error(exc) from exc
-    if usage["total_tokens"]:
+    finally:
+        response_channel_id, response_upstream_model = _extract_routing_info(response)
+        channel_id = channel_id or response_channel_id
+        upstream_model = upstream_model or response_upstream_model
         _record_usage_task(
             user=user,
             logical_model=logical_model,
             usage=usage,
-            status_value=UsageStatus.success.value,
+            status_value=status_value,
             latency_ms=_latency_ms(started_at),
             request_id=request_id,
+            channel_id=channel_id,
+            upstream_model=upstream_model,
         )
+        if status_value == UsageStatus.success.value and usage["total_tokens"]:
+            asyncio.create_task(
+                service.settle_quota(
+                    user.user_id,
+                    user.department_id,
+                    logical_model.id,
+                    usage["total_tokens"],
+                    None,
+                )
+            )
 
 
-async def _compensate_quota(service: GatewayService, user_id: int, logical_model_id: int) -> None:
-    quotas = await service.repo.get_active_quotas(user_id, logical_model_id)
-    await service.quota.compensate(user_id, logical_model_id, quotas)
+async def _compensate_quota(
+    service: GatewayService, user: AuthenticatedUser, logical_model_id: int
+) -> None:
+    quotas = await service.repo.get_active_quotas(
+        user.user_id, user.department_id, logical_model_id
+    )
+    await service.quota.compensate(
+        user.user_id, user.department_id, logical_model_id, quotas
+    )
 
 
 def _record_usage_task(
@@ -229,6 +290,8 @@ def _record_usage_task(
     status_value: str,
     latency_ms: int | None,
     request_id: str,
+    channel_id: int | None = None,
+    upstream_model: str | None = None,
 ) -> None:
     asyncio.create_task(
         record_usage(
@@ -236,8 +299,8 @@ def _record_usage_task(
                 user_id=user.user_id,
                 api_key_id=user.api_key_id,
                 logical_model=logical_model,
-                channel_id=None,
-                upstream_model=None,
+                channel_id=channel_id,
+                upstream_model=upstream_model,
                 prompt_tokens=usage["prompt_tokens"],
                 completion_tokens=usage["completion_tokens"],
                 total_tokens=usage["total_tokens"],
@@ -261,6 +324,38 @@ def _extract_usage(response: Any) -> dict[str, int]:
         "completion_tokens": _usage_value(usage, "completion_tokens"),
         "total_tokens": _usage_value(usage, "total_tokens"),
     }
+
+
+def _extract_routing_info(response: Any) -> tuple[int | None, str | None]:
+    """Extract channel_id and upstream_model from litellm response metadata."""
+    upstream_model: str | None = None
+    channel_id: int | None = None
+    if hasattr(response, "model"):
+        upstream_model = response.model
+    elif isinstance(response, Mapping):
+        model = response.get("model")
+        if isinstance(model, str):
+            upstream_model = model
+    hidden = getattr(response, "_hidden_params", None)
+    if hidden is None and isinstance(response, Mapping):
+        hidden = response.get("_hidden_params")
+    if isinstance(hidden, dict):
+        model_info = hidden.get("model_info", {})
+        if isinstance(model_info, dict):
+            key_id = model_info.get("id")
+            if key_id is not None:
+                with suppress(ValueError, TypeError):
+                    channel_id = int(key_id)
+    return channel_id, upstream_model
+
+
+def _actual_cost(response: Any) -> Decimal | None:
+    cost = getattr(response, "cost", None)
+    if cost is None and isinstance(response, Mapping):
+        cost = response.get("cost")
+    if cost is None:
+        return None
+    return Decimal(str(cost))
 
 
 def _usage_value(usage: Any, key: str) -> int:

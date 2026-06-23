@@ -167,5 +167,34 @@ class AsyncRedisDouble:
     async def ping(self) -> bool:
         return True
 
+    def pubsub(self) -> _PubSubDouble:
+        return _PubSubDouble()
+
+    async def publish(self, channel: str, message: str) -> int:
+        return 0
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _PubSubDouble:
+    """Minimal pub/sub double that immediately yields nothing."""
+
+    async def subscribe(self, *channels: str) -> None:
+        return None
+
+    async def unsubscribe(self, *channels: str) -> None:
+        return None
+
+    async def get_message(
+        self, *, ignore_subscribe_messages: bool = False, timeout: float = 0.0
+    ) -> dict[str, str] | None:
+        # Never delivers a message in tests — the poll loop will just spin
+        # until cancelled by shutdown.
+        import asyncio
+
+        await asyncio.sleep(timeout or 0.1)
+        return None
+
     async def aclose(self) -> None:
         return None

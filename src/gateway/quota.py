@@ -4,11 +4,39 @@ from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import cast
+from typing import Any, cast
+
+from redis.asyncio import Redis
 
 from src.core.redis import get_redis
 from src.db.models.quota import Quota
-from src.enums import QuotaMetric, QuotaPeriod
+from src.enums import QuotaMetric, QuotaPeriod, QuotaScope
+
+_QUOTA_CHECK_LUA = """
+-- KEYS: quota redis keys (one per quota rule)
+-- ARGV: [num_quotas, ttl1, limit1, enforce1, ttl2, limit2, enforce2, ...]
+-- Returns: {0=pass/1=fail, failed_index (0-based, -1 if pass), current_count}
+local n = tonumber(ARGV[1])
+local incremented = {}
+for i = 1, n do
+    local base = 1 + (i-1)*3
+    local ttl = tonumber(ARGV[base+1])
+    local limit = tonumber(ARGV[base+2])
+    local enforce = tonumber(ARGV[base+3])
+    local count = redis.call('INCRBY', KEYS[i], 1)
+    if count == 1 and ttl > 0 then
+        redis.call('EXPIRE', KEYS[i], ttl)
+    end
+    table.insert(incremented, i)
+    if enforce == 1 and count > limit then
+        for _, idx in ipairs(incremented) do
+            redis.call('DECRBY', KEYS[idx], 1)
+        end
+        return {1, i-1, count}
+    end
+end
+return {0, -1, -1}
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,22 +69,58 @@ class QuotaLimitExceeded(RuntimeError):
 class QuotaEnforcer:
     """Redis-backed quota checking and compensation primitives."""
 
+    def __init__(self) -> None:
+        self._check_script: Any | None = None
+
     async def check_and_increment(
-        self, user_id: int, logical_model_id: int, quotas: Sequence[Quota]
+        self,
+        user_id: int,
+        department_id: int | None,
+        logical_model_id: int | Sequence[Quota],
+        quotas: Sequence[Quota] | None = None,
     ) -> QuotaCheckResult:
+        legacy_key_format = quotas is None
+        if quotas is None:
+            quotas = cast("Sequence[Quota]", logical_model_id)
+            logical_model_id = int(department_id or 0)
+            department_id = None
+        if not quotas:
+            return QuotaCheckResult(passed=True)
         redis = get_redis()
-        warnings: list[QuotaWarning] = []
+        keys = [
+            self._key_for_quota(
+                user_id,
+                department_id,
+                int(logical_model_id),
+                quota,
+                legacy_key_format=legacy_key_format,
+            )
+            for quota in quotas
+        ]
+        argv: list[str | int] = [len(quotas)]
         for quota in quotas:
-            key = self._key(user_id, logical_model_id, quota)
-            count = await cast("Awaitable[int]", redis.incr(key))
-            if count == 1:
-                ttl = self._ttl_seconds(quota.period)
-                if ttl is not None:
-                    await redis.expire(key, ttl)
+            argv.extend(
+                [
+                    self._ttl_seconds(quota.period) or 0,
+                    int(quota.limit_value),
+                    int(quota.enforce),
+                ]
+            )
+        result = await self._run_check(redis, keys, argv)
+        failed = result[0] == 1
+        if failed:
+            failed_index = result[1]
+            failed_quota = quotas[failed_index]
+            current = Decimal(result[2])
+            raise QuotaLimitExceeded(
+                QuotaExceeded(quota=failed_quota, current=current)
+            )
+
+        warnings: list[QuotaWarning] = []
+        for key, quota in zip(keys, quotas, strict=True):
+            count = await self._count(redis, key)
             current = Decimal(count)
-            if current > quota.limit_value:
-                if quota.enforce:
-                    raise QuotaLimitExceeded(QuotaExceeded(quota=quota, current=current))
+            if not quota.enforce and current > quota.limit_value:
                 warnings.append(
                     QuotaWarning(
                         quota_id=quota.id,
@@ -69,17 +133,132 @@ class QuotaEnforcer:
         return QuotaCheckResult(passed=True, warnings=warnings)
 
     async def compensate(
-        self, user_id: int, logical_model_id: int, quotas: Sequence[Quota]
+        self,
+        user_id: int,
+        department_id: int | None,
+        logical_model_id: int | Sequence[Quota],
+        quotas: Sequence[Quota] | None = None,
     ) -> None:
+        legacy_key_format = quotas is None
+        if quotas is None:
+            quotas = cast("Sequence[Quota]", logical_model_id)
+            logical_model_id = int(department_id or 0)
+            department_id = None
         redis = get_redis()
         for quota in quotas:
-            await redis.decr(self._key(user_id, logical_model_id, quota))
+            await redis.decr(
+                self._key_for_quota(
+                    user_id,
+                    department_id,
+                    int(logical_model_id),
+                    quota,
+                    legacy_key_format=legacy_key_format,
+                )
+            )
+
+    async def settle(
+        self,
+        user_id: int,
+        department_id: int | None,
+        logical_model_id: int,
+        quotas: Sequence[Quota],
+        actual_tokens: int,
+        actual_cost: Decimal | None,
+    ) -> None:
+        """Adjust reservation to actual usage. Called after LLM response completes."""
+
+        redis = get_redis()
+        for quota in quotas:
+            adjustment = self._settlement_adjustment(quota, actual_tokens, actual_cost)
+            if adjustment == 0:
+                continue
+            await redis.incrby(
+                self._key_for_quota(user_id, department_id, logical_model_id, quota),
+                adjustment,
+            )
+
+    @staticmethod
+    def _settlement_adjustment(
+        quota: Quota, actual_tokens: int, actual_cost: Decimal | None
+    ) -> int:
+        if quota.metric == QuotaMetric.requests.value:
+            return 0
+        if quota.metric == QuotaMetric.tokens.value:
+            return actual_tokens - 1
+        if quota.metric == QuotaMetric.cost.value:
+            return int(actual_cost or Decimal(0)) - 1
+        return 0
+
+    @staticmethod
+    def _key_for_quota(
+        user_id: int,
+        department_id: int | None,
+        logical_model_id: int,
+        quota: Quota,
+        *,
+        legacy_key_format: bool = False,
+    ) -> str:
+        model_id = quota.logical_model_id or logical_model_id
+        period_key = QuotaEnforcer._period_key(quota.period)
+        if legacy_key_format:
+            return f"quota:{user_id}:{model_id}:{period_key}:{quota.metric}"
+        if quota.scope == QuotaScope.user.value:
+            return f"quota:u:{user_id}:{model_id}:{period_key}:{quota.metric}"
+        if quota.scope == QuotaScope.department.value:
+            dept_id = quota.scope_id if quota.scope_id is not None else department_id
+            return f"quota:d:{dept_id}:{model_id}:{period_key}:{quota.metric}"
+        return f"quota:g:{model_id}:{period_key}:{quota.metric}"
 
     @staticmethod
     def _key(user_id: int, logical_model_id: int, quota: Quota) -> str:
-        model_id = quota.logical_model_id or logical_model_id
-        period_key = QuotaEnforcer._period_key(quota.period)
-        return f"quota:{user_id}:{model_id}:{period_key}:{quota.metric}"
+        return QuotaEnforcer._key_for_quota(
+            user_id,
+            None,
+            logical_model_id,
+            quota,
+            legacy_key_format=True,
+        )
+
+    async def _run_check(
+        self, redis: Redis, keys: Sequence[str], argv: Sequence[str | int]
+    ) -> list[int]:
+        if hasattr(redis, "register_script"):
+            return await cast(
+                "Awaitable[list[int]]",
+                self._script(redis)(keys=keys, args=argv),
+            )
+        return await self._run_check_fallback(redis, keys, argv)
+
+    async def _run_check_fallback(
+        self, redis: Redis, keys: Sequence[str], argv: Sequence[str | int]
+    ) -> list[int]:
+        incremented: list[str] = []
+        quota_count = int(argv[0])
+        for index in range(quota_count):
+            base = 1 + index * 3
+            ttl = int(argv[base])
+            limit = int(argv[base + 1])
+            enforce = int(argv[base + 2])
+            count = int(await cast("Awaitable[int]", redis.incr(keys[index])))
+            if count == 1 and ttl > 0:
+                await redis.expire(keys[index], ttl)
+            incremented.append(keys[index])
+            if enforce == 1 and count > limit:
+                for key in incremented:
+                    await redis.decr(key)
+                return [1, index, count]
+        return [0, -1, -1]
+
+    async def _count(self, redis: Redis, key: str) -> int:
+        if hasattr(redis, "get"):
+            return int(await cast("Awaitable[int | str | None]", redis.get(key)) or 0)
+        data = getattr(redis, "_data", {})
+        return int(data.get(key, 0))
+
+    def _script(self, redis: Redis) -> Any:
+        if self._check_script is None:
+            self._check_script = redis.register_script(_QUOTA_CHECK_LUA)
+        return self._check_script
 
     @staticmethod
     def _period_key(period: str) -> str:

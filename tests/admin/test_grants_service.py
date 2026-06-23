@@ -10,6 +10,8 @@ from src.admin.grants.service import GrantService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.core.query import ListQuery
+from src.db.models.identity import Department, User
+from src.db.models.model_catalog import LogicalModel
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -33,7 +35,30 @@ def _grant_payload(**overrides: object) -> GrantCreate:
     return GrantCreate(**defaults)
 
 
+async def _seed_targets(session: AsyncSession) -> None:
+    session.add_all(
+        [
+            Department(id=10, name="Engineering"),
+            User(id=1, username="alice", employee_no="E001", status="active"),
+            LogicalModel(
+                id=101,
+                name="claude-sonnet",
+                display_name="Claude Sonnet",
+                status="active",
+            ),
+            LogicalModel(
+                id=102,
+                name="gpt-4o",
+                display_name="GPT-4o",
+                status="active",
+            ),
+        ]
+    )
+    await session.commit()
+
+
 async def test_create_grant_and_get_grant(admin_session: AsyncSession) -> None:
+    await _seed_targets(admin_session)
     svc = GrantService(admin_session)
     grant = await svc.create_grant(_grant_payload(), actor=ACTOR)
 
@@ -46,6 +71,7 @@ async def test_create_grant_and_get_grant(admin_session: AsyncSession) -> None:
 async def test_create_grant_duplicate_scope_model_rejected(
     admin_session: AsyncSession,
 ) -> None:
+    await _seed_targets(admin_session)
     svc = GrantService(admin_session)
     await svc.create_grant(_grant_payload(), actor=ACTOR)
 
@@ -58,6 +84,7 @@ async def test_create_grant_duplicate_scope_model_rejected(
 async def test_create_grant_default_clears_old_default(
     admin_session: AsyncSession,
 ) -> None:
+    await _seed_targets(admin_session)
     svc = GrantService(admin_session)
     old = await svc.create_grant(
         _grant_payload(logical_model_id=101, is_default=True), actor=ACTOR
@@ -76,6 +103,7 @@ async def test_create_grant_default_clears_old_default(
 async def test_update_grant_default_toggle_clears_old_default(
     admin_session: AsyncSession,
 ) -> None:
+    await _seed_targets(admin_session)
     svc = GrantService(admin_session)
     old = await svc.create_grant(
         _grant_payload(logical_model_id=101, is_default=True), actor=ACTOR
@@ -94,6 +122,7 @@ async def test_update_grant_default_toggle_clears_old_default(
 
 
 async def test_delete_grant_soft_deletes(admin_session: AsyncSession) -> None:
+    await _seed_targets(admin_session)
     svc = GrantService(admin_session)
     grant = await svc.create_grant(_grant_payload(), actor=ACTOR)
 
@@ -106,6 +135,7 @@ async def test_delete_grant_soft_deletes(admin_session: AsyncSession) -> None:
 
 
 async def test_list_grants_filtered_by_scope(admin_session: AsyncSession) -> None:
+    await _seed_targets(admin_session)
     svc = GrantService(admin_session)
     await svc.create_grant(_grant_payload(scope="user", scope_id=1), actor=ACTOR)
     await svc.create_grant(

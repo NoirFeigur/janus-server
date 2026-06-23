@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
+
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
@@ -25,12 +28,14 @@ from src.auth.service import AuthenticatedUser
 from src.core.channel_crypto import encrypt_channel_key, key_hint
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
+from src.core.redis import get_redis
 from src.db.models.model_catalog import (
     ChannelKey,
     LogicalModel,
     ModelDeployment,
     UpstreamChannel,
 )
+from src.db.session import add_after_commit_hook
 from src.enums import ErrorCode
 from src.exceptions import AppError
 
@@ -182,6 +187,7 @@ class CatalogService:
             updated_by=actor.user_id,
         )
         await self.channels.create(channel)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
         return channel
 
     async def update_channel(
@@ -199,14 +205,26 @@ class CatalogService:
         values["updated_by"] = actor.user_id
         await self.channels.update(channel, **values)
         await self.session.refresh(channel)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
         return channel
 
     async def delete_channel(
         self, channel_id: int, *, actor: AuthenticatedUser
     ) -> None:
         channel = await self._require_channel(channel_id)
+        active_deployment_count = await self.session.scalar(
+            select(func.count()).select_from(ModelDeployment).where(
+                ModelDeployment.channel_id == channel_id,
+                ModelDeployment.is_deleted.is_(False),
+                ModelDeployment.status == "active",
+            )
+        )
+        if active_deployment_count and active_deployment_count > 0:
+            raise AppError(ErrorCode.request_conflict, status.HTTP_409_CONFLICT)
+
         channel.updated_by = actor.user_id
         await self.channels.soft_delete(channel)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
 
     async def list_keys(
         self,
@@ -253,6 +271,7 @@ class CatalogService:
             updated_by=actor.user_id,
         )
         await self.keys.create(key)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
         return key
 
     async def update_key(
@@ -266,12 +285,14 @@ class CatalogService:
         values["updated_by"] = actor.user_id
         await self.keys.update(key, **values)
         await self.session.refresh(key)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
         return key
 
     async def delete_key(self, key_id: int, *, actor: AuthenticatedUser) -> None:
         key = await self._require_key(key_id)
         key.updated_by = actor.user_id
         await self.keys.soft_delete(key)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
 
     async def list_models(
         self, *, query: ListQuery | None = None
@@ -311,6 +332,7 @@ class CatalogService:
             updated_by=actor.user_id,
         )
         await self.models.create(model)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
         return model
 
     async def update_model(
@@ -328,12 +350,24 @@ class CatalogService:
         values["updated_by"] = actor.user_id
         await self.models.update(model, **values)
         await self.session.refresh(model)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
         return model
 
     async def delete_model(self, model_id: int, *, actor: AuthenticatedUser) -> None:
         model = await self._require_model(model_id)
+        active_deployment_count = await self.session.scalar(
+            select(func.count()).select_from(ModelDeployment).where(
+                ModelDeployment.logical_model_id == model_id,
+                ModelDeployment.is_deleted.is_(False),
+                ModelDeployment.status == "active",
+            )
+        )
+        if active_deployment_count and active_deployment_count > 0:
+            raise AppError(ErrorCode.request_conflict, status.HTTP_409_CONFLICT)
+
         model.updated_by = actor.user_id
         await self.models.soft_delete(model)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
 
     async def list_deployments(
         self,
@@ -384,6 +418,7 @@ class CatalogService:
             updated_by=actor.user_id,
         )
         await self.deployments.create(deployment)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
         return deployment
 
     async def update_deployment(
@@ -410,6 +445,7 @@ class CatalogService:
         values["updated_by"] = actor.user_id
         await self.deployments.update(deployment, **values)
         await self.session.refresh(deployment)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
         return deployment
 
     async def delete_deployment(
@@ -418,3 +454,16 @@ class CatalogService:
         deployment = await self._require_deployment(deployment_id)
         deployment.updated_by = actor.user_id
         await self.deployments.soft_delete(deployment)
+        add_after_commit_hook(self.session, _publish_router_invalidation)
+
+
+def _publish_router_invalidation() -> None:
+    """Publish router invalidation event (best-effort, non-blocking)."""
+    import asyncio
+
+    async def _pub() -> None:
+        with suppress(Exception):
+            await get_redis().publish("gateway:router:invalidate", "1")
+
+    with suppress(RuntimeError):
+        asyncio.get_event_loop().create_task(_pub())
