@@ -79,7 +79,7 @@ async def test_list_keys_by_user_id(admin_session: AsyncSession) -> None:
     await svc.create_key(_key_payload(user_id=1, name="first"), actor=ACTOR)
     await svc.create_key(_key_payload(user_id=2, name="second"), actor=ACTOR)
 
-    result = await svc.list_keys(user_id=2, query=ListQuery())
+    result = await svc.list_keys(user_id=2, query=ListQuery(), actor=ACTOR)
 
     assert result.total == 1
     assert result.items[0].user_id == 2
@@ -105,6 +105,6 @@ async def test_delete_key_soft_deletes(admin_session: AsyncSession) -> None:
     await svc.delete_key(key.id, actor=ACTOR)
 
     with pytest.raises(AppError) as exc:
-        await svc.get_key(key.id)
+        await svc.get_key(key.id, actor=ACTOR)
 
     assert exc.value.status_code == 404

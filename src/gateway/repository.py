@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import and_, case, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,7 @@ class RouterDeploymentRow:
     provider: str
     protocol: str
     api_base: str | None
+    extra_config: dict[str, Any] | None
     api_key_encrypted: str
     channel_id: int
     channel_key_id: int
@@ -48,6 +50,7 @@ class GatewayRepository:
                 UpstreamChannel.provider,
                 UpstreamChannel.protocol,
                 UpstreamChannel.api_base,
+                UpstreamChannel.extra_config,
                 ChannelKey.api_key_encrypted,
                 UpstreamChannel.id,
                 ChannelKey.id,
@@ -88,14 +91,15 @@ class GatewayRepository:
                 provider=row[3],
                 protocol=row[4],
                 api_base=row[5],
-                api_key_encrypted=row[6],
-                channel_id=row[7],
-                channel_key_id=row[8],
-                deployment_weight=row[9],
-                deployment_priority=row[10],
-                key_weight=row[11],
-                key_rpm_limit=row[12],
-                key_tpm_limit=row[13],
+                extra_config=row[6],
+                api_key_encrypted=row[7],
+                channel_id=row[8],
+                channel_key_id=row[9],
+                deployment_weight=row[10],
+                deployment_priority=row[11],
+                key_weight=row[12],
+                key_rpm_limit=row[13],
+                key_tpm_limit=row[14],
             )
             for row in rows
         ]

@@ -7,17 +7,37 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
 
+from src.db.models.identity import User
 from src.db.models.usage import UsageRecord
+from src.db.scope import DataScope
 
 
 class UsageRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+
+    def _scope_predicate(
+        self, scope_filter: DataScope, *, actor_id: int
+    ) -> ColumnElement[bool] | None:
+        if scope_filter.unrestricted:
+            return None
+        clauses: list[ColumnElement[bool]] = []
+        if scope_filter.department_ids:
+            user_ids = select(User.id).where(
+                User.is_deleted.is_(False),
+                User.department_id.in_(scope_filter.department_ids),
+            )
+            clauses.append(UsageRecord.user_id.in_(user_ids))
+        if scope_filter.include_self:
+            clauses.append(UsageRecord.user_id == actor_id)
+        if not clauses:
+            return UsageRecord.id == -1
+        return or_(*clauses)
 
     def _filters(
         self,
@@ -27,8 +47,14 @@ class UsageRepository:
         status: str | None = None,
         date_from: datetime | None,
         date_to: datetime | None,
+        scope_filter: DataScope | None = None,
+        actor_id: int | None = None,
     ) -> list[ColumnElement[bool]]:
         filters: list[ColumnElement[bool]] = []
+        if scope_filter is not None and actor_id is not None:
+            predicate = self._scope_predicate(scope_filter, actor_id=actor_id)
+            if predicate is not None:
+                filters.append(predicate)
         if user_id is not None:
             filters.append(UsageRecord.user_id == user_id)
         if logical_model_id is not None:
@@ -49,6 +75,8 @@ class UsageRepository:
         status: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        scope_filter: DataScope | None = None,
+        actor_id: int | None = None,
         sort: tuple[InstrumentedAttribute[object], bool] | None = None,
         limit: int,
         offset: int,
@@ -61,6 +89,8 @@ class UsageRepository:
             status=status,
             date_from=date_from,
             date_to=date_to,
+            scope_filter=scope_filter,
+            actor_id=actor_id,
         ):
             stmt = stmt.where(predicate)
         if sort is None:
@@ -80,6 +110,8 @@ class UsageRepository:
         status: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        scope_filter: DataScope | None = None,
+        actor_id: int | None = None,
     ) -> int:
         """Count usage rows using the same filters as list_records."""
         stmt = select(func.count()).select_from(UsageRecord)
@@ -89,6 +121,8 @@ class UsageRepository:
             status=status,
             date_from=date_from,
             date_to=date_to,
+            scope_filter=scope_filter,
+            actor_id=actor_id,
         ):
             stmt = stmt.where(predicate)
         total = await self.session.scalar(stmt)
@@ -101,6 +135,8 @@ class UsageRepository:
         logical_model_id: int | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        scope_filter: DataScope | None = None,
+        actor_id: int | None = None,
     ) -> dict[str, Any]:
         """Aggregate token, cost, latency, and result-count statistics."""
         success_expr = case((UsageRecord.status == "success", 1), else_=0)
@@ -118,6 +154,8 @@ class UsageRepository:
             logical_model_id=logical_model_id,
             date_from=date_from,
             date_to=date_to,
+            scope_filter=scope_filter,
+            actor_id=actor_id,
         ):
             stmt = stmt.where(predicate)
         row = (await self.session.execute(stmt)).one()

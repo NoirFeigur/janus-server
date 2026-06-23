@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +8,7 @@ from starlette import status
 
 from src.auth.service import AuthenticatedUser
 from src.db.models.model_catalog import LogicalModel
+from src.db.session import async_session_factory
 from src.enums import ErrorCode
 from src.exceptions import AppError
 from src.gateway.quota import QuotaCheckResult, QuotaEnforcer, QuotaLimitExceeded
@@ -83,6 +85,8 @@ class GatewayService:
         actual_tokens: int,
         actual_cost: Decimal | None,
     ) -> None:
+        # Re-querying active quotas can use a newer quota set after hot reloads.
+        # The 30s rebuild interval and period-stamped Redis keys make this acceptable.
         quotas = await self.repo.get_active_quotas(
             user_id, department_id, logical_model_id
         )
@@ -94,3 +98,29 @@ class GatewayService:
             actual_tokens,
             actual_cost,
         )
+
+
+async def settle_quota_independent(
+    *,
+    user_id: int,
+    department_id: int | None,
+    logical_model_id: int,
+    actual_tokens: int,
+    actual_cost: Decimal | None,
+) -> None:
+    """Settle quota using an independent session after request scope closes."""
+    # Re-querying active quotas can use a newer quota set after hot reloads.
+    # The 30s rebuild interval and period-stamped Redis keys make this acceptable.
+    with suppress(Exception):
+        async with async_session_factory() as session:
+            quotas = await GatewayRepository(session).get_active_quotas(
+                user_id, department_id, logical_model_id
+            )
+            await QuotaEnforcer().settle(
+                user_id,
+                department_id,
+                logical_model_id,
+                quotas,
+                actual_tokens,
+                actual_cost,
+            )

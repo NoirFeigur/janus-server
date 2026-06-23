@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 from contextlib import suppress
+from urllib.parse import urlsplit
 
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
@@ -24,7 +25,8 @@ from src.admin.catalog.schemas import (
     UpstreamChannelCreate,
     UpstreamChannelUpdate,
 )
-from src.auth.service import AuthenticatedUser
+from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.config import get_settings
 from src.core.channel_crypto import encrypt_channel_key, key_hint
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
@@ -86,6 +88,10 @@ class CatalogService:
         self.keys = ChannelKeyRepository(session)
         self.models = LogicalModelRepository(session)
         self.deployments = ModelDeploymentRepository(session)
+        self.auth = AuthService(session)
+
+    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
+        return await self.auth.resolve_data_scope(actor)
 
     async def _require_channel(self, channel_id: int) -> UpstreamChannel:
         channel = await self.channels.get(channel_id)
@@ -151,6 +157,39 @@ class CatalogService:
         if deployment is not None and deployment.id != current_id:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
+    def _require_catalog_wildcard(self, actor: AuthenticatedUser) -> None:
+        if not (actor.is_superuser or actor.has_permission("ai:catalog:*")):
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+
+    async def _check_catalog_write_access(
+        self, actor: AuthenticatedUser, resource: ChannelKey | UpstreamChannel
+    ) -> None:
+        self._require_catalog_wildcard(actor)
+        scope = await self._scope(actor)
+        if scope.unrestricted or resource.created_by == actor.user_id:
+            return
+        raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+
+    async def _require_catalog_create_access(self, actor: AuthenticatedUser) -> None:
+        self._require_catalog_wildcard(actor)
+        scope = await self._scope(actor)
+        if not scope.unrestricted:
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+
+    def _validate_api_base(self, api_base: str | None) -> None:
+        if api_base is None:
+            return
+        parsed = urlsplit(api_base)
+        if parsed.scheme == "https" and parsed.hostname:
+            return
+        if parsed.scheme == "http" and parsed.hostname:
+            settings = get_settings()
+            if settings.environment not in {"prod", "production"} and _is_internal_host(
+                parsed.hostname
+            ):
+                return
+        raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+
     async def list_channels(
         self, *, query: ListQuery | None = None
     ) -> PageResult[UpstreamChannel]:
@@ -173,6 +212,8 @@ class CatalogService:
     async def create_channel(
         self, payload: UpstreamChannelCreate, *, actor: AuthenticatedUser
     ) -> UpstreamChannel:
+        await self._require_catalog_create_access(actor)
+        self._validate_api_base(payload.api_base)
         await self._ensure_channel_name_unique(payload.name)
         channel = UpstreamChannel(
             name=payload.name,
@@ -198,7 +239,10 @@ class CatalogService:
         actor: AuthenticatedUser,
     ) -> UpstreamChannel:
         channel = await self._require_channel(channel_id)
+        await self._check_catalog_write_access(actor, channel)
         values = payload.model_dump(exclude_unset=True)
+        if "api_base" in values:
+            self._validate_api_base(values["api_base"])
         name = values.get("name")
         if name is not None:
             await self._ensure_channel_name_unique(name, current_id=channel.id)
@@ -212,14 +256,8 @@ class CatalogService:
         self, channel_id: int, *, actor: AuthenticatedUser
     ) -> None:
         channel = await self._require_channel(channel_id)
-        active_deployment_count = await self.session.scalar(
-            select(func.count()).select_from(ModelDeployment).where(
-                ModelDeployment.channel_id == channel_id,
-                ModelDeployment.is_deleted.is_(False),
-                ModelDeployment.status == "active",
-            )
-        )
-        if active_deployment_count and active_deployment_count > 0:
+        await self._check_catalog_write_access(actor, channel)
+        if await self.channels.count_active_deployments(channel_id) > 0:
             raise AppError(ErrorCode.request_conflict, status.HTTP_409_CONFLICT)
 
         channel.updated_by = actor.user_id
@@ -254,7 +292,9 @@ class CatalogService:
     async def create_key(
         self, payload: ChannelKeyCreate, *, actor: AuthenticatedUser
     ) -> ChannelKey:
-        await self._require_channel(payload.channel_id)
+        self._require_catalog_wildcard(actor)
+        channel = await self._require_channel(payload.channel_id)
+        await self._check_catalog_write_access(actor, channel)
         key = ChannelKey(
             channel_id=payload.channel_id,
             alias=payload.alias,
@@ -278,10 +318,12 @@ class CatalogService:
         self, key_id: int, payload: ChannelKeyUpdate, *, actor: AuthenticatedUser
     ) -> ChannelKey:
         key = await self._require_key(key_id)
+        await self._check_catalog_write_access(actor, key)
         values = payload.model_dump(exclude_unset=True)
         channel_id = values.get("channel_id")
         if channel_id is not None:
-            await self._require_channel(channel_id)
+            channel = await self._require_channel(channel_id)
+            await self._check_catalog_write_access(actor, channel)
         values["updated_by"] = actor.user_id
         await self.keys.update(key, **values)
         await self.session.refresh(key)
@@ -290,9 +332,23 @@ class CatalogService:
 
     async def delete_key(self, key_id: int, *, actor: AuthenticatedUser) -> None:
         key = await self._require_key(key_id)
+        await self._check_catalog_write_access(actor, key)
         key.updated_by = actor.user_id
         await self.keys.soft_delete(key)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+
+    async def rotate_key(
+        self, key_id: int, new_api_key: str, *, actor: AuthenticatedUser
+    ) -> ChannelKey:
+        """Replace the encrypted upstream key material for a channel key."""
+        key = await self._require_key(key_id)
+        await self._check_catalog_write_access(actor, key)
+        key.api_key_encrypted = encrypt_channel_key(new_api_key)
+        key.key_hint = key_hint(new_api_key)
+        key.updated_by = actor.user_id
+        await self.session.flush()
+        add_after_commit_hook(self.session, _publish_router_invalidation)
+        return key
 
     async def list_models(
         self, *, query: ListQuery | None = None
@@ -355,14 +411,7 @@ class CatalogService:
 
     async def delete_model(self, model_id: int, *, actor: AuthenticatedUser) -> None:
         model = await self._require_model(model_id)
-        active_deployment_count = await self.session.scalar(
-            select(func.count()).select_from(ModelDeployment).where(
-                ModelDeployment.logical_model_id == model_id,
-                ModelDeployment.is_deleted.is_(False),
-                ModelDeployment.status == "active",
-            )
-        )
-        if active_deployment_count and active_deployment_count > 0:
+        if await self.models.count_active_deployments(model_id) > 0:
             raise AppError(ErrorCode.request_conflict, status.HTTP_409_CONFLICT)
 
         model.updated_by = actor.user_id
@@ -461,3 +510,13 @@ async def _publish_router_invalidation() -> None:
     """Publish router invalidation event (best-effort, non-blocking)."""
     with suppress(Exception):
         await get_redis().publish("gateway:router:invalidate", "1")
+
+
+def _is_internal_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local

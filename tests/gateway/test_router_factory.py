@@ -30,6 +30,7 @@ def _row(*, api_base: str | None = "https://api.example.test") -> RouterDeployme
         provider="anthropic",
         protocol="anthropic",
         api_base=api_base,
+        extra_config=None,
         api_key_encrypted=encrypt_channel_key("sk-plaintext"),
         channel_id=20,
         channel_key_id=30,

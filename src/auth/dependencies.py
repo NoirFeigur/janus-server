@@ -29,11 +29,20 @@ def get_auth_service(
 
 
 async def get_current_user(
+    request: Request,
     service: Annotated[AuthService, Depends(get_auth_service)],
     authorization: Annotated[str | None, Header()] = None,
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ) -> AuthenticatedUser:
-    """Resolve JWT or sk-key to a user (programmatic protocol surface)."""
+    """Resolve JWT or sk-key to a user (programmatic protocol surface).
+
+    Reuses the user resolved by AuthMiddleware when available to avoid
+    duplicate DB/Redis lookups on the hot path.
+    """
+    state_user = getattr(request.state, "user", None)
+    if isinstance(state_user, AuthenticatedUser):
+        return state_user
+
     credential = extract_credential(authorization, x_api_key, allow_api_key=True)
     if credential.kind == CredentialKind.api_key:
         return await service.resolve_api_key(credential.value)

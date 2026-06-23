@@ -12,6 +12,7 @@ from src.admin.quota.service import QuotaService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.db.models.identity import User
+from src.db.models.model_catalog import LogicalModel
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -39,7 +40,17 @@ def _quota_payload(**overrides: object) -> QuotaCreate:
 
 
 async def _seed_user(session: AsyncSession) -> None:
-    session.add(User(id=1, username="alice", employee_no="E001", status="active"))
+    session.add_all(
+        [
+            User(id=1, username="alice", employee_no="E001", status="active"),
+            LogicalModel(
+                id=101,
+                name="claude-sonnet",
+                display_name="Claude Sonnet",
+                status="active",
+            ),
+        ]
+    )
     await session.commit()
 
 
@@ -48,7 +59,7 @@ async def test_create_quota_and_get_quota(admin_session: AsyncSession) -> None:
     svc = QuotaService(admin_session)
     quota = await svc.create_quota(_quota_payload(), actor=ACTOR)
 
-    fetched = await svc.get_quota(quota.id)
+    fetched = await svc.get_quota(quota.id, actor=ACTOR)
 
     assert fetched.id == quota.id
     assert fetched.limit_value == Decimal("1000.000000")
@@ -112,6 +123,6 @@ async def test_delete_quota_soft_deletes(admin_session: AsyncSession) -> None:
     await svc.delete_quota(quota.id, actor=ACTOR)
 
     with pytest.raises(AppError) as exc:
-        await svc.get_quota(quota.id)
+        await svc.get_quota(quota.id, actor=ACTOR)
 
     assert exc.value.status_code == 404

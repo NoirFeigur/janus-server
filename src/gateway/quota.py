@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,8 @@ from redis.asyncio import Redis
 from src.core.redis import get_redis
 from src.db.models.quota import Quota
 from src.enums import QuotaMetric, QuotaPeriod, QuotaScope
+
+logger = logging.getLogger(__name__)
 
 _QUOTA_CHECK_LUA = """
 -- KEYS: quota redis keys (one per quota rule)
@@ -175,13 +178,29 @@ class QuotaEnforcer:
 
         redis = get_redis()
         for quota in quotas:
+            # Pre-flight reserves 1 unit for fairness; post-flight settles actual.
+            # Under high concurrency near limits, brief over-quota is possible.
             adjustment = self._settlement_adjustment(quota, actual_tokens, actual_cost)
             if adjustment == 0:
                 continue
+            key = self._key_for_quota(user_id, department_id, logical_model_id, quota)
             await redis.incrby(
-                self._key_for_quota(user_id, department_id, logical_model_id, quota),
+                key,
                 adjustment,
             )
+            current = Decimal(await self._count(redis, key))
+            limit = self._redis_limit(quota)
+            if quota.enforce and current > limit:
+                logger.warning(
+                    "quota exceeded after settlement",
+                    extra={
+                        "quota_id": quota.id,
+                        "metric": quota.metric,
+                        "scope": quota.scope,
+                        "current": str(current),
+                        "limit": str(limit),
+                    },
+                )
 
     @staticmethod
     def _settlement_adjustment(
@@ -207,7 +226,7 @@ class QuotaEnforcer:
         *,
         legacy_key_format: bool = False,
     ) -> str:
-        model_id = quota.logical_model_id or logical_model_id
+        model_id = quota.logical_model_id if quota.logical_model_id is not None else 0
         period_key = QuotaEnforcer._period_key(quota.period)
         if legacy_key_format:
             return f"quota:{user_id}:{model_id}:{period_key}:{quota.metric}"
@@ -268,6 +287,12 @@ class QuotaEnforcer:
         if self._check_script is None:
             self._check_script = redis.register_script(_QUOTA_CHECK_LUA)
         return self._check_script
+
+    @staticmethod
+    def _redis_limit(quota: Quota) -> Decimal:
+        if quota.metric == QuotaMetric.cost.value:
+            return quota.limit_value * Decimal(1_000_000)
+        return quota.limit_value
 
     @staticmethod
     def _period_key(period: str) -> str:

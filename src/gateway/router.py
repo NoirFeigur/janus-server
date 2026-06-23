@@ -22,10 +22,10 @@ from src.db.models.model_catalog import LogicalModel
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
 from src.gateway.dependencies import get_gateway_service
-from src.gateway.quota import QuotaCheckResult, QuotaEnforcer
+from src.gateway.quota import QuotaCheckResult
 from src.gateway.router_manager import RouterManager
 from src.gateway.schemas import AnthropicRequest, GeminiRequest, OpenAIRequest
-from src.gateway.service import GatewayService
+from src.gateway.service import GatewayService, settle_quota_independent
 from src.gateway.usage import UsageData, compute_cost, record_usage
 
 router = APIRouter(tags=["gateway"])
@@ -196,6 +196,14 @@ async def gemini_generate_content(
         native_params["systemInstruction"] = payload.system_instruction
     if payload.generationConfig is not None:
         native_params["generationConfig"] = payload.generationConfig
+    if payload.tools is not None:
+        native_params["tools"] = payload.tools
+    if payload.tool_config is not None:
+        native_params["toolConfig"] = payload.tool_config
+    if payload.safety_settings is not None:
+        native_params["safetySettings"] = payload.safety_settings
+    if payload.cached_content is not None:
+        native_params["cachedContent"] = payload.cached_content
 
     try:
         if stream:
@@ -306,7 +314,7 @@ async def _execute_completion(
     started_at = monotonic()
     llm_router = RouterManager.get_router()
     if stream:
-        params.setdefault("stream_options", {"include_usage": True})
+        params["stream_options"] = {"include_usage": True}
     try:
         response = await llm_router.acompletion(
             model=logical_model.name,
@@ -384,19 +392,22 @@ async def _stream_openai(
     upstream_model: str | None = None
     stream_start = monotonic()
     response_iter = response.__aiter__()
+    bytes_yielded = 0
     try:
         while True:
             elapsed = monotonic() - stream_start
             if elapsed > _STREAM_MAX_DURATION_SECONDS:
                 status_value = UsageStatus.timeout.value
-                await _compensate_quota(service, user, logical_model.id)
+                if bytes_yielded == 0:
+                    await _compensate_quota(service, user, logical_model.id)
                 break
             try:
                 async with asyncio.timeout(_STREAM_IDLE_TIMEOUT_SECONDS):
                     chunk = await response_iter.__anext__()
             except TimeoutError:
                 status_value = UsageStatus.timeout.value
-                await _compensate_quota(service, user, logical_model.id)
+                if bytes_yielded == 0:
+                    await _compensate_quota(service, user, logical_model.id)
                 break
             except StopAsyncIteration:
                 break
@@ -406,16 +417,22 @@ async def _stream_openai(
             chunk_usage = _extract_usage(chunk)
             if chunk_usage["total_tokens"]:
                 usage = chunk_usage
-            yield f"data: {_dump_json(chunk)}\n\n"
+            data = f"data: {_dump_json(chunk)}\n\n"
+            bytes_yielded += len(data.encode("utf-8"))
+            yield data
         if status_value == UsageStatus.success.value:
-            yield "data: [DONE]\n\n"
+            data = "data: [DONE]\n\n"
+            bytes_yielded += len(data.encode("utf-8"))
+            yield data
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
-        await _compensate_quota(service, user, logical_model.id)
+        if bytes_yielded == 0:
+            await _compensate_quota(service, user, logical_model.id)
         raise
     except Exception as exc:
         status_value = _usage_status_for_exception(exc)
-        await _compensate_quota(service, user, logical_model.id)
+        if bytes_yielded == 0:
+            await _compensate_quota(service, user, logical_model.id)
         raise _upstream_error(exc) from exc
     finally:
         response_channel_id, response_upstream_model = _extract_routing_info(response)
@@ -432,7 +449,7 @@ async def _stream_openai(
             upstream_model=upstream_model,
         )
         if status_value == UsageStatus.success.value and usage["total_tokens"]:
-            await _settle_quota_independent(
+            await settle_quota_independent(
                 user_id=user.user_id,
                 department_id=user.department_id,
                 logical_model_id=logical_model.id,
@@ -462,36 +479,43 @@ async def _stream_anthropic_native(
     status_value = UsageStatus.success.value
     stream_start = monotonic()
     response_iter = response.__aiter__()
+    bytes_yielded = 0
+    sse_buffer = [""]
 
     try:
         while True:
             elapsed = monotonic() - stream_start
             if elapsed > _STREAM_MAX_DURATION_SECONDS:
                 status_value = UsageStatus.timeout.value
-                await _compensate_quota(service, user, logical_model.id)
+                if bytes_yielded == 0:
+                    await _compensate_quota(service, user, logical_model.id)
                 break
             try:
                 async with asyncio.timeout(_STREAM_IDLE_TIMEOUT_SECONDS):
                     chunk = await response_iter.__anext__()
             except TimeoutError:
                 status_value = UsageStatus.timeout.value
-                await _compensate_quota(service, user, logical_model.id)
+                if bytes_yielded == 0:
+                    await _compensate_quota(service, user, logical_model.id)
                 break
             except StopAsyncIteration:
                 break
 
             # chunk is bytes (raw SSE) — parse for usage then yield as-is
             raw_bytes = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
-            _accumulate_anthropic_usage(raw_bytes, usage)
+            _accumulate_anthropic_usage(raw_bytes, usage, sse_buffer)
+            bytes_yielded += len(raw_bytes)
             yield raw_bytes
 
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
-        await _compensate_quota(service, user, logical_model.id)
+        if bytes_yielded == 0:
+            await _compensate_quota(service, user, logical_model.id)
         raise
     except Exception as exc:
         status_value = _usage_status_for_exception(exc)
-        await _compensate_quota(service, user, logical_model.id)
+        if bytes_yielded == 0:
+            await _compensate_quota(service, user, logical_model.id)
         raise _upstream_error(exc) from exc
     finally:
         _record_usage_task(
@@ -505,7 +529,7 @@ async def _stream_anthropic_native(
             upstream_model=upstream_model,
         )
         if status_value == UsageStatus.success.value and usage["total_tokens"]:
-            await _settle_quota_independent(
+            await settle_quota_independent(
                 user_id=user.user_id,
                 department_id=user.department_id,
                 logical_model_id=logical_model.id,
@@ -535,35 +559,42 @@ async def _stream_gemini_native(
     status_value = UsageStatus.success.value
     stream_start = monotonic()
     response_iter = response.__aiter__()
+    bytes_yielded = 0
+    sse_buffer = [""]
 
     try:
         while True:
             elapsed = monotonic() - stream_start
             if elapsed > _STREAM_MAX_DURATION_SECONDS:
                 status_value = UsageStatus.timeout.value
-                await _compensate_quota(service, user, logical_model.id)
+                if bytes_yielded == 0:
+                    await _compensate_quota(service, user, logical_model.id)
                 break
             try:
                 async with asyncio.timeout(_STREAM_IDLE_TIMEOUT_SECONDS):
                     chunk = await response_iter.__anext__()
             except TimeoutError:
                 status_value = UsageStatus.timeout.value
-                await _compensate_quota(service, user, logical_model.id)
+                if bytes_yielded == 0:
+                    await _compensate_quota(service, user, logical_model.id)
                 break
             except StopAsyncIteration:
                 break
 
             raw_bytes = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
-            _accumulate_gemini_usage(raw_bytes, usage)
+            _accumulate_gemini_usage(raw_bytes, usage, sse_buffer)
+            bytes_yielded += len(raw_bytes)
             yield raw_bytes
 
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
-        await _compensate_quota(service, user, logical_model.id)
+        if bytes_yielded == 0:
+            await _compensate_quota(service, user, logical_model.id)
         raise
     except Exception as exc:
         status_value = _usage_status_for_exception(exc)
-        await _compensate_quota(service, user, logical_model.id)
+        if bytes_yielded == 0:
+            await _compensate_quota(service, user, logical_model.id)
         raise _upstream_error(exc) from exc
     finally:
         _record_usage_task(
@@ -577,7 +608,7 @@ async def _stream_gemini_native(
             upstream_model=upstream_model,
         )
         if status_value == UsageStatus.success.value and usage["total_tokens"]:
-            await _settle_quota_independent(
+            await settle_quota_independent(
                 user_id=user.user_id,
                 department_id=user.department_id,
                 logical_model_id=logical_model.id,
@@ -591,7 +622,9 @@ async def _stream_gemini_native(
 # ---------------------------------------------------------------------------
 
 
-def _accumulate_anthropic_usage(raw_bytes: bytes, usage: dict[str, int]) -> None:
+def _accumulate_anthropic_usage(
+    raw_bytes: bytes, usage: dict[str, int], buffer: list[str] | None = None
+) -> None:
     """Parse Anthropic SSE bytes and extract usage from relevant events.
 
     Anthropic usage arrives in:
@@ -599,10 +632,13 @@ def _accumulate_anthropic_usage(raw_bytes: bytes, usage: dict[str, int]) -> None
     - message_delta.usage.output_tokens
     """
     try:
-        text = raw_bytes.decode("utf-8", errors="replace")
+        sse_buffer = buffer if buffer is not None else [""]
+        text = sse_buffer[0] + raw_bytes.decode("utf-8", errors="replace")
     except Exception:
         return
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    sse_buffer[0] = lines[-1]
+    for line in lines[:-1]:
         if not line.startswith("data: "):
             continue
         try:
@@ -624,17 +660,22 @@ def _accumulate_anthropic_usage(raw_bytes: bytes, usage: dict[str, int]) -> None
                 usage["total_tokens"] = usage["prompt_tokens"] + output_tokens
 
 
-def _accumulate_gemini_usage(raw_bytes: bytes, usage: dict[str, int]) -> None:
+def _accumulate_gemini_usage(
+    raw_bytes: bytes, usage: dict[str, int], buffer: list[str] | None = None
+) -> None:
     """Parse Gemini streaming bytes and extract usageMetadata.
 
     Gemini sends `data: {...}` with optional `usageMetadata` containing
     promptTokenCount, candidatesTokenCount, totalTokenCount.
     """
     try:
-        text = raw_bytes.decode("utf-8", errors="replace")
+        sse_buffer = buffer if buffer is not None else [""]
+        text = sse_buffer[0] + raw_bytes.decode("utf-8", errors="replace")
     except Exception:
         return
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    sse_buffer[0] = lines[-1]
+    for line in lines[:-1]:
         if not line.startswith("data: "):
             continue
         try:
@@ -745,29 +786,6 @@ async def _compensate_quota(
     await service.quota.compensate(
         user.user_id, user.department_id, logical_model_id, quotas
     )
-
-
-async def _settle_quota_independent(
-    *,
-    user_id: int,
-    department_id: int | None,
-    logical_model_id: int,
-    actual_tokens: int,
-    actual_cost: Decimal | None,
-) -> None:
-    """Settle quota using an independent session (safe after request session closes)."""
-    from src.db.session import async_session_factory
-    from src.gateway.repository import GatewayRepository
-
-    with suppress(Exception):
-        async with async_session_factory() as session:
-            quotas = await GatewayRepository(session).get_active_quotas(
-                user_id, department_id, logical_model_id
-            )
-            await QuotaEnforcer().settle(
-                user_id, department_id, logical_model_id, quotas,
-                actual_tokens, actual_cost,
-            )
 
 
 def _compute_internal_cost(

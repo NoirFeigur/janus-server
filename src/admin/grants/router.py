@@ -46,7 +46,7 @@ def _query(
 async def list_grants(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:grant:list"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:grant:list"))],
     scope: Literal["user", "department"] | None = None,
     scope_id: Annotated[int | None, Query(ge=0)] = None,
     logical_model_id: Annotated[int | None, Query(ge=0)] = None,
@@ -60,6 +60,7 @@ async def list_grants(
         scope_id=scope_id,
         logical_model_id=logical_model_id,
         query=_query(sort_by, sort_order, limit, offset),
+        actor=user,
     )
     return success(
         page(
@@ -77,9 +78,9 @@ async def get_grant(
     grant_id: int,
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:grant:query"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:grant:query"))],
 ) -> SuccessEnvelope[GrantRead]:
-    grant = await service.get_grant(grant_id)
+    grant = await service.get_grant(grant_id, actor=user)
     return success(GrantRead.model_validate(grant), trace_id=trace_id)
 
 

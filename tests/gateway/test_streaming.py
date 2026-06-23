@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from src.auth.service import AuthenticatedUser
+from src.db.models.model_catalog import LogicalModel
 from src.gateway.router import (
     _accumulate_anthropic_usage,
     _accumulate_gemini_usage,
@@ -41,23 +43,35 @@ def _make_gemini_sse(*payloads: dict[str, Any]) -> list[bytes]:
     return chunks
 
 
-class FakeUser:
-    user_id = 100
-    department_id = 10
-    api_key_id = None
+def _fake_user() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=100,
+        username="test_user",
+        department_id=10,
+        permissions=frozenset(),
+    )
 
 
-class FakeLogicalModel:
-    id = 1
-    name = "claude-sonnet"
-    display_name = "Claude Sonnet"
-    price_input = None
-    price_output = None
+def _fake_logical_model() -> Any:
+    from unittest.mock import Mock
+
+    model = Mock(spec=LogicalModel)
+    model.id = 1
+    model.name = "claude-sonnet"
+    model.display_name = "Claude Sonnet"
+    model.price_input = None
+    model.price_output = None
+    return model
 
 
 async def _fake_byte_stream(chunks: list[bytes]) -> AsyncIterator[bytes]:
     for chunk in chunks:
         yield chunk
+
+
+# Backward-compatible aliases used by all stream tests below.
+FakeUser = _fake_user
+FakeLogicalModel = _fake_logical_model
 
 
 # ---------------------------------------------------------------------------
@@ -257,12 +271,12 @@ async def test_stream_anthropic_native_pipes_bytes_and_extracts_usage() -> None:
 
     collected: list[bytes] = []
     with patch(
-        "src.gateway.router._settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
     ):
         async for chunk in _stream_anthropic_native(
             response=_fake_byte_stream(sse_chunks),
-            user=FakeUser(),  # type: ignore[arg-type]
-            logical_model=FakeLogicalModel(),  # type: ignore[arg-type]
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
             service=fake_service,
             started_at=0.0,
             request_id="req-1",
@@ -308,14 +322,14 @@ async def test_stream_anthropic_native_records_usage() -> None:
     fake_service.quota = AsyncMock()
 
     with patch(
-        "src.gateway.router._settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
     ) as mock_settle, patch(
         "src.gateway.router.record_usage", new_callable=AsyncMock
     ) as mock_record:
         async for _ in _stream_anthropic_native(
             response=_fake_byte_stream(sse_chunks),
-            user=FakeUser(),  # type: ignore[arg-type]
-            logical_model=FakeLogicalModel(),  # type: ignore[arg-type]
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
             service=fake_service,
             started_at=0.0,
             request_id="req-u",
@@ -374,12 +388,12 @@ async def test_stream_gemini_native_pipes_bytes_and_extracts_usage() -> None:
 
     collected: list[bytes] = []
     with patch(
-        "src.gateway.router._settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
     ):
         async for chunk in _stream_gemini_native(
             response=_fake_byte_stream(sse_chunks),
-            user=FakeUser(),  # type: ignore[arg-type]
-            logical_model=FakeLogicalModel(),  # type: ignore[arg-type]
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
             service=fake_service,
             started_at=0.0,
             request_id="req-g",
@@ -417,14 +431,14 @@ async def test_stream_gemini_native_records_usage() -> None:
     fake_service.quota = AsyncMock()
 
     with patch(
-        "src.gateway.router._settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
     ) as mock_settle, patch(
         "src.gateway.router.record_usage", new_callable=AsyncMock
     ) as mock_record:
         async for _ in _stream_gemini_native(
             response=_fake_byte_stream(sse_chunks),
-            user=FakeUser(),  # type: ignore[arg-type]
-            logical_model=FakeLogicalModel(),  # type: ignore[arg-type]
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
             service=fake_service,
             started_at=0.0,
             request_id="req-gu",

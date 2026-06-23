@@ -62,7 +62,7 @@ async def test_create_grant_and_get_grant(admin_session: AsyncSession) -> None:
     svc = GrantService(admin_session)
     grant = await svc.create_grant(_grant_payload(), actor=ACTOR)
 
-    fetched = await svc.get_grant(grant.id)
+    fetched = await svc.get_grant(grant.id, actor=ACTOR)
 
     assert fetched.id == grant.id
     assert fetched.scope == "user"
@@ -129,7 +129,7 @@ async def test_delete_grant_soft_deletes(admin_session: AsyncSession) -> None:
     await svc.delete_grant(grant.id, actor=ACTOR)
 
     with pytest.raises(AppError) as exc:
-        await svc.get_grant(grant.id)
+        await svc.get_grant(grant.id, actor=ACTOR)
 
     assert exc.value.status_code == 404
 
@@ -143,7 +143,7 @@ async def test_list_grants_filtered_by_scope(admin_session: AsyncSession) -> Non
         actor=ACTOR,
     )
 
-    result = await svc.list_grants(scope="department", query=ListQuery())
+    result = await svc.list_grants(scope="department", query=ListQuery(), actor=ACTOR)
 
     assert result.total == 1
     assert result.items[0].scope == "department"

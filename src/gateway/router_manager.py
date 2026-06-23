@@ -49,8 +49,13 @@ class RouterManager:
         async with cls._lock:
             async with session_factory() as session:
                 rows = await GatewayRepository(session).get_router_config()
-            router = build_router(rows)
-            cls._router = router
+            new_router = build_router(rows)
+            old_router = cls._router
+            cls._router = new_router
+            # Close old router to release aiohttp sessions / Redis connections
+            if old_router is not None:
+                with suppress(Exception):
+                    await old_router.close()  # type-safe: litellm Router exposes close()
             _log.info("gateway.router.rebuilt", deployments=len(rows))
 
     @classmethod
@@ -75,20 +80,29 @@ class RouterManager:
         """Listen for catalog invalidation events from admin writes."""
         from src.core.redis import get_redis
 
-        redis = get_redis()
-        pubsub = redis.pubsub()
-        await pubsub.subscribe("gateway:router:invalidate")
-        try:
-            while True:
-                msg = await pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
-                )
-                if msg is not None and msg.get("type") == "message":
-                    _log.info("gateway.router.invalidate_received")
-                    try:
-                        await cls.rebuild(session_factory)
-                    except Exception:
-                        _log.exception("gateway.router.rebuild_after_invalidate_failed")
-        finally:
-            await pubsub.unsubscribe("gateway:router:invalidate")
-            await pubsub.aclose()
+        while True:
+            try:
+                redis = get_redis()
+                pubsub = redis.pubsub()
+                await pubsub.subscribe("gateway:router:invalidate")
+                try:
+                    while True:
+                        msg = await pubsub.get_message(
+                            ignore_subscribe_messages=True, timeout=1.0
+                        )
+                        if msg is not None and msg.get("type") == "message":
+                            _log.info("gateway.router.invalidate_received")
+                            try:
+                                await cls.rebuild(session_factory)
+                            except Exception:
+                                _log.exception(
+                                    "gateway.router.rebuild_after_invalidate_failed"
+                                )
+                finally:
+                    await pubsub.unsubscribe("gateway:router:invalidate")
+                    await pubsub.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _log.exception("gateway.router.subscribe_failed_retrying")
+                await asyncio.sleep(5)

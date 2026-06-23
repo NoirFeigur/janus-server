@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.admin.catalog.schemas import (
     ChannelKeyCreate,
     ChannelKeyRead,
+    ChannelKeyRotate,
     ChannelKeyUpdate,
     LogicalModelCreate,
     LogicalModelRead,
@@ -200,6 +201,18 @@ async def delete_key(
 ) -> SuccessEnvelope[None]:
     await service.delete_key(key_id, actor=user)
     return success(None, trace_id=trace_id)
+
+
+@router.post("/keys/{key_id}/rotate", response_model=SuccessEnvelope[ChannelKeyRead])
+async def rotate_key(
+    key_id: int,
+    payload: ChannelKeyRotate,
+    service: ServiceDep,
+    trace_id: TraceId,
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:catalog:edit"))],
+) -> SuccessEnvelope[ChannelKeyRead]:
+    key = await service.rotate_key(key_id, payload.api_key, actor=user)
+    return success(ChannelKeyRead.model_validate(key), trace_id=trace_id)
 
 
 @router.get("/models", response_model=SuccessEnvelope[Page[LogicalModelRead]])

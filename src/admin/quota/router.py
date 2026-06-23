@@ -32,7 +32,7 @@ ServiceDep = Annotated[QuotaService, Depends(get_quota_service)]
 async def list_quotas(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:quota:list"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:quota:list"))],
     scope: str | None = None,
     scope_id: int | None = None,
     logical_model_id: int | None = None,
@@ -54,6 +54,7 @@ async def list_quotas(
         logical_model_id=logical_model_id,
         status_filter=status,
         query=query,
+        actor=user,
     )
     return success(
         page(
@@ -71,9 +72,9 @@ async def get_quota(
     quota_id: int,
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:quota:query"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:quota:query"))],
 ) -> SuccessEnvelope[QuotaRead]:
-    quota = await service.get_quota(quota_id)
+    quota = await service.get_quota(quota_id, actor=user)
     return success(QuotaRead.model_validate(quota), trace_id=trace_id)
 
 

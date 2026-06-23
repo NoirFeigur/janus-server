@@ -78,6 +78,19 @@ class UpstreamChannelRepository(BaseRepository[UpstreamChannel]):
         total = await self.session.scalar(stmt)
         return int(total or 0)
 
+    async def count_active_deployments(self, channel_id: int) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(ModelDeployment)
+            .where(
+                ModelDeployment.channel_id == channel_id,
+                ModelDeployment.is_deleted.is_(False),
+                ModelDeployment.status == "active",
+            )
+        )
+        total = await self.session.scalar(stmt)
+        return int(total or 0)
+
 
 class ChannelKeyRepository(BaseRepository[ChannelKey]):
     model = ChannelKey
@@ -174,6 +187,19 @@ class LogicalModelRepository(BaseRepository[LogicalModel]):
         stmt = select(func.count()).select_from(LogicalModel)
         for predicate in self._filters(keyword=keyword):
             stmt = stmt.where(predicate)
+        total = await self.session.scalar(stmt)
+        return int(total or 0)
+
+    async def count_active_deployments(self, logical_model_id: int) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(ModelDeployment)
+            .where(
+                ModelDeployment.logical_model_id == logical_model_id,
+                ModelDeployment.is_deleted.is_(False),
+                ModelDeployment.status == "active",
+            )
+        )
         total = await self.session.scalar(stmt)
         return int(total or 0)
 

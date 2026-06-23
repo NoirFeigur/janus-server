@@ -25,6 +25,20 @@ def build_router(rows: list[RouterDeploymentRow]) -> Router:
             litellm_params["rpm"] = row.key_rpm_limit
         if row.key_tpm_limit is not None:
             litellm_params["tpm"] = row.key_tpm_limit
+        # Map channel extra_config to litellm params (region, api_version, etc.)
+        if row.extra_config:
+            _ALLOWED_EXTRA_KEYS = {
+                "api_version",
+                "region_name",
+                "vertex_project",
+                "vertex_location",
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_region_name",
+            }
+            for k, v in row.extra_config.items():
+                if k in _ALLOWED_EXTRA_KEYS and v is not None:
+                    litellm_params[k] = v
         model_list.append(
             {
                 "model_name": row.logical_model_name,

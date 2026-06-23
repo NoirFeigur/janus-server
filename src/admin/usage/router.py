@@ -38,7 +38,7 @@ ServiceDep = Annotated[UsageService, Depends(get_usage_service)]
 async def list_usage_records(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:usage:list"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:usage:list"))],
     user_id: int | None = None,
     logical_model_id: int | None = None,
     status: str | None = None,
@@ -62,6 +62,7 @@ async def list_usage_records(
         date_from=date_from,
         date_to=date_to,
         query=query,
+        actor=user,
     )
     return success(
         page(
@@ -82,7 +83,7 @@ async def list_usage_records(
 async def get_usage_stats(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:usage:list"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:usage:list"))],
     user_id: int | None = None,
     logical_model_id: int | None = None,
     date_from: datetime | None = None,
@@ -93,5 +94,6 @@ async def get_usage_stats(
         logical_model_id=logical_model_id,
         date_from=date_from,
         date_to=date_to,
+        actor=user,
     )
     return success(stats, trace_id=trace_id)

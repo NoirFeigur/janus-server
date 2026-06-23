@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.usage.repository import UsageRepository
 from src.admin.usage.schemas import UsageStats
+from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.usage import UsageRecord
@@ -27,6 +28,10 @@ class UsageService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.repo = UsageRepository(session)
+        self.auth = AuthService(session)
+
+    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
+        return await self.auth.resolve_data_scope(actor)
 
     async def list_records(
         self,
@@ -37,8 +42,10 @@ class UsageService:
         date_from: datetime | None = None,
         date_to: datetime | None = None,
         query: ListQuery | None = None,
+        actor: AuthenticatedUser,
     ) -> PageResult[UsageRecord]:
         query = query or ListQuery()
+        scope = await self._scope(actor)
         sort = resolve_sort(query, allowed=SORT_COLUMNS, default="created_at")
         total = await self.repo.count_records(
             user_id=user_id,
@@ -46,6 +53,8 @@ class UsageService:
             status=status,
             date_from=date_from,
             date_to=date_to,
+            scope_filter=scope,
+            actor_id=actor.user_id,
         )
         items = await self.repo.list_records(
             user_id=user_id,
@@ -53,6 +62,8 @@ class UsageService:
             status=status,
             date_from=date_from,
             date_to=date_to,
+            scope_filter=scope,
+            actor_id=actor.user_id,
             sort=sort,
             limit=query.limit,
             offset=query.offset,
@@ -68,12 +79,16 @@ class UsageService:
         logical_model_id: int | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        actor: AuthenticatedUser,
     ) -> UsageStats:
+        scope = await self._scope(actor)
         stats = await self.repo.aggregate_stats(
             user_id=user_id,
             logical_model_id=logical_model_id,
             date_from=date_from,
             date_to=date_to,
+            scope_filter=scope,
+            actor_id=actor.user_id,
         )
         total_requests = stats["total_requests"]
         error_count = stats["error_count"]

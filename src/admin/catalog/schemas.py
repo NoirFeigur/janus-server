@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
@@ -14,10 +14,10 @@ class UpstreamChannelCreate(BaseModel):
 
     name: str = Field(min_length=1, max_length=64)
     provider: str = Field(min_length=1, max_length=32)
-    protocol: str = Field(min_length=1, max_length=16)
+    protocol: Literal["anthropic", "openai", "gemini"]
     api_base: str | None = Field(default=None, max_length=255)
     extra_config: dict[str, Any] | None = None
-    status: str = Field(default="active", max_length=16)
+    status: Literal["active", "disabled"] = "active"
     remark: str | None = Field(default=None, max_length=255)
 
 
@@ -26,10 +26,10 @@ class UpstreamChannelUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=64)
     provider: str | None = Field(default=None, min_length=1, max_length=32)
-    protocol: str | None = Field(default=None, min_length=1, max_length=16)
+    protocol: Literal["anthropic", "openai", "gemini"] | None = None
     api_base: str | None = Field(default=None, max_length=255)
     extra_config: dict[str, Any] | None = None
-    status: str | None = Field(default=None, max_length=16)
+    status: Literal["active", "disabled"] | None = None
     remark: str | None = Field(default=None, max_length=255)
 
 
@@ -60,12 +60,18 @@ class ChannelKeyCreate(BaseModel):
     channel_id: int
     alias: str = Field(min_length=1, max_length=64)
     api_key: str = Field(min_length=1)
-    status: str = Field(default="active", max_length=16)
-    rpm_limit: int | None = None
-    tpm_limit: int | None = None
-    weight: int = 1
-    priority: int = 0
+    status: Literal["active", "disabled"] = "active"
+    rpm_limit: int | None = Field(default=None, ge=0)
+    tpm_limit: int | None = Field(default=None, ge=0)
+    weight: int = Field(default=1, ge=1)
+    priority: int = Field(default=0, ge=0)
     remark: str | None = Field(default=None, max_length=255)
+
+
+class ChannelKeyRotate(BaseModel):
+    """Rotate the upstream API key for an existing channel key entry."""
+
+    api_key: str = Field(min_length=1)
 
 
 class ChannelKeyUpdate(BaseModel):
@@ -73,11 +79,11 @@ class ChannelKeyUpdate(BaseModel):
 
     channel_id: int | None = None
     alias: str | None = Field(default=None, min_length=1, max_length=64)
-    status: str | None = Field(default=None, max_length=16)
-    rpm_limit: int | None = None
-    tpm_limit: int | None = None
-    weight: int | None = None
-    priority: int | None = None
+    status: Literal["active", "disabled"] | None = None
+    rpm_limit: int | None = Field(default=None, ge=0)
+    tpm_limit: int | None = Field(default=None, ge=0)
+    weight: int | None = Field(default=None, ge=1)
+    priority: int | None = Field(default=None, ge=0)
     remark: str | None = Field(default=None, max_length=255)
 
 
@@ -161,9 +167,9 @@ class ModelDeploymentCreate(BaseModel):
     logical_model_id: int
     channel_id: int
     upstream_model: str = Field(min_length=1, max_length=128)
-    weight: int = 1
-    priority: int = 0
-    status: str = Field(default="active", max_length=16)
+    weight: int = Field(default=1, ge=1)
+    priority: int = Field(default=0, ge=0)
+    status: Literal["active", "disabled"] = "active"
     remark: str | None = Field(default=None, max_length=255)
 
 
@@ -173,9 +179,9 @@ class ModelDeploymentUpdate(BaseModel):
     logical_model_id: int | None = None
     channel_id: int | None = None
     upstream_model: str | None = Field(default=None, min_length=1, max_length=128)
-    weight: int | None = None
-    priority: int | None = None
-    status: str | None = Field(default=None, max_length=16)
+    weight: int | None = Field(default=None, ge=1)
+    priority: int | None = Field(default=None, ge=0)
+    status: Literal["active", "disabled"] | None = None
     remark: str | None = Field(default=None, max_length=255)
 
 

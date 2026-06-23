@@ -37,7 +37,7 @@ ServiceDep = Annotated[CredentialService, Depends(get_credential_service)]
 async def list_keys(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:credential:list"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:credential:list"))],
     user_id: int | None = None,
     status: str | None = None,
     keyword: str | None = None,
@@ -57,6 +57,7 @@ async def list_keys(
         user_id=user_id,
         status_filter=status,
         query=query,
+        actor=user,
     )
     return success(
         page(
@@ -74,9 +75,9 @@ async def get_key(
     key_id: int,
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:credential:query"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:credential:query"))],
 ) -> SuccessEnvelope[ApiKeyRead]:
-    key = await service.get_key(key_id)
+    key = await service.get_key(key_id, actor=user)
     return success(ApiKeyRead.model_validate(key), trace_id=trace_id)
 
 

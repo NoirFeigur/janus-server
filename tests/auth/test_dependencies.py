@@ -116,8 +116,9 @@ class _StubAuthService:
 @pytest.mark.asyncio
 async def test_get_current_user_routes_sk_key_to_api_key_path() -> None:
     stub = _StubAuthService()
+    request = Request({"type": "http", "headers": []})
     current_user = await get_current_user(
-        cast(AuthService, stub), authorization="Bearer sk-live-123"
+        request, cast(AuthService, stub), authorization="Bearer sk-live-123"
     )
     assert stub.api_key_calls == ["sk-live-123"]
     assert stub.token_calls == []
@@ -127,8 +128,9 @@ async def test_get_current_user_routes_sk_key_to_api_key_path() -> None:
 @pytest.mark.asyncio
 async def test_get_current_user_routes_jwt_to_access_token_path() -> None:
     stub = _StubAuthService()
+    request = Request({"type": "http", "headers": []})
     current_user = await get_current_user(
-        cast(AuthService, stub), authorization="Bearer header.payload.sig"
+        request, cast(AuthService, stub), authorization="Bearer header.payload.sig"
     )
     assert stub.token_calls == ["header.payload.sig"]
     assert stub.api_key_calls == []
@@ -138,8 +140,9 @@ async def test_get_current_user_routes_jwt_to_access_token_path() -> None:
 @pytest.mark.asyncio
 async def test_get_current_user_missing_credential_raises_401() -> None:
     stub = _StubAuthService()
+    request = Request({"type": "http", "headers": []})
     with pytest.raises(AppError) as exc:
-        await get_current_user(cast(AuthService, stub))
+        await get_current_user(request, cast(AuthService, stub))
     assert exc.value.status_code == 401
 
 

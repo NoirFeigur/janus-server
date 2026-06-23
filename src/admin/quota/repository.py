@@ -4,16 +4,43 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
 
+from src.db.models.identity import Department, User
+from src.db.models.model_catalog import LogicalModel
 from src.db.models.quota import Quota
 from src.db.repository import BaseRepository
+from src.db.scope import DataScope
 
 
 class QuotaRepository(BaseRepository[Quota]):
     model = Quota
+
+    def _scope_predicate(
+        self, scope_filter: DataScope, *, actor_id: int, include_global: bool
+    ) -> ColumnElement[bool] | None:
+        if scope_filter.unrestricted:
+            return None
+        clauses: list[ColumnElement[bool]] = []
+        if include_global:
+            clauses.append(Quota.scope == "global")
+        if scope_filter.department_ids:
+            clauses.append(
+                (Quota.scope == "department")
+                & Quota.scope_id.in_(scope_filter.department_ids)
+            )
+            user_ids = select(User.id).where(
+                User.is_deleted.is_(False),
+                User.department_id.in_(scope_filter.department_ids),
+            )
+            clauses.append((Quota.scope == "user") & Quota.scope_id.in_(user_ids))
+        if scope_filter.include_self:
+            clauses.append((Quota.scope == "user") & (Quota.scope_id == actor_id))
+        if not clauses:
+            return Quota.id == -1
+        return or_(*clauses)
 
     async def get_existing(
         self,
@@ -46,8 +73,17 @@ class QuotaRepository(BaseRepository[Quota]):
         scope_id: int | None,
         logical_model_id: int | None,
         status: str | None,
+        scope_filter: DataScope | None = None,
+        actor_id: int | None = None,
+        include_global: bool = False,
     ) -> list[ColumnElement[bool]]:
         filters: list[ColumnElement[bool]] = [Quota.is_deleted.is_(False)]
+        if scope_filter is not None and actor_id is not None:
+            predicate = self._scope_predicate(
+                scope_filter, actor_id=actor_id, include_global=include_global
+            )
+            if predicate is not None:
+                filters.append(predicate)
         if scope is not None:
             filters.append(Quota.scope == scope)
         if scope_id is not None:
@@ -65,6 +101,9 @@ class QuotaRepository(BaseRepository[Quota]):
         scope_id: int | None = None,
         logical_model_id: int | None = None,
         status: str | None = None,
+        scope_filter: DataScope | None = None,
+        actor_id: int | None = None,
+        include_global: bool = False,
         sort: tuple[InstrumentedAttribute[object], bool] | None = None,
         limit: int,
         offset: int,
@@ -75,6 +114,9 @@ class QuotaRepository(BaseRepository[Quota]):
             scope_id=scope_id,
             logical_model_id=logical_model_id,
             status=status,
+            scope_filter=scope_filter,
+            actor_id=actor_id,
+            include_global=include_global,
         ):
             stmt = stmt.where(predicate)
         if sort is None:
@@ -93,6 +135,9 @@ class QuotaRepository(BaseRepository[Quota]):
         scope_id: int | None = None,
         logical_model_id: int | None = None,
         status: str | None = None,
+        scope_filter: DataScope | None = None,
+        actor_id: int | None = None,
+        include_global: bool = False,
     ) -> int:
         stmt = select(func.count()).select_from(Quota)
         for predicate in self._filters(
@@ -100,7 +145,47 @@ class QuotaRepository(BaseRepository[Quota]):
             scope_id=scope_id,
             logical_model_id=logical_model_id,
             status=status,
+            scope_filter=scope_filter,
+            actor_id=actor_id,
+            include_global=include_global,
         ):
             stmt = stmt.where(predicate)
         total = await self.session.scalar(stmt)
         return int(total or 0)
+
+    async def user_exists(self, user_id: int) -> bool:
+        stmt = select(User.id).where(User.id == user_id, User.is_deleted.is_(False))
+        return await self.session.scalar(stmt) is not None
+
+    async def department_exists(self, dept_id: int) -> bool:
+        stmt = select(Department.id).where(
+            Department.id == dept_id, Department.is_deleted.is_(False)
+        )
+        return await self.session.scalar(stmt) is not None
+
+    async def model_exists(self, model_id: int) -> bool:
+        stmt = select(LogicalModel.id).where(
+            LogicalModel.id == model_id, LogicalModel.is_deleted.is_(False)
+        )
+        return await self.session.scalar(stmt) is not None
+
+    async def subject_in_scope(
+        self, *, scope: str, scope_id: int | None, scope_filter: DataScope, actor_id: int
+    ) -> bool:
+        if scope_filter.unrestricted:
+            return True
+        if scope == "department" and scope_id is not None:
+            return scope_id in scope_filter.department_ids
+        if scope != "user" or scope_id is None:
+            return False
+        clauses: list[ColumnElement[bool]] = []
+        if scope_filter.department_ids:
+            clauses.append(User.department_id.in_(scope_filter.department_ids))
+        if scope_filter.include_self:
+            clauses.append(User.id == actor_id)
+        if not clauses:
+            return False
+        stmt = select(User.id).where(
+            User.id == scope_id, User.is_deleted.is_(False), or_(*clauses)
+        )
+        return await self.session.scalar(stmt) is not None
