@@ -46,6 +46,9 @@ class AsyncRedisDouble:
         self._decode_responses = decode_responses
         self._data: dict[str, str] = {}
         self._sets: dict[str, set[str]] = {}
+        self._lists: dict[str, list[str]] = {}
+        self._hashes: dict[str, dict[str, str]] = {}
+        self._zsets: dict[str, dict[str, float]] = {}
         self._expiry: dict[str, float] = {}  # key -> monotonic deadline (seconds)
 
     def _evict_if_expired(self, key: str) -> bool:
@@ -53,6 +56,9 @@ class AsyncRedisDouble:
         if deadline is not None and time.monotonic() >= deadline:
             self._data.pop(key, None)
             self._sets.pop(key, None)
+            self._lists.pop(key, None)
+            self._hashes.pop(key, None)
+            self._zsets.pop(key, None)
             self._expiry.pop(key, None)
             return True
         return False
@@ -67,7 +73,10 @@ class AsyncRedisDouble:
         # (matching the production client used by perm_cache's generation read).
         return [await self.get(key) for key in keys]
 
-    async def set(self, key: str, value: str, ex: int | None = None) -> bool:
+    async def set(self, key: str, value: str, ex: int | None = None, *, nx: bool = False) -> bool | None:
+        if nx:
+            if not self._evict_if_expired(key) and key in self._data:
+                return None
         self._data[key] = value
         if ex is not None:
             self._expiry[key] = time.monotonic() + ex
@@ -80,6 +89,9 @@ class AsyncRedisDouble:
         for key in keys:
             present = self._data.pop(key, None) is not None
             present = self._sets.pop(key, None) is not None or present
+            present = self._lists.pop(key, None) is not None or present
+            present = self._hashes.pop(key, None) is not None or present
+            present = self._zsets.pop(key, None) is not None or present
             if present:
                 removed += 1
             self._expiry.pop(key, None)
@@ -91,7 +103,7 @@ class AsyncRedisDouble:
         for key in keys:
             if self._evict_if_expired(key):
                 continue
-            if key in self._data or key in self._sets:
+            if key in self._data or key in self._sets or key in self._lists or key in self._hashes or key in self._zsets:
                 count += 1
         return count
 
@@ -148,7 +160,7 @@ class AsyncRedisDouble:
     async def expire(self, key: str, seconds: int) -> bool:
         if self._evict_if_expired(key):
             return False
-        if key not in self._data and key not in self._sets:
+        if key not in self._data and key not in self._sets and key not in self._lists and key not in self._hashes and key not in self._zsets:
             return False
         self._expiry[key] = time.monotonic() + seconds
         return True
@@ -156,7 +168,7 @@ class AsyncRedisDouble:
     async def ttl(self, key: str) -> int:
         # Redis semantics: -2 = no key, -1 = key without expiry, else seconds left.
         if self._evict_if_expired(key) or (
-            key not in self._data and key not in self._sets
+            key not in self._data and key not in self._sets and key not in self._lists and key not in self._hashes and key not in self._zsets
         ):
             return -2
         deadline = self._expiry.get(key)
@@ -173,8 +185,307 @@ class AsyncRedisDouble:
     async def publish(self, channel: str, message: str) -> int:
         return 0
 
+    # ------------------------------------------------------------------
+    # List operations (RPUSH / LPOP / LLEN / LRANGE)
+    # ------------------------------------------------------------------
+
+    async def rpush(self, key: str, *values: str) -> int:
+        if self._evict_if_expired(key):
+            pass
+        lst = self._lists.setdefault(key, [])
+        for v in values:
+            lst.append(v)
+        return len(lst)
+
+    async def lpop(self, key: str, count: int | None = None) -> str | list[str] | None:
+        if self._evict_if_expired(key):
+            return None
+        lst = self._lists.get(key)
+        if not lst:
+            return None
+        if count is None:
+            return lst.pop(0)
+        result = lst[:count]
+        del lst[:count]
+        if not lst:
+            self._lists.pop(key, None)
+        return result
+
+    async def llen(self, key: str) -> int:
+        if self._evict_if_expired(key):
+            return 0
+        return len(self._lists.get(key, []))
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+        if self._evict_if_expired(key):
+            return []
+        lst = self._lists.get(key, [])
+        # Redis LRANGE stop is inclusive
+        return lst[start : stop + 1] if stop != -1 else lst[start:]
+
+    # ------------------------------------------------------------------
+    # Hash operations (HSET / HGET / HGETALL / HINCRBY / HMGET)
+    # ------------------------------------------------------------------
+
+    async def hset(self, key: str, field: str | None = None, value: str | None = None, mapping: dict[str, str] | None = None) -> int:
+        if self._evict_if_expired(key):
+            pass
+        h = self._hashes.setdefault(key, {})
+        count = 0
+        if field is not None and value is not None:
+            is_new = field not in h
+            h[field] = str(value)
+            count += int(is_new)
+        if mapping:
+            for k, v in mapping.items():
+                is_new = k not in h
+                h[k] = str(v)
+                count += int(is_new)
+        return count
+
+    async def hget(self, key: str, field: str) -> str | None:
+        if self._evict_if_expired(key):
+            return None
+        h = self._hashes.get(key)
+        if h is None:
+            return None
+        return h.get(field)
+
+    async def hmget(self, key: str, *fields: str) -> list[str | None]:
+        """HMGET: return values for fields in order."""
+        if self._evict_if_expired(key):
+            return [None] * len(fields)
+        h = self._hashes.get(key, {})
+        return [h.get(f) for f in fields]
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        if self._evict_if_expired(key):
+            return {}
+        return dict(self._hashes.get(key, {}))
+
+    async def hincrby(self, key: str, field: str, amount: int = 1) -> int:
+        if self._evict_if_expired(key):
+            pass
+        h = self._hashes.setdefault(key, {})
+        current = int(h.get(field, "0"))
+        current += amount
+        h[field] = str(current)
+        return current
+
+    # ------------------------------------------------------------------
+    # Sorted set operations (ZADD / ZREM / ZCARD / ZREMRANGEBYSCORE)
+    # ------------------------------------------------------------------
+
+    async def zadd(self, key: str, score_member: dict[str, float] | None = None, **kwargs: float) -> int:
+        """Simplified ZADD: zadd(key, {member: score})."""
+        if self._evict_if_expired(key):
+            pass
+        zs = self._zsets.setdefault(key, {})
+        mapping = score_member or kwargs
+        added = 0
+        for member, score in mapping.items():
+            if member not in zs:
+                added += 1
+            zs[member] = float(score)
+        return added
+
+    async def zrem(self, key: str, *members: str) -> int:
+        if self._evict_if_expired(key):
+            return 0
+        zs = self._zsets.get(key)
+        if zs is None:
+            return 0
+        removed = 0
+        for m in members:
+            if m in zs:
+                del zs[m]
+                removed += 1
+        if not zs:
+            self._zsets.pop(key, None)
+        return removed
+
+    async def zcard(self, key: str) -> int:
+        if self._evict_if_expired(key):
+            return 0
+        return len(self._zsets.get(key, {}))
+
+    async def zremrangebyscore(self, key: str, min_score: float | str, max_score: float | str) -> int:
+        if self._evict_if_expired(key):
+            return 0
+        zs = self._zsets.get(key)
+        if zs is None:
+            return 0
+        min_s = float("-inf") if min_score == "-inf" else float(min_score)
+        max_s = float("inf") if max_score == "+inf" else float(max_score)
+        to_remove = [m for m, s in zs.items() if min_s <= s <= max_s]
+        for m in to_remove:
+            del zs[m]
+        if not zs:
+            self._zsets.pop(key, None)
+        return len(to_remove)
+
+    # ------------------------------------------------------------------
+    # SET: sismember
+    # ------------------------------------------------------------------
+
+    async def sismember(self, key: str, member: str) -> bool:
+        if self._evict_if_expired(key):
+            return False
+        bucket = self._sets.get(key)
+        return member in bucket if bucket else False
+
+    # ------------------------------------------------------------------
+    # SET with NX (conditional set)
+    # ------------------------------------------------------------------
+
+    async def set(self, key: str, value: str, ex: int | None = None, *, nx: bool = False) -> bool | None:  # type: ignore[override]
+        if nx:
+            if not self._evict_if_expired(key) and key in self._data:
+                return None
+        self._data[key] = value
+        if ex is not None:
+            self._expiry[key] = time.monotonic() + ex
+        else:
+            self._expiry.pop(key, None)
+        return True
+
+    # ------------------------------------------------------------------
+    # PEXPIRE
+    # ------------------------------------------------------------------
+
+    async def pexpire(self, key: str, milliseconds: int) -> bool:
+        if self._evict_if_expired(key):
+            return False
+        present = key in self._data or key in self._sets or key in self._hashes or key in self._zsets or key in self._lists
+        if not present:
+            return False
+        self._expiry[key] = time.monotonic() + (milliseconds / 1000.0)
+        return True
+
+    # ------------------------------------------------------------------
+    # EVAL (Lua script simulation)
+    # ------------------------------------------------------------------
+
+    async def eval(self, script: str, numkeys: int, *args: object) -> list[int]:
+        """Minimal Lua eval stub — returns [1, 0, limit] (allowed) by default.
+
+        For test purposes, simulates rate-limit Lua scripts. The test can
+        override behavior by manipulating the underlying data directly.
+        """
+        # Parse key and args
+        keys = [str(args[i]) for i in range(numkeys)]
+        argv = [str(args[i]) for i in range(numkeys, len(args))]
+
+        # Concurrent script: uses "timeout_ms" variable (unique marker)
+        if "timeout_ms" in script:
+            key = keys[0]
+            now_ms = float(argv[0])
+            limit = int(argv[1])
+            member = argv[2] if len(argv) > 2 else str(now_ms)
+            timeout_ms = float(argv[3]) if len(argv) > 3 else 1800000
+
+            zs = self._zsets.get(key, {})
+            cutoff = now_ms - timeout_ms
+            zs = {m: s for m, s in zs.items() if s > cutoff}
+            count = len(zs)
+
+            if count >= limit:
+                self._zsets[key] = zs
+                return [0, count, limit]
+
+            zs[member] = now_ms
+            self._zsets[key] = zs
+            return [1, count + 1, limit]
+
+        # RPM script: uses "window_ms" variable (unique marker)
+        if "window_ms" in script:
+            key = keys[0]
+            now_ms = float(argv[0])
+            window_ms = float(argv[1])
+            limit = int(argv[2])
+            member = argv[3] if len(argv) > 3 else str(now_ms)
+
+            zs = self._zsets.get(key, {})
+            cutoff = now_ms - window_ms
+            zs = {m: s for m, s in zs.items() if s > cutoff}
+            count = len(zs)
+
+            if count >= limit:
+                self._zsets[key] = zs
+                return [0, count, limit]
+
+            zs[member] = now_ms
+            self._zsets[key] = zs
+            return [1, count + 1, limit]
+
+        # TPM script detection: HMGET + HSET pattern
+        if "HMGET" in script and "HSET" in script:
+            key = keys[0]
+            now_ms = float(argv[0])
+            limit = int(argv[1])
+            request_tokens = int(argv[2])
+            refill_rate = float(argv[3]) if len(argv) > 3 else float(limit)
+
+            h = self._hashes.get(key, {})
+            tokens = float(h.get("tokens", str(limit)))
+            last_ts = float(h.get("ts", str(now_ms)))
+
+            elapsed_ms = now_ms - last_ts
+            refill = int(elapsed_ms * refill_rate / 60000)
+            tokens = min(limit, tokens + refill)
+
+            if tokens < request_tokens:
+                return [0, int(tokens), limit]
+
+            tokens = tokens - request_tokens
+            self._hashes[key] = {"tokens": str(int(tokens)), "ts": str(int(now_ms))}
+            return [1, int(tokens), limit]
+
+        # Default: allow
+        return [1, 0, 100]
+
+    # ------------------------------------------------------------------
+    # Pipeline support
+    # ------------------------------------------------------------------
+
+    def pipeline(self, transaction: bool = True) -> _PipelineDouble:
+        return _PipelineDouble(self)
+
     async def aclose(self) -> None:
         return None
+
+
+class _PipelineDouble:
+    """Minimal pipeline double that buffers commands and executes sequentially."""
+
+    def __init__(self, redis: AsyncRedisDouble) -> None:
+        self._redis = redis
+        self._commands: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    def hincrby(self, key: str, field: str, amount: int = 1) -> _PipelineDouble:
+        self._commands.append(("hincrby", (key, field, amount), {}))
+        return self
+
+    def hget(self, key: str, field: str) -> _PipelineDouble:
+        self._commands.append(("hget", (key, field), {}))
+        return self
+
+    def expire(self, key: str, seconds: int) -> _PipelineDouble:
+        self._commands.append(("expire", (key, seconds), {}))
+        return self
+
+    def pexpire(self, key: str, milliseconds: int) -> _PipelineDouble:
+        self._commands.append(("pexpire", (key, milliseconds), {}))
+        return self
+
+    async def execute(self) -> list[object]:
+        results: list[object] = []
+        for cmd, args, kwargs in self._commands:
+            method = getattr(self._redis, cmd)
+            result = await method(*args, **kwargs)
+            results.append(result)
+        self._commands.clear()
+        return results
 
 
 class _PubSubDouble:

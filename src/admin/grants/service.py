@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
@@ -11,6 +13,7 @@ from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.grant import UserModelGrant
+from src.db.session import add_after_commit_hook
 from src.enums import ErrorCode
 from src.exceptions import AppError
 
@@ -158,6 +161,8 @@ class GrantService:
             updated_by=actor.user_id,
         )
         await self.grants.create(grant)
+        hook = _bump_grant_cache_generation(payload.scope, payload.scope_id)
+        add_after_commit_hook(self.session, hook)
         return grant
 
     async def update_grant(
@@ -178,9 +183,28 @@ class GrantService:
         values["updated_by"] = actor.user_id
         await self.grants.update(grant, **values)
         await self.session.refresh(grant)
+        hook = _bump_grant_cache_generation(grant.scope, grant.scope_id)
+        add_after_commit_hook(self.session, hook)
         return grant
 
     async def delete_grant(self, grant_id: int, *, actor: AuthenticatedUser) -> None:
         grant = await self._require_visible_grant(grant_id, actor)
         grant.updated_by = actor.user_id
         await self.grants.soft_delete(grant)
+        hook = _bump_grant_cache_generation(grant.scope, grant.scope_id)
+        add_after_commit_hook(self.session, hook)
+
+
+def _bump_grant_cache_generation(scope: str, scope_id: int):  # noqa: ANN202
+    """Return an async callback that bumps the grant generation for a specific subject."""
+
+    async def _hook() -> None:
+        with suppress(Exception):
+            from src.gateway.cache import bump_grant_generation
+
+            if scope == "user":
+                await bump_grant_generation(user_id=scope_id)
+            elif scope == "department":
+                await bump_grant_generation(dept_id=scope_id)
+
+    return _hook

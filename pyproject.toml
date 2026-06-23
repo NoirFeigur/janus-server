@@ -20,6 +20,7 @@ dependencies = [
     "litellm>=1.82,<2",
     "mcp>=1.9,<2",
     "pillow>=11,<12",
+    "prometheus-client>=0.22,<1",
     "pydantic>=2.11,<3",
     "pydantic-settings>=2.9,<3",
     "pyjwt[crypto]>=2.10,<3",

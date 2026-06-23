@@ -229,6 +229,7 @@ class CatalogService:
         )
         await self.channels.create(channel)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return channel
 
     async def update_channel(
@@ -250,6 +251,7 @@ class CatalogService:
         await self.channels.update(channel, **values)
         await self.session.refresh(channel)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return channel
 
     async def delete_channel(
@@ -263,6 +265,7 @@ class CatalogService:
         channel.updated_by = actor.user_id
         await self.channels.soft_delete(channel)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
 
     async def list_keys(
         self,
@@ -312,6 +315,7 @@ class CatalogService:
         )
         await self.keys.create(key)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return key
 
     async def update_key(
@@ -328,6 +332,7 @@ class CatalogService:
         await self.keys.update(key, **values)
         await self.session.refresh(key)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return key
 
     async def delete_key(self, key_id: int, *, actor: AuthenticatedUser) -> None:
@@ -336,6 +341,7 @@ class CatalogService:
         key.updated_by = actor.user_id
         await self.keys.soft_delete(key)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
 
     async def rotate_key(
         self, key_id: int, new_api_key: str, *, actor: AuthenticatedUser
@@ -348,6 +354,7 @@ class CatalogService:
         key.updated_by = actor.user_id
         await self.session.flush()
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return key
 
     async def list_models(
@@ -389,6 +396,7 @@ class CatalogService:
         )
         await self.models.create(model)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return model
 
     async def update_model(
@@ -407,6 +415,7 @@ class CatalogService:
         await self.models.update(model, **values)
         await self.session.refresh(model)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return model
 
     async def delete_model(self, model_id: int, *, actor: AuthenticatedUser) -> None:
@@ -417,6 +426,7 @@ class CatalogService:
         model.updated_by = actor.user_id
         await self.models.soft_delete(model)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
 
     async def list_deployments(
         self,
@@ -468,6 +478,7 @@ class CatalogService:
         )
         await self.deployments.create(deployment)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return deployment
 
     async def update_deployment(
@@ -495,6 +506,7 @@ class CatalogService:
         await self.deployments.update(deployment, **values)
         await self.session.refresh(deployment)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
         return deployment
 
     async def delete_deployment(
@@ -504,12 +516,21 @@ class CatalogService:
         deployment.updated_by = actor.user_id
         await self.deployments.soft_delete(deployment)
         add_after_commit_hook(self.session, _publish_router_invalidation)
+        add_after_commit_hook(self.session, _bump_catalog_cache_generation)
 
 
 async def _publish_router_invalidation() -> None:
     """Publish router invalidation event (best-effort, non-blocking)."""
     with suppress(Exception):
         await get_redis().publish("gateway:router:invalidate", "1")
+
+
+async def _bump_catalog_cache_generation() -> None:
+    """Bump catalog generation counter so cached resolutions become stale."""
+    with suppress(Exception):
+        from src.gateway.cache import bump_catalog_generation
+
+        await bump_catalog_generation()
 
 
 def _is_internal_host(host: str) -> bool:

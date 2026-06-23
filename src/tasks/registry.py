@@ -1,9 +1,13 @@
 from collections.abc import Callable
 from typing import Any
 
+from src.channel_health.tasks import probe_degraded_channels
+from src.gateway.observability import flush_gateway_logs
+from src.gateway.usage_batch import flush_usage_records
+
 TaskFn = Callable[..., Any]
 
-TASKS: list[TaskFn] = []
+TASKS: list[TaskFn] = [flush_usage_records, flush_gateway_logs, probe_degraded_channels]
 
 
 async def noop(_ctx: dict[str, object]) -> None:

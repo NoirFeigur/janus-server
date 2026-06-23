@@ -97,7 +97,7 @@ async def test_anthropic_stream_returns_sse_bytes() -> None:
     with patch(
         "src.gateway.router.RouterManager.get_router", return_value=fake_router
     ), patch(
-        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
     ), patch(
         "src.gateway.router.record_usage", new_callable=AsyncMock
     ):
@@ -164,7 +164,7 @@ async def test_gemini_stream_returns_sse_bytes() -> None:
     with patch(
         "src.gateway.router.RouterManager.get_router", return_value=fake_router
     ), patch(
-        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
     ), patch(
         "src.gateway.router.record_usage", new_callable=AsyncMock
     ):
@@ -261,7 +261,7 @@ async def test_openai_stream_returns_sse_text() -> None:
     with patch(
         "src.gateway.router.RouterManager.get_router", return_value=fake_router
     ), patch(
-        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
     ), patch(
         "src.gateway.router.record_usage", new_callable=AsyncMock
     ):

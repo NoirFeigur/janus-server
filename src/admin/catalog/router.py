@@ -25,6 +25,7 @@ from src.admin.catalog.schemas import (
 from src.admin.catalog.service import CatalogService
 from src.auth.dependencies import RequiredPerms, TraceId
 from src.auth.service import AuthenticatedUser
+from src.channel_health.schemas import ChannelHealthAction, ChannelHealthRead
 from src.core.pagination import Page, page
 from src.core.query import ListQuery
 from src.db.session import get_session
@@ -355,3 +356,140 @@ async def delete_deployment(
 ) -> SuccessEnvelope[None]:
     await service.delete_deployment(deployment_id, actor=user)
     return success(None, trace_id=trace_id)
+
+
+# ---------------------------------------------------------------------------
+# Channel health status
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/channels/{channel_id}/health",
+    response_model=SuccessEnvelope[ChannelHealthRead],
+)
+async def get_channel_health(
+    channel_id: int,
+    service: ServiceDep,
+    trace_id: TraceId,
+    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:catalog:query"))],
+) -> SuccessEnvelope[ChannelHealthRead]:
+    """Get channel health status (degraded / healthy / disabled)."""
+    from src.channel_health.redis_store import (
+        get_channel_state,
+        get_error_rate,
+        is_degraded,
+    )
+
+    # Verify channel exists
+    await service.get_channel(channel_id)
+
+    degraded = await is_degraded(channel_id)
+    state = await get_channel_state(channel_id)
+    total, errors, rate = await get_error_rate(channel_id, window_seconds=300)
+
+    status_str = "degraded" if degraded else "healthy"
+    if state.get("status") == "disabled":
+        status_str = "disabled"
+
+    return success(
+        ChannelHealthRead(
+            channel_id=channel_id,
+            status=status_str,
+            error_rate=round(rate, 4) if total > 0 else None,
+            total_requests=total if total > 0 else None,
+            error_count=errors if errors > 0 else None,
+            degraded_since=state.get("degraded_since"),
+            probe_failures=int(state["probe_failures"]) if "probe_failures" in state else None,
+            last_probe_at=state.get("last_probe_at"),
+        ),
+        trace_id=trace_id,
+    )
+
+
+@router.post(
+    "/channels/{channel_id}/health/recover",
+    response_model=SuccessEnvelope[None],
+)
+async def recover_channel(
+    channel_id: int,
+    payload: ChannelHealthAction,
+    service: ServiceDep,
+    trace_id: TraceId,
+    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:catalog:edit"))],
+) -> SuccessEnvelope[None]:
+    """Manually recover a degraded channel (admin override)."""
+    from src.channel_health.service import ChannelHealthService
+
+    # Verify channel exists
+    await service.get_channel(channel_id)
+    health_service = ChannelHealthService()
+    await health_service.record_probe_success(channel_id)
+    return success(None, trace_id=trace_id)
+
+
+# ---------------------------------------------------------------------------
+# Catalog change log
+# ---------------------------------------------------------------------------
+
+
+@router.get("/changelog", response_model=SuccessEnvelope[Page[dict]])
+async def list_changelog(
+    service: ServiceDep,
+    trace_id: TraceId,
+    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:catalog:list"))],
+    resource_type: str | None = None,
+    action: str | None = None,
+    actor_id: int | None = None,
+    sort_order: Literal["asc", "desc"] = "desc",
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> SuccessEnvelope[Page[dict]]:
+    """List catalog change log entries."""
+    from sqlalchemy import desc as sa_desc
+    from sqlalchemy import select
+
+    from src.db.models.catalog_ops import CatalogChangeLog
+
+    stmt = select(CatalogChangeLog)
+    if resource_type is not None:
+        stmt = stmt.where(CatalogChangeLog.resource_type == resource_type)
+    if action is not None:
+        stmt = stmt.where(CatalogChangeLog.action == action)
+    if actor_id is not None:
+        stmt = stmt.where(CatalogChangeLog.actor_id == actor_id)
+
+    if sort_order == "desc":
+        stmt = stmt.order_by(sa_desc(CatalogChangeLog.id))
+    else:
+        stmt = stmt.order_by(CatalogChangeLog.id)
+
+    # Count
+    count_stmt = select(CatalogChangeLog.id)
+    if resource_type is not None:
+        count_stmt = count_stmt.where(CatalogChangeLog.resource_type == resource_type)
+    if action is not None:
+        count_stmt = count_stmt.where(CatalogChangeLog.action == action)
+    if actor_id is not None:
+        count_stmt = count_stmt.where(CatalogChangeLog.actor_id == actor_id)
+    count_result = await service.session.execute(count_stmt)
+    total = len(count_result.all())
+
+    stmt = stmt.offset(offset).limit(limit)
+    result = await service.session.execute(stmt)
+    items = [
+        {
+            "id": row.id,
+            "actor_id": row.actor_id,
+            "resource_type": row.resource_type,
+            "resource_id": row.resource_id,
+            "action": row.action,
+            "before_value": row.before_value,
+            "after_value": row.after_value,
+            "diff": row.diff,
+            "trace_id": row.trace_id,
+            "created_at": str(row.created_at) if row.created_at else None,
+        }
+        for row in result.scalars().all()
+    ]
+
+    return success(page(items, total=total, limit=limit, offset=offset), trace_id=trace_id)

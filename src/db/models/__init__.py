@@ -7,7 +7,9 @@ on ``Base.metadata``.
 
 from src.db.models.attach import SysAttach
 from src.db.models.audit import LoginLog, OperLog
+from src.db.models.catalog_ops import CatalogChangeLog, CatalogConfigSnapshot
 from src.db.models.credential import ApiKey
+from src.db.models.gateway_observability import GatewayRequestLog
 from src.db.models.grant import UserModelGrant
 from src.db.models.identity import (
     Department,
@@ -26,6 +28,7 @@ from src.db.models.model_catalog import (
     UpstreamChannel,
 )
 from src.db.models.quota import Quota
+from src.db.models.rate_limit import RateLimitRule
 from src.db.models.sys_config import SysConfig
 from src.db.models.usage import UsageRecord
 
@@ -51,9 +54,16 @@ __all__ = [
     # usage & quota
     "UsageRecord",
     "Quota",
+    # rate limiting
+    "RateLimitRule",
     # audit
     "OperLog",
     "LoginLog",
+    # gateway observability
+    "GatewayRequestLog",
+    # catalog operations
+    "CatalogChangeLog",
+    "CatalogConfigSnapshot",
     # platform config
     "SysConfig",
     # attachment

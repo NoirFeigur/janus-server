@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from contextlib import suppress
 from decimal import Decimal
+from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
 from src.auth.service import AuthenticatedUser
 from src.db.models.model_catalog import LogicalModel
+from src.db.models.rate_limit import RateLimitRule
 from src.db.session import async_session_factory
 from src.enums import ErrorCode
 from src.exceptions import AppError
@@ -98,6 +101,56 @@ class GatewayService:
             actual_tokens,
             actual_cost,
         )
+
+    async def get_rate_limit_rules(
+        self,
+        user_id: int,
+        department_id: int | None,
+        logical_model_id: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch active rate limit rules applicable to this user/model (fail-open).
+
+        Returns matching rules as dicts for the rate_limit module.
+        Lookup order: user-specific → department → global, all filtered by model.
+        """
+        with suppress(Exception):
+            session = self.repo.session
+            stmt = (
+                select(RateLimitRule)
+                .where(RateLimitRule.is_deleted == False)  # noqa: E712
+                .where(RateLimitRule.status == "active")
+                .where(RateLimitRule.enforce == True)  # noqa: E712
+                .where(
+                    (RateLimitRule.logical_model_id == logical_model_id)
+                    | (RateLimitRule.logical_model_id.is_(None))
+                )
+                .where(
+                    (
+                        (RateLimitRule.subject_type == "user")
+                        & (RateLimitRule.subject_id == user_id)
+                    )
+                    | (
+                        (RateLimitRule.subject_type == "department")
+                        & (RateLimitRule.subject_id == department_id)
+                    )
+                    | (RateLimitRule.subject_type == "global")
+                )
+            )
+            result = await session.execute(stmt)
+            rules = result.scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "subject_type": r.subject_type,
+                    "subject_id": r.subject_id,
+                    "logical_model_id": r.logical_model_id,
+                    "rpm_limit": r.rpm_limit,
+                    "tpm_limit": r.tpm_limit,
+                    "max_concurrent": r.max_concurrent,
+                }
+                for r in rules
+            ]
+        return []
 
 
 async def settle_quota_independent(

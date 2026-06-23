@@ -118,6 +118,18 @@ class Settings(BaseSettings):
 
     cors_allow_origins: list[str] = Field(default_factory=list)
 
+    # --- Channel health monitoring (P1/P4) ---
+    # Sliding window for error rate calculation.
+    channel_health_window_seconds: int = 300  # 5 minutes
+    # Minimum requests in window before evaluating error rate.
+    channel_health_min_requests: int = 10
+    # Error rate threshold to trigger auto-degrade (0.0-1.0).
+    channel_health_error_threshold: float = 0.5
+    # Consecutive probe failures before hard-disable (DB status=disabled).
+    channel_health_max_probe_failures: int = 5
+    # Probe interval for degraded channels (seconds).
+    channel_health_probe_interval_seconds: int = 60
+
     log_level: str = "INFO"  # 根 logger 级别（DEBUG/INFO/WARNING/ERROR）
     log_json: bool = True  # True=JSON 行（生产/采集）；False=彩色控制台（本地开发）
 

@@ -21,11 +21,21 @@ from src.auth.service import AuthenticatedUser
 from src.db.models.model_catalog import LogicalModel
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
+from src.gateway.context import GatewayRequestContext
 from src.gateway.dependencies import get_gateway_service
+from src.gateway.finalize import finalize_gateway_request
 from src.gateway.quota import QuotaCheckResult
+from src.gateway.rate_limit import check_rate_limits
+from src.gateway.response_cache import (
+    compute_fingerprint,
+    get_cached_response,
+    is_cacheable_request,
+    is_cacheable_response,
+    set_cached_response,
+)
 from src.gateway.router_manager import RouterManager
 from src.gateway.schemas import AnthropicRequest, GeminiRequest, OpenAIRequest
-from src.gateway.service import GatewayService, settle_quota_independent
+from src.gateway.service import GatewayService
 from src.gateway.usage import UsageData, compute_cost, record_usage
 
 router = APIRouter(tags=["gateway"])
@@ -105,15 +115,29 @@ async def anthropic_messages(
     try:
         response = await llm_router.aanthropic_messages(**native_params)
     except Exception as exc:
-        await _compensate_quota(service, user, logical_model.id)
+        # Build ctx for error finalization
+        ctx = GatewayRequestContext(
+            request_id=request_id,
+            user_id=user.user_id,
+            department_id=user.department_id,
+            api_key_id=user.api_key_id,
+            requested_model=logical_model.name,
+            logical_model_id=logical_model.id,
+            logical_model_name=logical_model.name,
+            started_at=started_at,
+            stream=payload.stream,
+            quota_reserved=True,
+        )
+        ctx.mark_error(_usage_status_for_exception(exc))
         _record_usage_task(
             user=user,
             logical_model=logical_model,
             usage=_empty_usage(),
-            status_value=_usage_status_for_exception(exc),
+            status_value=ctx.status,
             latency_ms=_latency_ms(started_at),
             request_id=request_id,
         )
+        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
         raise _upstream_error(exc) from exc
 
     # Extract channel info from metadata (populated by Router before the call)
@@ -137,13 +161,21 @@ async def anthropic_messages(
 
     # Non-streaming: response is AnthropicMessagesResponse (dict-like)
     usage = _extract_anthropic_usage(response)
-    await service.settle_quota(
-        user.user_id,
-        user.department_id,
-        logical_model.id,
-        usage["total_tokens"],
-        _compute_internal_cost(logical_model, usage),
+    ctx = GatewayRequestContext(
+        request_id=request_id,
+        user_id=user.user_id,
+        department_id=user.department_id,
+        api_key_id=user.api_key_id,
+        requested_model=logical_model.name,
+        logical_model_id=logical_model.id,
+        logical_model_name=logical_model.name,
+        channel_id=channel_id,
+        upstream_model=upstream_model,
+        started_at=started_at,
+        stream=False,
+        quota_reserved=True,
     )
+    ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
     _record_usage_task(
         user=user,
         logical_model=logical_model,
@@ -154,6 +186,7 @@ async def anthropic_messages(
         channel_id=channel_id,
         upstream_model=upstream_model,
     )
+    await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
     # Return native Anthropic response directly
     return JSONResponse(
         content=_to_json_serializable(response),
@@ -211,15 +244,28 @@ async def gemini_generate_content(
         else:
             response = await llm_router.agenerate_content(**native_params)
     except Exception as exc:
-        await _compensate_quota(service, user, logical_model.id)
+        ctx = GatewayRequestContext(
+            request_id=request_id,
+            user_id=user.user_id,
+            department_id=user.department_id,
+            api_key_id=user.api_key_id,
+            requested_model=logical_model.name,
+            logical_model_id=logical_model.id,
+            logical_model_name=logical_model.name,
+            started_at=started_at,
+            stream=stream,
+            quota_reserved=True,
+        )
+        ctx.mark_error(_usage_status_for_exception(exc))
         _record_usage_task(
             user=user,
             logical_model=logical_model,
             usage=_empty_usage(),
-            status_value=_usage_status_for_exception(exc),
+            status_value=ctx.status,
             latency_ms=_latency_ms(started_at),
             request_id=request_id,
         )
+        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
         raise _upstream_error(exc) from exc
 
     channel_id = _channel_id_from_metadata(litellm_meta)
@@ -242,13 +288,21 @@ async def gemini_generate_content(
 
     # Non-streaming: return native Gemini response
     usage = _extract_gemini_usage_from_response(response)
-    await service.settle_quota(
-        user.user_id,
-        user.department_id,
-        logical_model.id,
-        usage["total_tokens"],
-        _compute_internal_cost(logical_model, usage),
+    ctx = GatewayRequestContext(
+        request_id=request_id,
+        user_id=user.user_id,
+        department_id=user.department_id,
+        api_key_id=user.api_key_id,
+        requested_model=logical_model.name,
+        logical_model_id=logical_model.id,
+        logical_model_name=logical_model.name,
+        channel_id=channel_id,
+        upstream_model=upstream_model,
+        started_at=started_at,
+        stream=False,
+        quota_reserved=True,
     )
+    ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
     _record_usage_task(
         user=user,
         logical_model=logical_model,
@@ -259,6 +313,7 @@ async def gemini_generate_content(
         channel_id=channel_id,
         upstream_model=upstream_model,
     )
+    await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
     return JSONResponse(
         content=_to_json_serializable(response),
         headers=_quota_headers(quota_result),
@@ -308,9 +363,66 @@ async def _execute_completion(
 ) -> JSONResponse | StreamingResponse:
     request_id = _request_id(request)
     logical_model = await service.resolve_model(user, requested_model)
+
+    # P2: Rate limiting (before quota reservation)
+    rate_limit_rules = await service.get_rate_limit_rules(
+        user.user_id, user.department_id, logical_model.id
+    )
+    if rate_limit_rules:
+        rl_result = await check_rate_limits(
+            request_id=request_id,
+            rules=rate_limit_rules,
+            estimated_tokens=100,
+            is_stream=stream,
+        )
+        if not rl_result.allowed:
+            raise AppError(
+                ErrorCode.rate_limit_exceeded,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
     quota_result = await service.check_quota(
         user.user_id, user.department_id, logical_model.id
     )
+
+    # P4: Response cache check (non-streaming only)
+    fingerprint: str | None = None
+    if not stream and is_cacheable_request(
+        stream=stream, response_cache_enabled=True, params=params
+    ):
+        fingerprint = compute_fingerprint(logical_model.name, messages, params)
+        cached = await get_cached_response(logical_model.id, fingerprint)
+        if cached is not None:
+            # Cache hit: still record usage with cache_hit=True
+            usage = _extract_usage(cached) if "usage" in str(cached) else _empty_usage()
+            ctx = GatewayRequestContext(
+                request_id=request_id,
+                user_id=user.user_id,
+                department_id=user.department_id,
+                api_key_id=user.api_key_id,
+                requested_model=logical_model.name,
+                logical_model_id=logical_model.id,
+                logical_model_name=logical_model.name,
+                started_at=monotonic(),
+                stream=False,
+                quota_reserved=True,
+                cache_hit=True,
+            )
+            ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
+            _record_usage_task(
+                user=user,
+                logical_model=logical_model,
+                usage=usage,
+                status_value=UsageStatus.success.value,
+                latency_ms=0,
+                request_id=request_id,
+            )
+            await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
+            return JSONResponse(
+                content=cached,
+                headers=_quota_headers(quota_result),
+            )
+
     started_at = monotonic()
     llm_router = RouterManager.get_router()
     if stream:
@@ -323,15 +435,29 @@ async def _execute_completion(
             **params,
         )
     except Exception as exc:
-        await _compensate_quota(service, user, logical_model.id)
+        # Build ctx for error finalization
+        ctx = GatewayRequestContext(
+            request_id=request_id,
+            user_id=user.user_id,
+            department_id=user.department_id,
+            api_key_id=user.api_key_id,
+            requested_model=logical_model.name,
+            logical_model_id=logical_model.id,
+            logical_model_name=logical_model.name,
+            started_at=started_at,
+            stream=stream,
+            quota_reserved=True,
+        )
+        ctx.mark_error(_usage_status_for_exception(exc))
         _record_usage_task(
             user=user,
             logical_model=logical_model,
             usage=_empty_usage(),
-            status_value=_usage_status_for_exception(exc),
+            status_value=ctx.status,
             latency_ms=_latency_ms(started_at),
             request_id=request_id,
         )
+        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
         raise _upstream_error(exc) from exc
 
     if stream:
@@ -349,13 +475,23 @@ async def _execute_completion(
 
     usage = _extract_usage(response)
     channel_id, upstream_model = _extract_routing_info(response)
-    await service.settle_quota(
-        user.user_id,
-        user.department_id,
-        logical_model.id,
-        usage["total_tokens"],
-        _compute_internal_cost(logical_model, usage),
+    # Build ctx for success finalization
+    ctx = GatewayRequestContext(
+        request_id=request_id,
+        user_id=user.user_id,
+        department_id=user.department_id,
+        api_key_id=user.api_key_id,
+        requested_model=logical_model.name,
+        logical_model_id=logical_model.id,
+        logical_model_name=logical_model.name,
+        channel_id=channel_id,
+        upstream_model=upstream_model,
+        started_at=started_at,
+        stream=False,
+        quota_reserved=True,
     )
+    ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
+    # Dual-write: direct DB path
     _record_usage_task(
         user=user,
         logical_model=logical_model,
@@ -366,6 +502,14 @@ async def _execute_completion(
         channel_id=channel_id,
         upstream_model=upstream_model,
     )
+    await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
+
+    # P4: Cache the response if eligible
+    if fingerprint is not None and is_cacheable_response(response):
+        await set_cached_response(
+            logical_model.id, fingerprint, jsonable_encoder(_dump_model(response))
+        )
+
     return JSONResponse(
         content=jsonable_encoder(_dump_model(response)),
         headers=_quota_headers(quota_result),
@@ -386,6 +530,18 @@ async def _stream_openai(
     started_at: float,
     request_id: str,
 ) -> AsyncIterator[str]:
+    ctx = GatewayRequestContext(
+        request_id=request_id,
+        user_id=user.user_id,
+        department_id=user.department_id,
+        api_key_id=user.api_key_id,
+        requested_model=logical_model.name,
+        logical_model_id=logical_model.id,
+        logical_model_name=logical_model.name,
+        started_at=started_at,
+        stream=True,
+        quota_reserved=True,
+    )
     usage = _empty_usage()
     status_value = UsageStatus.success.value
     channel_id: int | None = None
@@ -398,16 +554,12 @@ async def _stream_openai(
             elapsed = monotonic() - stream_start
             if elapsed > _STREAM_MAX_DURATION_SECONDS:
                 status_value = UsageStatus.timeout.value
-                if bytes_yielded == 0:
-                    await _compensate_quota(service, user, logical_model.id)
                 break
             try:
                 async with asyncio.timeout(_STREAM_IDLE_TIMEOUT_SECONDS):
                     chunk = await response_iter.__anext__()
             except TimeoutError:
                 status_value = UsageStatus.timeout.value
-                if bytes_yielded == 0:
-                    await _compensate_quota(service, user, logical_model.id)
                 break
             except StopAsyncIteration:
                 break
@@ -418,6 +570,8 @@ async def _stream_openai(
             if chunk_usage["total_tokens"]:
                 usage = chunk_usage
             data = f"data: {_dump_json(chunk)}\n\n"
+            if bytes_yielded == 0:
+                ctx.record_ttft()
             bytes_yielded += len(data.encode("utf-8"))
             yield data
         if status_value == UsageStatus.success.value:
@@ -426,18 +580,20 @@ async def _stream_openai(
             yield data
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
-        if bytes_yielded == 0:
-            await _compensate_quota(service, user, logical_model.id)
         raise
     except Exception as exc:
         status_value = _usage_status_for_exception(exc)
-        if bytes_yielded == 0:
-            await _compensate_quota(service, user, logical_model.id)
         raise _upstream_error(exc) from exc
     finally:
         response_channel_id, response_upstream_model = _extract_routing_info(response)
         channel_id = channel_id or response_channel_id
         upstream_model = upstream_model or response_upstream_model
+        # Populate context for finalizer
+        ctx.channel_id = channel_id
+        ctx.upstream_model = upstream_model
+        ctx.status = status_value
+        ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
+        # Dual-write: direct DB path (existing tests depend on this)
         _record_usage_task(
             user=user,
             logical_model=logical_model,
@@ -448,14 +604,8 @@ async def _stream_openai(
             channel_id=channel_id,
             upstream_model=upstream_model,
         )
-        if status_value == UsageStatus.success.value and usage["total_tokens"]:
-            await settle_quota_independent(
-                user_id=user.user_id,
-                department_id=user.department_id,
-                logical_model_id=logical_model.id,
-                actual_tokens=usage["total_tokens"],
-                actual_cost=_compute_internal_cost(logical_model, usage),
-            )
+        # Unified finalizer: quota settlement + durable enqueue + metrics
+        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +625,20 @@ async def _stream_anthropic_native(
     upstream_model: str | None,
 ) -> AsyncIterator[bytes]:
     """Pipe raw Anthropic SSE bytes to client, parsing usage from events."""
+    ctx = GatewayRequestContext(
+        request_id=request_id,
+        user_id=user.user_id,
+        department_id=user.department_id,
+        api_key_id=user.api_key_id,
+        requested_model=logical_model.name,
+        logical_model_id=logical_model.id,
+        logical_model_name=logical_model.name,
+        channel_id=channel_id,
+        upstream_model=upstream_model,
+        started_at=started_at,
+        stream=True,
+        quota_reserved=True,
+    )
     usage = _empty_usage()
     status_value = UsageStatus.success.value
     stream_start = monotonic()
@@ -487,16 +651,12 @@ async def _stream_anthropic_native(
             elapsed = monotonic() - stream_start
             if elapsed > _STREAM_MAX_DURATION_SECONDS:
                 status_value = UsageStatus.timeout.value
-                if bytes_yielded == 0:
-                    await _compensate_quota(service, user, logical_model.id)
                 break
             try:
                 async with asyncio.timeout(_STREAM_IDLE_TIMEOUT_SECONDS):
                     chunk = await response_iter.__anext__()
             except TimeoutError:
                 status_value = UsageStatus.timeout.value
-                if bytes_yielded == 0:
-                    await _compensate_quota(service, user, logical_model.id)
                 break
             except StopAsyncIteration:
                 break
@@ -504,20 +664,22 @@ async def _stream_anthropic_native(
             # chunk is bytes (raw SSE) — parse for usage then yield as-is
             raw_bytes = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
             _accumulate_anthropic_usage(raw_bytes, usage, sse_buffer)
+            if bytes_yielded == 0:
+                ctx.record_ttft()
             bytes_yielded += len(raw_bytes)
             yield raw_bytes
 
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
-        if bytes_yielded == 0:
-            await _compensate_quota(service, user, logical_model.id)
         raise
     except Exception as exc:
         status_value = _usage_status_for_exception(exc)
-        if bytes_yielded == 0:
-            await _compensate_quota(service, user, logical_model.id)
         raise _upstream_error(exc) from exc
     finally:
+        # Populate context for finalizer
+        ctx.status = status_value
+        ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
+        # Dual-write: direct DB path (existing tests depend on this)
         _record_usage_task(
             user=user,
             logical_model=logical_model,
@@ -528,14 +690,8 @@ async def _stream_anthropic_native(
             channel_id=channel_id,
             upstream_model=upstream_model,
         )
-        if status_value == UsageStatus.success.value and usage["total_tokens"]:
-            await settle_quota_independent(
-                user_id=user.user_id,
-                department_id=user.department_id,
-                logical_model_id=logical_model.id,
-                actual_tokens=usage["total_tokens"],
-                actual_cost=_compute_internal_cost(logical_model, usage),
-            )
+        # Unified finalizer: quota settlement + durable enqueue + metrics
+        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +711,20 @@ async def _stream_gemini_native(
     upstream_model: str | None,
 ) -> AsyncIterator[bytes]:
     """Pipe raw Gemini streaming bytes to client, parsing usage from chunks."""
+    ctx = GatewayRequestContext(
+        request_id=request_id,
+        user_id=user.user_id,
+        department_id=user.department_id,
+        api_key_id=user.api_key_id,
+        requested_model=logical_model.name,
+        logical_model_id=logical_model.id,
+        logical_model_name=logical_model.name,
+        channel_id=channel_id,
+        upstream_model=upstream_model,
+        started_at=started_at,
+        stream=True,
+        quota_reserved=True,
+    )
     usage = _empty_usage()
     status_value = UsageStatus.success.value
     stream_start = monotonic()
@@ -567,36 +737,34 @@ async def _stream_gemini_native(
             elapsed = monotonic() - stream_start
             if elapsed > _STREAM_MAX_DURATION_SECONDS:
                 status_value = UsageStatus.timeout.value
-                if bytes_yielded == 0:
-                    await _compensate_quota(service, user, logical_model.id)
                 break
             try:
                 async with asyncio.timeout(_STREAM_IDLE_TIMEOUT_SECONDS):
                     chunk = await response_iter.__anext__()
             except TimeoutError:
                 status_value = UsageStatus.timeout.value
-                if bytes_yielded == 0:
-                    await _compensate_quota(service, user, logical_model.id)
                 break
             except StopAsyncIteration:
                 break
 
             raw_bytes = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
             _accumulate_gemini_usage(raw_bytes, usage, sse_buffer)
+            if bytes_yielded == 0:
+                ctx.record_ttft()
             bytes_yielded += len(raw_bytes)
             yield raw_bytes
 
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
-        if bytes_yielded == 0:
-            await _compensate_quota(service, user, logical_model.id)
         raise
     except Exception as exc:
         status_value = _usage_status_for_exception(exc)
-        if bytes_yielded == 0:
-            await _compensate_quota(service, user, logical_model.id)
         raise _upstream_error(exc) from exc
     finally:
+        # Populate context for finalizer
+        ctx.status = status_value
+        ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
+        # Dual-write: direct DB path (existing tests depend on this)
         _record_usage_task(
             user=user,
             logical_model=logical_model,
@@ -607,14 +775,8 @@ async def _stream_gemini_native(
             channel_id=channel_id,
             upstream_model=upstream_model,
         )
-        if status_value == UsageStatus.success.value and usage["total_tokens"]:
-            await settle_quota_independent(
-                user_id=user.user_id,
-                department_id=user.department_id,
-                logical_model_id=logical_model.id,
-                actual_tokens=usage["total_tokens"],
-                actual_cost=_compute_internal_cost(logical_model, usage),
-            )
+        # Unified finalizer: quota settlement + durable enqueue + metrics
+        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +968,7 @@ def _record_usage_task(
     channel_id: int | None = None,
     upstream_model: str | None = None,
 ) -> None:
+    # Primary: direct DB write (existing behavior, preserved for tests).
     asyncio.create_task(
         record_usage(
             UsageData(
@@ -824,6 +987,59 @@ def _record_usage_task(
             )
         )
     )
+    # Secondary: durable enqueue to Redis queue (P3) for gateway log / metrics.
+    # This is fire-and-forget; if Redis is down, the primary path above handles it.
+    asyncio.create_task(
+        _enqueue_log_event(
+            user=user,
+            logical_model=logical_model,
+            usage=usage,
+            status_value=status_value,
+            latency_ms=latency_ms,
+            request_id=request_id,
+            channel_id=channel_id,
+            upstream_model=upstream_model,
+        )
+    )
+
+
+async def _enqueue_log_event(
+    *,
+    user: AuthenticatedUser,
+    logical_model: LogicalModel,
+    usage: dict[str, int],
+    status_value: str,
+    latency_ms: int | None,
+    request_id: str,
+    channel_id: int | None = None,
+    upstream_model: str | None = None,
+) -> None:
+    """Enqueue a gateway log event to the durable Redis queue (P1 observability)."""
+    from src.gateway.events import enqueue_log_event
+
+    with suppress(Exception):
+        payload = {
+            "request_id": request_id,
+            "user_id": user.user_id,
+            "api_key_id": user.api_key_id,
+            "logical_model_id": logical_model.id,
+            "model": logical_model.name,
+            "channel_id": channel_id,
+            "upstream_model": upstream_model,
+            "provider": None,
+            "status_code": 200 if status_value == UsageStatus.success.value else 502,
+            "error_code": None,
+            "error_body": None,
+            "latency_ms": latency_ms,
+            "ttft_ms": None,
+            "tokens_in": usage["prompt_tokens"],
+            "tokens_out": usage["completion_tokens"],
+            "cache_hit": False,
+            "stream": False,
+            "retry_count": 0,
+            "fallback_used": False,
+        }
+        await enqueue_log_event(payload)
 
 
 def _extract_usage(response: Any) -> dict[str, int]:

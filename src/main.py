@@ -16,6 +16,7 @@ from src.auth.router import router as auth_router
 from src.config import get_settings, validate_runtime
 from src.core.i18n.middleware import LocaleMiddleware
 from src.core.logging import bind_trace_id, clear_context, configure_logging, get_logger
+from src.core.metrics import setup_metrics_route
 from src.core.redis import close_redis
 from src.core.redis import ping as redis_ping
 from src.core.security_headers import SecurityHeadersMiddleware
@@ -23,6 +24,7 @@ from src.core.worker_id import acquire_worker_id
 from src.db.session import async_session_factory, engine
 from src.exceptions import register_exception_handlers
 from src.files.router import router as attach_router
+from src.gateway.endpoints_v1 import router as gateway_v1_router
 from src.gateway.router import router as gateway_router
 from src.gateway.router_manager import RouterManager
 
@@ -114,11 +116,13 @@ def create_app() -> FastAPI:
     # nosniff / 防点击劫持 / CSP / 条件 HSTS,不依赖 nginx 是否配齐。
     app.add_middleware(SecurityHeadersMiddleware)
     register_exception_handlers(app)
+    setup_metrics_route(app)
 
     app.include_router(auth_router, prefix=settings.api_prefix)
     app.include_router(admin_router, prefix=settings.api_prefix)
     app.include_router(attach_router, prefix=settings.api_prefix)
     app.include_router(gateway_router, prefix=settings.api_prefix)
+    app.include_router(gateway_v1_router, prefix=settings.api_prefix)
 
     # health 探针走裸格式,不套统一信封——它服务于 k8s/LB 存活探测,约定是
     # 极简 {"status":"ok"},不属于管理面业务 API,无 i18n / trace 语义需求。

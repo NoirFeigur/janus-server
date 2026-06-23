@@ -49,6 +49,12 @@ class RouterManager:
         async with cls._lock:
             async with session_factory() as session:
                 rows = await GatewayRepository(session).get_router_config()
+
+            # Exclude degraded channels (fail-open: if Redis is down, include all)
+            degraded_ids = await cls._get_degraded_ids()
+            if degraded_ids:
+                rows = [r for r in rows if r.channel_id not in degraded_ids]
+
             new_router = build_router(rows)
             old_router = cls._router
             cls._router = new_router
@@ -56,7 +62,11 @@ class RouterManager:
             if old_router is not None:
                 with suppress(Exception):
                     await old_router.close()  # type-safe: litellm Router exposes close()
-            _log.info("gateway.router.rebuilt", deployments=len(rows))
+            _log.info(
+                "gateway.router.rebuilt",
+                deployments=len(rows),
+                degraded_excluded=len(degraded_ids),
+            )
 
     @classmethod
     def get_router(cls) -> Router:
@@ -72,6 +82,15 @@ class RouterManager:
                 await cls.rebuild(session_factory)
             except Exception:
                 _log.exception("gateway.router.rebuild_failed")
+
+    @classmethod
+    async def _get_degraded_ids(cls) -> set[int]:
+        """Load degraded channel IDs from Redis (fail-open: empty set on error)."""
+        with suppress(Exception):
+            from src.channel_health.redis_store import get_degraded_channel_ids
+
+            return await get_degraded_channel_ids()
+        return set()
 
     @classmethod
     async def _subscribe(

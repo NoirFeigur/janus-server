@@ -86,6 +86,13 @@ class QuotaMetric(StrEnum):
     cost = "cost"  # Internal cost-point quota.
 
 
+class RateLimitScope(StrEnum):
+    user = "user"  # Per-user rate limit.
+    department = "department"  # Per-department rate limit.
+    global_ = "global"  # Platform-wide rate limit.
+    api_key = "api_key"  # Per-API-key rate limit.
+
+
 class ConfigValueType(StrEnum):
     string = "string"  # Raw string value, used as-is.
     int = "int"  # Parsed as a base-10 integer.
@@ -114,6 +121,7 @@ class ErrorCode(StrEnum):
     model_unavailable = "model.unavailable"  # Logical model has no active deployments.
     model_no_channel = "model.no_available_channel"  # Logical model has no usable channel.
     quota_exceeded = "quota.exceeded"  # Quota limit has been reached.
+    rate_limit_exceeded = "rate_limit.exceeded"  # Hard rate limit (RPM/TPM/concurrent) breached.
     upstream_error = "upstream.error"  # Upstream provider returned an error.
     upstream_timeout = "upstream.timeout"  # Upstream provider timed out.
     upstream_rate_limited = "upstream.rate_limited"  # Upstream pool is rate-limited.

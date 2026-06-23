@@ -271,7 +271,7 @@ async def test_stream_anthropic_native_pipes_bytes_and_extracts_usage() -> None:
 
     collected: list[bytes] = []
     with patch(
-        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
     ):
         async for chunk in _stream_anthropic_native(
             response=_fake_byte_stream(sse_chunks),
@@ -322,8 +322,8 @@ async def test_stream_anthropic_native_records_usage() -> None:
     fake_service.quota = AsyncMock()
 
     with patch(
-        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
-    ) as mock_settle, patch(
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
+    ) as mock_finalize, patch(
         "src.gateway.router.record_usage", new_callable=AsyncMock
     ) as mock_record:
         async for _ in _stream_anthropic_native(
@@ -338,10 +338,10 @@ async def test_stream_anthropic_native_records_usage() -> None:
         ):
             pass
 
-    # Settle should be called with extracted usage
-    mock_settle.assert_called_once()
-    call_kwargs = mock_settle.call_args[1]
-    assert call_kwargs["actual_tokens"] == 32  # 20 + 12
+    # Finalize should be called with ctx containing extracted usage
+    mock_finalize.assert_called_once()
+    ctx = mock_finalize.call_args[0][0]
+    assert ctx.total_tokens == 32  # 20 + 12
 
     # record_usage should be called with correct usage data
     mock_record.assert_called_once()
@@ -388,7 +388,7 @@ async def test_stream_gemini_native_pipes_bytes_and_extracts_usage() -> None:
 
     collected: list[bytes] = []
     with patch(
-        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
     ):
         async for chunk in _stream_gemini_native(
             response=_fake_byte_stream(sse_chunks),
@@ -431,8 +431,8 @@ async def test_stream_gemini_native_records_usage() -> None:
     fake_service.quota = AsyncMock()
 
     with patch(
-        "src.gateway.router.settle_quota_independent", new_callable=AsyncMock
-    ) as mock_settle, patch(
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
+    ) as mock_finalize, patch(
         "src.gateway.router.record_usage", new_callable=AsyncMock
     ) as mock_record:
         async for _ in _stream_gemini_native(
@@ -447,9 +447,9 @@ async def test_stream_gemini_native_records_usage() -> None:
         ):
             pass
 
-    mock_settle.assert_called_once()
-    call_kwargs = mock_settle.call_args[1]
-    assert call_kwargs["actual_tokens"] == 8
+    mock_finalize.assert_called_once()
+    ctx = mock_finalize.call_args[0][0]
+    assert ctx.total_tokens == 8
 
     mock_record.assert_called_once()
     usage_data = mock_record.call_args[0][0]
