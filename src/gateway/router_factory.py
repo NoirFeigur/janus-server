@@ -29,7 +29,10 @@ def build_router(rows: list[RouterDeploymentRow]) -> Router:
             {
                 "model_name": row.logical_model_name,
                 "litellm_params": litellm_params,
-                "model_info": {"id": str(row.channel_key_id)},
+                "model_info": {
+                    "id": str(row.channel_id),
+                    "channel_key_id": str(row.channel_key_id),
+                },
                 "weight": row.deployment_weight * row.key_weight,
                 "priority": row.deployment_priority,
             }

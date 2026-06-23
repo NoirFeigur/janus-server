@@ -457,13 +457,7 @@ class CatalogService:
         add_after_commit_hook(self.session, _publish_router_invalidation)
 
 
-def _publish_router_invalidation() -> None:
+async def _publish_router_invalidation() -> None:
     """Publish router invalidation event (best-effort, non-blocking)."""
-    import asyncio
-
-    async def _pub() -> None:
-        with suppress(Exception):
-            await get_redis().publish("gateway:router:invalidate", "1")
-
-    with suppress(RuntimeError):
-        asyncio.get_event_loop().create_task(_pub())
+    with suppress(Exception):
+        await get_redis().publish("gateway:router:invalidate", "1")

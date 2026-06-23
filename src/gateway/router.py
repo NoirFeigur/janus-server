@@ -22,11 +22,11 @@ from src.db.models.model_catalog import LogicalModel
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
 from src.gateway.dependencies import get_gateway_service
-from src.gateway.quota import QuotaCheckResult
+from src.gateway.quota import QuotaCheckResult, QuotaEnforcer
 from src.gateway.router_manager import RouterManager
 from src.gateway.schemas import AnthropicRequest, GeminiRequest, OpenAIRequest
 from src.gateway.service import GatewayService
-from src.gateway.usage import UsageData, record_usage
+from src.gateway.usage import UsageData, compute_cost, record_usage
 
 router = APIRouter(tags=["gateway"])
 
@@ -64,6 +64,12 @@ async def anthropic_messages(
     service: GatewayServiceDep,
 ) -> JSONResponse | StreamingResponse:
     payload = await _parse_body(request, AnthropicRequest)
+    if payload.stream:
+        raise AppError(
+            ErrorCode.request_invalid,
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            params={"detail": "Anthropic streaming not yet supported; use /v1/chat/completions"},
+        )
     params = payload.model_dump(exclude={"model", "messages", "stream", "system"})
     messages = _anthropic_to_openai_messages(payload.messages, payload.system)
     response = await _execute_completion(
@@ -72,7 +78,7 @@ async def anthropic_messages(
         service=service,
         requested_model=payload.model,
         messages=messages,
-        stream=payload.stream,
+        stream=False,
         params=params,
     )
     if isinstance(response, StreamingResponse):
@@ -95,13 +101,19 @@ async def gemini_generate_content(
         payload.system_instruction,
     )
     stream = request.url.path.endswith(":streamGenerateContent")
+    if stream:
+        raise AppError(
+            ErrorCode.request_invalid,
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            params={"detail": "Gemini streaming not yet supported; use /v1/chat/completions"},
+        )
     response = await _execute_completion(
         request=request,
         user=user,
         service=service,
         requested_model=model_name,
         messages=messages,
-        stream=stream,
+        stream=False,
         params=params,
     )
     if isinstance(response, StreamingResponse):
@@ -110,12 +122,17 @@ async def gemini_generate_content(
 
 
 async def _parse_body(request: Request, schema: type[RequestSchemaT]) -> RequestSchemaT:
-    body = await request.body()
-    if len(body) > _MAX_BODY_BYTES:
-        raise AppError(
-            ErrorCode.request_invalid,
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-        )
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > _MAX_BODY_BYTES:
+            raise AppError(
+                ErrorCode.request_invalid,
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+        chunks.append(chunk)
+    body = b"".join(chunks)
     try:
         return schema.model_validate_json(body)
     except (ValidationError, ValueError) as exc:
@@ -183,7 +200,7 @@ async def _execute_completion(
         user.department_id,
         logical_model.id,
         usage["total_tokens"],
-        _actual_cost(response),
+        _compute_internal_cost(logical_model, usage),
     )
     _record_usage_task(
         user=user,
@@ -215,19 +232,23 @@ async def _stream_openai(
     channel_id: int | None = None
     upstream_model: str | None = None
     stream_start = monotonic()
-    last_chunk_at = monotonic()
+    response_iter = response.__aiter__()
     try:
-        async for chunk in response:
-            now = monotonic()
-            if now - stream_start > _STREAM_MAX_DURATION_SECONDS:
+        while True:
+            elapsed = monotonic() - stream_start
+            if elapsed > _STREAM_MAX_DURATION_SECONDS:
                 status_value = UsageStatus.timeout.value
                 await _compensate_quota(service, user, logical_model.id)
                 break
-            if now - last_chunk_at > _STREAM_IDLE_TIMEOUT_SECONDS:
+            try:
+                async with asyncio.timeout(_STREAM_IDLE_TIMEOUT_SECONDS):
+                    chunk = await response_iter.__anext__()
+            except TimeoutError:
                 status_value = UsageStatus.timeout.value
                 await _compensate_quota(service, user, logical_model.id)
                 break
-            last_chunk_at = now
+            except StopAsyncIteration:
+                break
             chunk_channel_id, chunk_upstream_model = _extract_routing_info(chunk)
             channel_id = channel_id or chunk_channel_id
             upstream_model = upstream_model or chunk_upstream_model
@@ -260,14 +281,12 @@ async def _stream_openai(
             upstream_model=upstream_model,
         )
         if status_value == UsageStatus.success.value and usage["total_tokens"]:
-            asyncio.create_task(
-                service.settle_quota(
-                    user.user_id,
-                    user.department_id,
-                    logical_model.id,
-                    usage["total_tokens"],
-                    None,
-                )
+            await _settle_quota_independent(
+                user_id=user.user_id,
+                department_id=user.department_id,
+                logical_model_id=logical_model.id,
+                actual_tokens=usage["total_tokens"],
+                actual_cost=_compute_internal_cost(logical_model, usage),
             )
 
 
@@ -280,6 +299,36 @@ async def _compensate_quota(
     await service.quota.compensate(
         user.user_id, user.department_id, logical_model_id, quotas
     )
+
+
+async def _settle_quota_independent(
+    *,
+    user_id: int,
+    department_id: int | None,
+    logical_model_id: int,
+    actual_tokens: int,
+    actual_cost: Decimal | None,
+) -> None:
+    """Settle quota using an independent session (safe after request session closes)."""
+    from src.db.session import async_session_factory
+    from src.gateway.repository import GatewayRepository
+
+    with suppress(Exception):
+        async with async_session_factory() as session:
+            quotas = await GatewayRepository(session).get_active_quotas(
+                user_id, department_id, logical_model_id
+            )
+            await QuotaEnforcer().settle(
+                user_id, department_id, logical_model_id, quotas,
+                actual_tokens, actual_cost,
+            )
+
+
+def _compute_internal_cost(
+    logical_model: LogicalModel, usage: dict[str, int]
+) -> Decimal | None:
+    """Compute internal cost from the logical model's pricing."""
+    return compute_cost(logical_model, usage["prompt_tokens"], usage["completion_tokens"])
 
 
 def _record_usage_task(

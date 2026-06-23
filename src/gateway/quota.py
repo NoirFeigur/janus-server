@@ -99,10 +99,16 @@ class QuotaEnforcer:
         ]
         argv: list[str | int] = [len(quotas)]
         for quota in quotas:
+            # Cost quotas use micro-units (×1_000_000) for Redis integer precision.
+            limit = (
+                int(quota.limit_value * 1_000_000)
+                if quota.metric == QuotaMetric.cost.value
+                else int(quota.limit_value)
+            )
             argv.extend(
                 [
                     self._ttl_seconds(quota.period) or 0,
-                    int(quota.limit_value),
+                    limit,
                     int(quota.enforce),
                 ]
             )
@@ -186,7 +192,10 @@ class QuotaEnforcer:
         if quota.metric == QuotaMetric.tokens.value:
             return actual_tokens - 1
         if quota.metric == QuotaMetric.cost.value:
-            return int(actual_cost or Decimal(0)) - 1
+            # Cost stored in micro-units (×1_000_000) for Redis integer precision.
+            # Reservation was 1 micro-unit; settle to actual micro-cost.
+            micro_cost = int((actual_cost or Decimal(0)) * 1_000_000)
+            return micro_cost - 1
         return 0
 
     @staticmethod
