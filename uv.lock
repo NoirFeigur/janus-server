@@ -744,7 +744,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=45,<47" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "litellm", specifier = ">=1.72,<2" },
+    { name = "litellm", specifier = ">=1.82,<2" },
     { name = "mcp", specifier = ">=1.9,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.16,<2" },
     { name = "pillow", specifier = ">=11,<12" },

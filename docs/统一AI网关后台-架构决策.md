@@ -81,18 +81,18 @@ Hermes / Claude Code / OA系统 / 脚本 / 其他应用
 
 ## 三、网关 build / buy 边界（G2 + G3）
 
-**结论：控制面全自建，litellm 仅作为「翻译 + 韧性」的库，存在感就两个调用点。**
+**结论：控制面全自建，litellm 仅作为「翻译 + 韧性」的库，存在感就三个调用点。**
 
 ```python
 # 你的 FastAPI 网关进程（100% 自研代码）
-# —— 客户端协议有两个原生入口，各自调对应的 litellm 库函数 ——
+# —— 客户端协议有三个原生入口，各自调对应的 litellm Router 原生接口 ——
 
 # 入口 1：OpenAI 协议（Hermes + 任意 OpenAI SDK 客户端）
 async def handle_openai(request, principal):       # POST /v1/chat/completions
     verify_credential(principal)                    # ← 自建：JWT / sk-key 鉴权
-    check_quota(principal, redis)                   # ← 自建：Redis 配额
+    check_quota(principal, redis)                   # ← 自建：Lua 原子配额
     model, _ = resolve_model(principal)             # ← 自建：分配表裁决
-    resp = await router.acompletion(                # ← litellm：按 model 前缀自动直通/转换
+    resp = await router.acompletion(                # ← litellm Router：按 model 前缀路由
         model=model, messages=..., stream=True
     )
     async for chunk in resp:                        # ← 自建：流式透传 + 尾包记账
@@ -102,19 +102,33 @@ async def handle_openai(request, principal):       # POST /v1/chat/completions
 # 入口 2：Anthropic 协议（Claude Code 等）
 async def handle_anthropic(request, principal):     # POST /v1/messages
     verify_credential(principal); check_quota(...); model, _ = resolve_model(...)
-    resp = await litellm.anthropic.messages.acreate(# ← litellm：anthropic/ 上游则无损直通
-        model=model, messages=..., stream=True
+    metadata = {}
+    resp = await router.aanthropic_messages(        # ← litellm Router 原生接口：返回 bytes
+        model=model, messages=..., stream=True,
+        litellm_metadata=metadata                   # Router 写入 channel_id 供记账归因
     )
-    async for chunk in resp:                        # ← 自建：Anthropic SSE 透传 + 记账
-        record_usage_if_final(chunk)
-        yield chunk                                 # 已是 Anthropic SSE 事件
+    async for raw_bytes in resp:                    # ← 原生 SSE bytes 直透，零格式转换
+        accumulate_usage_from_sse(raw_bytes)         # 从 message_start/message_delta 解析
+        yield raw_bytes                             # 已是 Anthropic SSE 原始字节
+
+# 入口 3：Gemini 协议（Google genai SDK）
+async def handle_gemini(request, principal):         # POST /v1beta/models/{m}:streamGenerateContent
+    verify_credential(principal); check_quota(...); model, _ = resolve_model(...)
+    metadata = {}
+    resp = await router.agenerate_content_stream(   # ← litellm Router 原生接口：返回 bytes
+        model=model, contents=...,
+        litellm_metadata=metadata
+    )
+    async for raw_bytes in resp:                    # ← 原生 Gemini SSE bytes 直透
+        accumulate_usage_from_sse(raw_bytes)         # 从 usageMetadata 字段解析
+        yield raw_bytes
 ```
 
 ### 自建 vs 引用库 总账
 
 | 层 | 自建 | 引用库 |
 |---|---|---|
-| LLM 网关 | 客户端协议入口 / 鉴权 / 路由 / 配额 / 记账 / 可观测 | litellm（`acompletion` + `anthropic.messages.acreate` 翻译 + `Router` 韧性） |
+| LLM 网关 | 客户端协议入口 / 鉴权 / 路由 / 配额 / 记账 / 可观测 | litellm（`Router.acompletion` + `Router.aanthropic_messages` + `Router.agenerate_content_stream` 原生接口 + `Router` 韧性） |
 | MCP 服务器 | 自身即标准 MCP 服务器 / 工具(代码) / 鉴权 / `tools/list` 发现 / 调用审计 | mcp SDK（协议层，作 **MCP 服务端**暴露 Streamable HTTP 端点） |
 | 认证服务 | 企微 OAuth / JWT 签发 / refresh rotation / sk-key 子系统 | pyjwt 等标准 JWT 库 |
 | 管理后台 | 后端 CRUD / 报表 + **前端全部** | Ant Design Pro 等 UI 框架 |
@@ -151,15 +165,17 @@ async def handle_anthropic(request, principal):     # POST /v1/messages
 
 客户端打哪个端点只决定「请求进来是什么格式」；**真正决定转不转、怎么转的，是请求被路由到的上游是什么协议**。同协议直通（无损），异协议转换。**直通是 per-上游 的配置开关，不是全局开关**（来自 new-api 源码实证：`QuantumNous/new-api`，转换由 channel-type 的 Adaptor 决定，passthrough 是 channel setting）。
 
-### 三个客户端入口 → 三个 litellm 库函数
+### 三个客户端入口 → 三个 litellm Router 原生接口
 
-| 客户端协议 | 端点 | 调用的 litellm 库函数 |
-|---|---|---|
-| OpenAI | `POST /v1/chat/completions` | `litellm.acompletion()` / `Router.acompletion()` |
-| Anthropic | `POST /v1/messages` | `litellm.anthropic.messages.acreate()` |
-| Gemini | `POST /v1beta/models/{model}:generateContent` | `litellm.google_genai.agenerate_content()` / `agenerate_content_stream()` |
+| 客户端协议 | 端点 | 调用的 litellm Router 接口 | 返回类型 |
+|---|---|---|---|
+| OpenAI | `POST /v1/chat/completions` | `Router.acompletion()` | `AsyncIterator[ModelResponse]`（chunk 对象） |
+| Anthropic | `POST /v1/messages` | `Router.aanthropic_messages()` | `AsyncIterator[bytes]`（原生 SSE 字节流） |
+| Gemini | `POST /v1beta/models/{model}:generateContent` | `Router.agenerate_content()` / `Router.agenerate_content_stream()` | `dict` / `AsyncIterator[bytes]`（原生 SSE 字节流） |
 
-> 三者对称，均为 litellm 库原生提供（Gemini 由 PR #12046 加入，2025/6）。**三个入口都不用自写转换器。**
+> 三者对称，均为 litellm Router 原生提供。Anthropic/Gemini 返回**原始 SSE 字节流**，网关零格式转换直透给客户端；OpenAI 返回结构化 chunk 对象，由网关序列化为 SSE。**三个入口都不用自写转换器。**
+>
+> **关键架构决策（2026-06-23 native passthrough refactor）**：早期设计曾考虑所有协议统一走 `Router.acompletion()` → OpenAI chunks → 再反转为各协议格式（double-normalization），实际实现中**否决此方案**，改用各协议的 Router 原生接口直透。原因：① 避免 Anthropic `cache_control`/`thinking` 等特性在 OpenAI 中间格式中丢失；② 避免 Gemini `usageMetadata`/`safetyRatings` 等富字段被截断；③ 消除两次序列化/反序列化的性能开销；④ litellm callbacks 对原生流式存在已知 bugs（#8842/#24097/#28216），从 SSE bytes 中间流解析 usage 更可靠。
 
 ### 对称 3×3 矩阵（客户端协议 × 上游协议）
 
