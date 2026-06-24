@@ -24,6 +24,10 @@ from src.core.redis import get_redis
 
 _log = get_logger(__name__)
 
+# Conservative upfront TPM reservation per request.  Settled/refunded against
+# actual token usage at request finalization (see finalize._refund_tpm).
+ESTIMATED_TOKENS_PER_REQUEST = 100
+
 
 @dataclass(frozen=True, slots=True)
 class RateLimitCheckResult:

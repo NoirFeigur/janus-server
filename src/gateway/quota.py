@@ -52,9 +52,29 @@ class QuotaWarning:
 
 
 @dataclass(frozen=True, slots=True)
+class QuotaReservation:
+    """A quota counter reserved at check time.
+
+    Captures the *resolved* Redis key plus the scalar quota attributes needed to
+    settle.  Settlement targets this exact key, so it is immune to quota config
+    hot-reloads or period rollover between check and settle (the divergence
+    window is unbounded for long streams).  Reservation and settlement always
+    balance on the same counter.
+    """
+
+    key: str
+    quota_id: int
+    metric: str
+    scope: str
+    enforce: bool
+    limit_value: Decimal
+
+
+@dataclass(frozen=True, slots=True)
 class QuotaCheckResult:
     passed: bool
     warnings: list[QuotaWarning] = field(default_factory=list)
+    reservations: list[QuotaReservation] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +159,18 @@ class QuotaEnforcer:
                         limit=quota.limit_value,
                     )
                 )
-        return QuotaCheckResult(passed=True, warnings=warnings)
+        reservations = [
+            QuotaReservation(
+                key=key,
+                quota_id=quota.id,
+                metric=quota.metric,
+                scope=quota.scope,
+                enforce=quota.enforce,
+                limit_value=quota.limit_value,
+            )
+            for key, quota in zip(keys, quotas, strict=True)
+        ]
+        return QuotaCheckResult(passed=True, warnings=warnings, reservations=reservations)
 
     async def compensate(
         self,
@@ -201,6 +232,69 @@ class QuotaEnforcer:
                         "limit": str(limit),
                     },
                 )
+
+    async def settle_reservations(
+        self,
+        reservations: Sequence[QuotaReservation],
+        actual_tokens: int,
+        actual_cost: Decimal | None,
+    ) -> None:
+        """Settle against the exact keys reserved at check time (hot-reload safe).
+
+        Targets the resolved Redis keys captured by ``check_and_increment`` so
+        reservation and settlement always balance on the same counter, even if
+        the quota config hot-reloaded or the period rolled over mid-request.
+        """
+        redis = get_redis()
+        for res in reservations:
+            adjustment = self._settlement_adjustment_for_metric(
+                res.metric, actual_tokens, actual_cost
+            )
+            if adjustment == 0:
+                continue
+            await redis.incrby(res.key, adjustment)
+            current = Decimal(await self._count(redis, res.key))
+            limit = self._redis_limit_for(res.metric, res.limit_value)
+            if res.enforce and current > limit:
+                logger.warning(
+                    "quota exceeded after settlement",
+                    extra={
+                        "quota_id": res.quota_id,
+                        "metric": res.metric,
+                        "scope": res.scope,
+                        "current": str(current),
+                        "limit": str(limit),
+                    },
+                )
+
+    async def compensate_reservations(
+        self,
+        reservations: Sequence[QuotaReservation],
+    ) -> None:
+        """Give back the +1 pre-flight reservation on the exact keys reserved."""
+        redis = get_redis()
+        for res in reservations:
+            await redis.decr(res.key)
+
+    @staticmethod
+    def _settlement_adjustment_for_metric(
+        metric: str, actual_tokens: int, actual_cost: Decimal | None
+    ) -> int:
+        if metric == QuotaMetric.requests.value:
+            return 0
+        if metric == QuotaMetric.tokens.value:
+            return actual_tokens - 1
+        if metric == QuotaMetric.cost.value:
+            # Cost stored in micro-units (×1_000_000); reservation was 1 micro-unit.
+            micro_cost = int((actual_cost or Decimal(0)) * 1_000_000)
+            return micro_cost - 1
+        return 0
+
+    @staticmethod
+    def _redis_limit_for(metric: str, limit_value: Decimal) -> Decimal:
+        if metric == QuotaMetric.cost.value:
+            return limit_value * Decimal(1_000_000)
+        return limit_value
 
     @staticmethod
     def _settlement_adjustment(

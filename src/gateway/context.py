@@ -11,9 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from time import monotonic
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from src.enums import UsageStatus
+
+if TYPE_CHECKING:
+    from src.gateway.quota import QuotaReservation
 
 
 @dataclass(slots=True)
@@ -62,6 +66,10 @@ class GatewayRequestContext:
     # --- Quota (set after check_quota) ---
     quota_reserved: bool = False
     quota_settled: bool = False
+    # Resolved quota counters reserved at check time; settle/compensate target
+    # these exact keys (hot-reload + period-rollover safe). Empty => fall back to
+    # legacy re-query settle in the finalizer.
+    quota_reservations: list[QuotaReservation] = field(default_factory=list)
 
     def record_latency(self) -> None:
         """Compute and store latency_ms from started_at to now."""

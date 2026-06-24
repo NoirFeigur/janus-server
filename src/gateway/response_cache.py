@@ -76,6 +76,14 @@ def is_cacheable_request(
     # n > 1 produces multiple choices — don't cache
     if params.get("n", 1) > 1:
         return False
+    # Non-deterministic sampling (temperature > 0) yields different output each
+    # call — caching would serve a stale sample as if fresh. Only deterministic
+    # requests (temperature == 0, or unset → treated as deterministic-eligible)
+    # are cacheable. The fingerprint embeds temperature, so a later explicit
+    # temperature=0 keys separately from an unset request.
+    temperature = params.get("temperature")
+    if isinstance(temperature, (int, float)) and temperature > 0:
+        return False
     # Tool calls are context-dependent — don't cache
     return not (params.get("tools") or params.get("tool_choice"))
 
@@ -129,7 +137,8 @@ async def get_cached_response(
         raw = await redis.get(key)
         if raw is None:
             return None
-        return json.loads(raw)
+        decoded = json.loads(raw)
+        return decoded if isinstance(decoded, dict) else None
     except (RedisError, json.JSONDecodeError, ValueError):
         return None
 

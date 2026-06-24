@@ -15,6 +15,7 @@ from src.gateway.router import (
     _accumulate_anthropic_usage,
     _accumulate_gemini_usage,
     _channel_id_from_metadata,
+    _check_rate_limits,
     _empty_usage,
     _extract_anthropic_usage,
     _extract_gemini_usage_from_response,
@@ -298,7 +299,7 @@ async def test_stream_anthropic_native_pipes_bytes_and_extracts_usage() -> None:
 
 @pytest.mark.asyncio
 async def test_stream_anthropic_native_records_usage() -> None:
-    """Usage is extracted from SSE events and passed to record_usage."""
+    """Usage is extracted from SSE events and carried on ctx into finalize."""
     sse_chunks = _make_anthropic_sse(
         ("message_start", {
             "type": "message_start",
@@ -323,9 +324,7 @@ async def test_stream_anthropic_native_records_usage() -> None:
 
     with patch(
         "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
-    ) as mock_finalize, patch(
-        "src.gateway.router.record_usage", new_callable=AsyncMock
-    ) as mock_record:
+    ) as mock_finalize:
         async for _ in _stream_anthropic_native(
             response=_fake_byte_stream(sse_chunks),
             user=FakeUser(),
@@ -338,18 +337,12 @@ async def test_stream_anthropic_native_records_usage() -> None:
         ):
             pass
 
-    # Finalize should be called with ctx containing extracted usage
+    # Finalize is the single usage/log path; ctx carries the extracted usage.
     mock_finalize.assert_called_once()
     ctx = mock_finalize.call_args[0][0]
+    assert ctx.prompt_tokens == 20
+    assert ctx.completion_tokens == 12
     assert ctx.total_tokens == 32  # 20 + 12
-
-    # record_usage should be called with correct usage data
-    mock_record.assert_called_once()
-    usage_data = mock_record.call_args[0][0]
-    assert usage_data.prompt_tokens == 20
-    assert usage_data.completion_tokens == 12
-    assert usage_data.total_tokens == 32
-    assert usage_data.channel_id == 7
 
 
 # ---------------------------------------------------------------------------
@@ -432,9 +425,7 @@ async def test_stream_gemini_native_records_usage() -> None:
 
     with patch(
         "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
-    ) as mock_finalize, patch(
-        "src.gateway.router.record_usage", new_callable=AsyncMock
-    ) as mock_record:
+    ) as mock_finalize:
         async for _ in _stream_gemini_native(
             response=_fake_byte_stream(sse_chunks),
             user=FakeUser(),
@@ -449,10 +440,171 @@ async def test_stream_gemini_native_records_usage() -> None:
 
     mock_finalize.assert_called_once()
     ctx = mock_finalize.call_args[0][0]
+    assert ctx.prompt_tokens == 5
+    assert ctx.completion_tokens == 3
     assert ctx.total_tokens == 8
 
-    mock_record.assert_called_once()
-    usage_data = mock_record.call_args[0][0]
-    assert usage_data.prompt_tokens == 5
-    assert usage_data.completion_tokens == 3
-    assert usage_data.channel_id == 11
+
+# ---------------------------------------------------------------------------
+# H2: concurrent semaphore release in stream finally
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_anthropic_releases_concurrent_slot() -> None:
+    """When rate_limit_rules are passed, the slot is released in finally."""
+    sse_chunks = _make_anthropic_sse(
+        ("message_start", {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 5, "output_tokens": 0}},
+        }),
+        ("message_stop", {"type": "message_stop"}),
+    )
+
+    fake_service = AsyncMock()
+    fake_service.repo = AsyncMock()
+    fake_service.repo.get_active_quotas = AsyncMock(return_value=[])
+    fake_service.quota = AsyncMock()
+
+    rules = [{"id": 1, "max_concurrent": 5, "subject_type": "user", "subject_id": 100}]
+
+    with patch(
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
+    ), patch(
+        "src.gateway.router.release_concurrent", new_callable=AsyncMock
+    ) as mock_release:
+        async for _ in _stream_anthropic_native(
+            response=_fake_byte_stream(sse_chunks),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=fake_service,
+            started_at=0.0,
+            request_id="req-rel",
+            channel_id=7,
+            upstream_model="anthropic/claude-sonnet-4-20250514",
+            rate_limit_rules=rules,
+        ):
+            pass
+
+    mock_release.assert_awaited_once_with("req-rel", rules)
+
+
+@pytest.mark.asyncio
+async def test_stream_gemini_no_release_without_rules() -> None:
+    """No rate_limit_rules (non-stream-limited) means no release call."""
+    sse_chunks = _make_gemini_sse(
+        {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 8,
+            },
+        },
+    )
+
+    fake_service = AsyncMock()
+    fake_service.repo = AsyncMock()
+    fake_service.repo.get_active_quotas = AsyncMock(return_value=[])
+    fake_service.quota = AsyncMock()
+
+    with patch(
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
+    ), patch(
+        "src.gateway.router.release_concurrent", new_callable=AsyncMock
+    ) as mock_release:
+        async for _ in _stream_gemini_native(
+            response=_fake_byte_stream(sse_chunks),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=fake_service,
+            started_at=0.0,
+            request_id="req-gu2",
+            channel_id=11,
+            upstream_model="gemini/gemini-2.0-flash",
+        ):
+            pass
+
+    mock_release.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# H3: shared rate-limit helper used by all three protocol endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_rate_limits_returns_rules_when_allowed() -> None:
+    """Helper returns the applicable rules so the caller can release the slot."""
+    from src.gateway.rate_limit import RateLimitCheckResult
+
+    rules = [{"id": 1, "max_concurrent": 5, "subject_type": "user", "subject_id": 100}]
+    fake_service = AsyncMock()
+    fake_service.get_rate_limit_rules = AsyncMock(return_value=rules)
+
+    with patch(
+        "src.gateway.router.check_rate_limits", new_callable=AsyncMock
+    ) as mock_check:
+        mock_check.return_value = RateLimitCheckResult(allowed=True)
+        result = await _check_rate_limits(
+            service=fake_service,
+            user=FakeUser(),
+            logical_model_id=1,
+            request_id="req-rl",
+            is_stream=True,
+        )
+
+    assert result == rules
+    mock_check.assert_awaited_once()
+    assert mock_check.await_args.kwargs["is_stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_check_rate_limits_raises_429_when_denied() -> None:
+    """Helper raises rate_limit_exceeded (429) when any limit is exceeded."""
+    from src.enums import ErrorCode
+    from src.exceptions import AppError
+    from src.gateway.rate_limit import RateLimitCheckResult
+
+    rules = [{"id": 1, "rpm_limit": 1, "subject_type": "user", "subject_id": 100}]
+    fake_service = AsyncMock()
+    fake_service.get_rate_limit_rules = AsyncMock(return_value=rules)
+
+    with patch(
+        "src.gateway.router.check_rate_limits", new_callable=AsyncMock
+    ) as mock_check:
+        mock_check.return_value = RateLimitCheckResult(
+            allowed=False, denied_reason="rpm_exceeded"
+        )
+        with pytest.raises(AppError) as exc:
+            await _check_rate_limits(
+                service=fake_service,
+                user=FakeUser(),
+                logical_model_id=1,
+                request_id="req-rl",
+                is_stream=False,
+            )
+
+    assert exc.value.code == ErrorCode.rate_limit_exceeded
+    assert exc.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_check_rate_limits_skips_check_when_no_rules() -> None:
+    """No rules configured means no check call and an empty list back."""
+    fake_service = AsyncMock()
+    fake_service.get_rate_limit_rules = AsyncMock(return_value=[])
+
+    with patch(
+        "src.gateway.router.check_rate_limits", new_callable=AsyncMock
+    ) as mock_check:
+        result = await _check_rate_limits(
+            service=fake_service,
+            user=FakeUser(),
+            logical_model_id=1,
+            request_id="req-rl",
+            is_stream=True,
+        )
+
+    assert result == []
+    mock_check.assert_not_called()

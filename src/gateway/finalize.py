@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.core.logging import get_logger
 from src.core.metrics import emit_request_metrics
@@ -26,6 +26,7 @@ from src.gateway.events import enqueue_log_event, enqueue_usage_event
 
 if TYPE_CHECKING:
     from src.db.models.model_catalog import LogicalModel
+    from src.gateway.quota import QuotaReservation
     from src.gateway.service import GatewayService
 
 _log = get_logger(__name__)
@@ -36,8 +37,15 @@ async def finalize_gateway_request(
     *,
     logical_model: LogicalModel | None = None,
     service: GatewayService | None = None,
+    rate_limit_rules: list[dict[str, Any]] | None = None,
+    quota_reservations: list[QuotaReservation] | None = None,
 ) -> None:
     """Run all post-request tasks.  Each step is independently fail-safe."""
+    # Capture resolved quota counters reserved at check time so settlement
+    # targets the same keys (hot-reload + period-rollover safe).
+    if quota_reservations:
+        ctx.quota_reservations = quota_reservations
+
     # Ensure latency is computed
     if ctx.latency_ms is None:
         ctx.record_latency()
@@ -56,6 +64,9 @@ async def finalize_gateway_request(
 
     # 5. Channel health recording
     await _record_channel_health(ctx)
+
+    # 6. TPM reservation refund (estimated tokens reserved upfront - actual used)
+    await _refund_tpm(ctx, rate_limit_rules=rate_limit_rules)
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +89,24 @@ async def _settle_quota(
     with suppress(Exception):
         from src.enums import UsageStatus
 
-        if ctx.status != UsageStatus.success.value or ctx.total_tokens == 0:
-            # Error or zero usage: compensate (give back reserved tokens)
+        error_or_zero = ctx.status != UsageStatus.success.value or ctx.total_tokens == 0
+
+        # Preferred path: settle against the exact keys reserved at check time.
+        # Immune to quota hot-reload / period rollover between check and settle.
+        if ctx.quota_reservations:
+            if error_or_zero:
+                await service.quota.compensate_reservations(ctx.quota_reservations)
+            else:
+                cost = _compute_cost(ctx, logical_model)
+                await service.quota.settle_reservations(
+                    ctx.quota_reservations, ctx.total_tokens, cost
+                )
+            ctx.quota_settled = True
+            return
+
+        # Legacy fallback: re-query active quotas (used where reservations were
+        # not captured, e.g. cache-hit synthetic contexts).
+        if error_or_zero:
             quotas = await service.repo.get_active_quotas(
                 ctx.user_id, ctx.department_id, logical_model.id
             )
@@ -87,8 +114,7 @@ async def _settle_quota(
                 ctx.user_id, ctx.department_id, logical_model.id, quotas
             )
         else:
-            # Success: settle with actual token count
-            cost = _compute_cost(logical_model)
+            cost = _compute_cost(ctx, logical_model)
             await service.settle_quota(
                 ctx.user_id,
                 ctx.department_id,
@@ -99,11 +125,17 @@ async def _settle_quota(
         ctx.quota_settled = True
 
 
-def _compute_cost(logical_model: LogicalModel) -> Decimal | None:
-    """Placeholder — actual cost computation deferred to usage module."""
-    # NOTE: This is a simplified reference; full cost computation uses
-    # compute_cost() from src.gateway.usage. We import lazily to avoid cycles.
-    return None
+def _compute_cost(
+    ctx: GatewayRequestContext, logical_model: LogicalModel
+) -> Decimal | None:
+    """Compute the frozen internal cost for this request from actual token usage.
+
+    Cost-metric quota settlement depends on a real value here; returning None
+    would zero out cost accounting and silently disable cost-based limits.
+    """
+    from src.gateway.usage import compute_cost
+
+    return compute_cost(logical_model, ctx.prompt_tokens, ctx.completion_tokens)
 
 
 async def _enqueue_usage(
@@ -199,3 +231,25 @@ async def _record_channel_health(ctx: GatewayRequestContext) -> None:
         if not success:
             error_class = ctx.error_code or ctx.status
         await svc.record_and_evaluate(ctx.channel_id, success=success, error_class=error_class)
+
+
+async def _refund_tpm(
+    ctx: GatewayRequestContext,
+    *,
+    rate_limit_rules: list[dict[str, Any]] | None,
+) -> None:
+    """Refund the unused portion of the upfront TPM reservation.
+
+    Each request reserves ``ESTIMATED_TOKENS_PER_REQUEST`` tokens against the
+    TPM bucket before the upstream call.  Once actual usage is known, give back
+    the difference (estimated - actual) so the bucket reflects real consumption.
+    Errors and zero-token requests refund the full reservation.
+    """
+    if not rate_limit_rules:
+        return
+    with suppress(Exception):
+        from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST, refund_tpm
+
+        refund_tokens = ESTIMATED_TOKENS_PER_REQUEST - ctx.total_tokens
+        if refund_tokens > 0:
+            await refund_tpm(ctx.request_id, rate_limit_rules, refund_tokens)

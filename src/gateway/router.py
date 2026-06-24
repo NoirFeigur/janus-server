@@ -4,7 +4,6 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
-from decimal import Decimal
 from time import monotonic
 from typing import Annotated, Any, TypeVar
 from uuid import uuid4
@@ -18,14 +17,19 @@ from starlette import status
 
 from src.auth.dependencies import CurrentUser
 from src.auth.service import AuthenticatedUser
+from src.config import get_settings
 from src.db.models.model_catalog import LogicalModel
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
 from src.gateway.context import GatewayRequestContext
 from src.gateway.dependencies import get_gateway_service
 from src.gateway.finalize import finalize_gateway_request
-from src.gateway.quota import QuotaCheckResult
-from src.gateway.rate_limit import check_rate_limits
+from src.gateway.quota import QuotaCheckResult, QuotaReservation
+from src.gateway.rate_limit import (
+    ESTIMATED_TOKENS_PER_REQUEST,
+    check_rate_limits,
+    release_concurrent,
+)
 from src.gateway.response_cache import (
     compute_fingerprint,
     get_cached_response,
@@ -36,7 +40,6 @@ from src.gateway.response_cache import (
 from src.gateway.router_manager import RouterManager
 from src.gateway.schemas import AnthropicRequest, GeminiRequest, OpenAIRequest
 from src.gateway.service import GatewayService
-from src.gateway.usage import UsageData, compute_cost, record_usage
 
 router = APIRouter(tags=["gateway"])
 
@@ -86,9 +89,18 @@ async def anthropic_messages(
     payload = await _parse_body(request, AnthropicRequest)
     request_id = _request_id(request)
     logical_model = await service.resolve_model(user, payload.model)
-    quota_result = await service.check_quota(
-        user.user_id, user.department_id, logical_model.id
+
+    # P2: Rate limiting (before quota reservation)
+    rate_limit_rules = await _check_rate_limits(
+        service=service,
+        user=user,
+        logical_model_id=logical_model.id,
+        request_id=request_id,
+        is_stream=payload.stream,
     )
+
+    quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    quota_reservations = quota_result.reservations
 
     # Build native Anthropic params (no conversion to OpenAI format)
     native_params: dict[str, Any] = {
@@ -100,9 +112,7 @@ async def anthropic_messages(
     if payload.system is not None:
         native_params["system"] = payload.system
     # Forward extra params (temperature, top_p, top_k, tools, etc.)
-    extra = payload.model_dump(
-        exclude={"model", "messages", "max_tokens", "stream", "system"}
-    )
+    extra = payload.model_dump(exclude={"model", "messages", "max_tokens", "stream", "system"})
     native_params.update(extra)
 
     # Mutable dict — Router writes deployment info into it before the call
@@ -129,15 +139,13 @@ async def anthropic_messages(
             quota_reserved=True,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
-        _record_usage_task(
-            user=user,
+        await finalize_gateway_request(
+            ctx,
             logical_model=logical_model,
-            usage=_empty_usage(),
-            status_value=ctx.status,
-            latency_ms=_latency_ms(started_at),
-            request_id=request_id,
+            service=service,
+            rate_limit_rules=rate_limit_rules,
+            quota_reservations=quota_reservations,
         )
-        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
         raise _upstream_error(exc) from exc
 
     # Extract channel info from metadata (populated by Router before the call)
@@ -155,6 +163,8 @@ async def anthropic_messages(
                 request_id=request_id,
                 channel_id=channel_id,
                 upstream_model=upstream_model,
+                rate_limit_rules=rate_limit_rules,
+                quota_reservations=quota_reservations,
             ),
             media_type="text/event-stream",
         )
@@ -176,17 +186,13 @@ async def anthropic_messages(
         quota_reserved=True,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-    _record_usage_task(
-        user=user,
+    await finalize_gateway_request(
+        ctx,
         logical_model=logical_model,
-        usage=usage,
-        status_value=UsageStatus.success.value,
-        latency_ms=_latency_ms(started_at),
-        request_id=request_id,
-        channel_id=channel_id,
-        upstream_model=upstream_model,
+        service=service,
+        rate_limit_rules=rate_limit_rules,
+        quota_reservations=quota_reservations,
     )
-    await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
     # Return native Anthropic response directly
     return JSONResponse(
         content=_to_json_serializable(response),
@@ -210,11 +216,21 @@ async def gemini_generate_content(
     payload = await _parse_body(request, GeminiRequest)
     request_id = _request_id(request)
     logical_model = await service.resolve_model(user, model_name)
-    quota_result = await service.check_quota(
-        user.user_id, user.department_id, logical_model.id
-    )
 
     stream = request.url.path.endswith(":streamGenerateContent")
+
+    # P2: Rate limiting (before quota reservation)
+    rate_limit_rules = await _check_rate_limits(
+        service=service,
+        user=user,
+        logical_model_id=logical_model.id,
+        request_id=request_id,
+        is_stream=stream,
+    )
+
+    quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    quota_reservations = quota_result.reservations
+
     litellm_meta: dict[str, Any] = {}
     started_at = monotonic()
     llm_router = RouterManager.get_router()
@@ -257,15 +273,13 @@ async def gemini_generate_content(
             quota_reserved=True,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
-        _record_usage_task(
-            user=user,
+        await finalize_gateway_request(
+            ctx,
             logical_model=logical_model,
-            usage=_empty_usage(),
-            status_value=ctx.status,
-            latency_ms=_latency_ms(started_at),
-            request_id=request_id,
+            service=service,
+            rate_limit_rules=rate_limit_rules,
+            quota_reservations=quota_reservations,
         )
-        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
         raise _upstream_error(exc) from exc
 
     channel_id = _channel_id_from_metadata(litellm_meta)
@@ -282,6 +296,8 @@ async def gemini_generate_content(
                 request_id=request_id,
                 channel_id=channel_id,
                 upstream_model=upstream_model,
+                rate_limit_rules=rate_limit_rules,
+                quota_reservations=quota_reservations,
             ),
             media_type="text/event-stream",
         )
@@ -303,17 +319,13 @@ async def gemini_generate_content(
         quota_reserved=True,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-    _record_usage_task(
-        user=user,
+    await finalize_gateway_request(
+        ctx,
         logical_model=logical_model,
-        usage=usage,
-        status_value=UsageStatus.success.value,
-        latency_ms=_latency_ms(started_at),
-        request_id=request_id,
-        channel_id=channel_id,
-        upstream_model=upstream_model,
+        service=service,
+        rate_limit_rules=rate_limit_rules,
+        quota_reservations=quota_reservations,
     )
-    await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
     return JSONResponse(
         content=_to_json_serializable(response),
         headers=_quota_headers(quota_result),
@@ -351,6 +363,35 @@ async def _parse_body(request: Request, schema: type[RequestSchemaT]) -> Request
 # ---------------------------------------------------------------------------
 
 
+async def _check_rate_limits(
+    *,
+    service: GatewayService,
+    user: AuthenticatedUser,
+    logical_model_id: int,
+    request_id: str,
+    is_stream: bool,
+) -> list[dict[str, Any]]:
+    """Enforce rate limits before quota reservation (P2).
+
+    Returns the applicable rules so the caller can release the concurrent slot
+    in the stream finally block.  Raises 429 if any limit is exceeded.
+    """
+    rules = await service.get_rate_limit_rules(user.user_id, user.department_id, logical_model_id)
+    if rules:
+        rl_result = await check_rate_limits(
+            request_id=request_id,
+            rules=rules,
+            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+            is_stream=is_stream,
+        )
+        if not rl_result.allowed:
+            raise AppError(
+                ErrorCode.rate_limit_exceeded,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+    return rules
+
+
 async def _execute_completion(
     *,
     request: Request,
@@ -365,30 +406,24 @@ async def _execute_completion(
     logical_model = await service.resolve_model(user, requested_model)
 
     # P2: Rate limiting (before quota reservation)
-    rate_limit_rules = await service.get_rate_limit_rules(
-        user.user_id, user.department_id, logical_model.id
+    rate_limit_rules = await _check_rate_limits(
+        service=service,
+        user=user,
+        logical_model_id=logical_model.id,
+        request_id=request_id,
+        is_stream=stream,
     )
-    if rate_limit_rules:
-        rl_result = await check_rate_limits(
-            request_id=request_id,
-            rules=rate_limit_rules,
-            estimated_tokens=100,
-            is_stream=stream,
-        )
-        if not rl_result.allowed:
-            raise AppError(
-                ErrorCode.rate_limit_exceeded,
-                status.HTTP_429_TOO_MANY_REQUESTS,
-            )
 
-    quota_result = await service.check_quota(
-        user.user_id, user.department_id, logical_model.id
-    )
+    quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    quota_reservations = quota_result.reservations
 
     # P4: Response cache check (non-streaming only)
+    settings = get_settings()
     fingerprint: str | None = None
     if not stream and is_cacheable_request(
-        stream=stream, response_cache_enabled=True, params=params
+        stream=stream,
+        response_cache_enabled=settings.response_cache_enabled,
+        params=params,
     ):
         fingerprint = compute_fingerprint(logical_model.name, messages, params)
         cached = await get_cached_response(logical_model.id, fingerprint)
@@ -409,15 +444,13 @@ async def _execute_completion(
                 cache_hit=True,
             )
             ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-            _record_usage_task(
-                user=user,
+            await finalize_gateway_request(
+                ctx,
                 logical_model=logical_model,
-                usage=usage,
-                status_value=UsageStatus.success.value,
-                latency_ms=0,
-                request_id=request_id,
+                service=service,
+                rate_limit_rules=rate_limit_rules,
+                quota_reservations=quota_reservations,
             )
-            await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
             return JSONResponse(
                 content=cached,
                 headers=_quota_headers(quota_result),
@@ -449,15 +482,13 @@ async def _execute_completion(
             quota_reserved=True,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
-        _record_usage_task(
-            user=user,
+        await finalize_gateway_request(
+            ctx,
             logical_model=logical_model,
-            usage=_empty_usage(),
-            status_value=ctx.status,
-            latency_ms=_latency_ms(started_at),
-            request_id=request_id,
+            service=service,
+            rate_limit_rules=rate_limit_rules,
+            quota_reservations=quota_reservations,
         )
-        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
         raise _upstream_error(exc) from exc
 
     if stream:
@@ -469,6 +500,8 @@ async def _execute_completion(
                 service=service,
                 started_at=started_at,
                 request_id=request_id,
+                rate_limit_rules=rate_limit_rules,
+                quota_reservations=quota_reservations,
             ),
             media_type="text/event-stream",
         )
@@ -491,23 +524,21 @@ async def _execute_completion(
         quota_reserved=True,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-    # Dual-write: direct DB path
-    _record_usage_task(
-        user=user,
+    await finalize_gateway_request(
+        ctx,
         logical_model=logical_model,
-        usage=usage,
-        status_value=UsageStatus.success.value,
-        latency_ms=_latency_ms(started_at),
-        request_id=request_id,
-        channel_id=channel_id,
-        upstream_model=upstream_model,
+        service=service,
+        rate_limit_rules=rate_limit_rules,
+        quota_reservations=quota_reservations,
     )
-    await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
 
     # P4: Cache the response if eligible
     if fingerprint is not None and is_cacheable_response(response):
         await set_cached_response(
-            logical_model.id, fingerprint, jsonable_encoder(_dump_model(response))
+            logical_model.id,
+            fingerprint,
+            jsonable_encoder(_dump_model(response)),
+            ttl_seconds=settings.response_cache_ttl_seconds,
         )
 
     return JSONResponse(
@@ -529,6 +560,8 @@ async def _stream_openai(
     service: GatewayService,
     started_at: float,
     request_id: str,
+    rate_limit_rules: list[dict[str, Any]] | None = None,
+    quota_reservations: list[QuotaReservation] | None = None,
 ) -> AsyncIterator[str]:
     ctx = GatewayRequestContext(
         request_id=request_id,
@@ -593,19 +626,17 @@ async def _stream_openai(
         ctx.upstream_model = upstream_model
         ctx.status = status_value
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-        # Dual-write: direct DB path (existing tests depend on this)
-        _record_usage_task(
-            user=user,
-            logical_model=logical_model,
-            usage=usage,
-            status_value=status_value,
-            latency_ms=_latency_ms(started_at),
-            request_id=request_id,
-            channel_id=channel_id,
-            upstream_model=upstream_model,
-        )
         # Unified finalizer: quota settlement + durable enqueue + metrics
-        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
+        await finalize_gateway_request(
+            ctx,
+            logical_model=logical_model,
+            service=service,
+            rate_limit_rules=rate_limit_rules,
+            quota_reservations=quota_reservations,
+        )
+        # Release concurrent semaphore slot acquired at rate-limit check.
+        if rate_limit_rules:
+            await release_concurrent(request_id, rate_limit_rules)
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +654,8 @@ async def _stream_anthropic_native(
     request_id: str,
     channel_id: int | None,
     upstream_model: str | None,
+    rate_limit_rules: list[dict[str, Any]] | None = None,
+    quota_reservations: list[QuotaReservation] | None = None,
 ) -> AsyncIterator[bytes]:
     """Pipe raw Anthropic SSE bytes to client, parsing usage from events."""
     ctx = GatewayRequestContext(
@@ -679,19 +712,17 @@ async def _stream_anthropic_native(
         # Populate context for finalizer
         ctx.status = status_value
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-        # Dual-write: direct DB path (existing tests depend on this)
-        _record_usage_task(
-            user=user,
-            logical_model=logical_model,
-            usage=usage,
-            status_value=status_value,
-            latency_ms=_latency_ms(started_at),
-            request_id=request_id,
-            channel_id=channel_id,
-            upstream_model=upstream_model,
-        )
         # Unified finalizer: quota settlement + durable enqueue + metrics
-        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
+        await finalize_gateway_request(
+            ctx,
+            logical_model=logical_model,
+            service=service,
+            rate_limit_rules=rate_limit_rules,
+            quota_reservations=quota_reservations,
+        )
+        # Release concurrent semaphore slot acquired at rate-limit check.
+        if rate_limit_rules:
+            await release_concurrent(request_id, rate_limit_rules)
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +740,8 @@ async def _stream_gemini_native(
     request_id: str,
     channel_id: int | None,
     upstream_model: str | None,
+    rate_limit_rules: list[dict[str, Any]] | None = None,
+    quota_reservations: list[QuotaReservation] | None = None,
 ) -> AsyncIterator[bytes]:
     """Pipe raw Gemini streaming bytes to client, parsing usage from chunks."""
     ctx = GatewayRequestContext(
@@ -764,19 +797,17 @@ async def _stream_gemini_native(
         # Populate context for finalizer
         ctx.status = status_value
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-        # Dual-write: direct DB path (existing tests depend on this)
-        _record_usage_task(
-            user=user,
-            logical_model=logical_model,
-            usage=usage,
-            status_value=status_value,
-            latency_ms=_latency_ms(started_at),
-            request_id=request_id,
-            channel_id=channel_id,
-            upstream_model=upstream_model,
-        )
         # Unified finalizer: quota settlement + durable enqueue + metrics
-        await finalize_gateway_request(ctx, logical_model=logical_model, service=service)
+        await finalize_gateway_request(
+            ctx,
+            logical_model=logical_model,
+            service=service,
+            rate_limit_rules=rate_limit_rules,
+            quota_reservations=quota_reservations,
+        )
+        # Release concurrent semaphore slot acquired at rate-limit check.
+        if rate_limit_rules:
+            await release_concurrent(request_id, rate_limit_rules)
 
 
 # ---------------------------------------------------------------------------
@@ -864,9 +895,7 @@ def _extract_anthropic_usage(response: Any) -> dict[str, int]:
         if hasattr(resp_usage, "input_tokens"):
             return {
                 "prompt_tokens": int(getattr(resp_usage, "input_tokens", 0) or 0),
-                "completion_tokens": int(
-                    getattr(resp_usage, "output_tokens", 0) or 0
-                ),
+                "completion_tokens": int(getattr(resp_usage, "output_tokens", 0) or 0),
                 "total_tokens": int(getattr(resp_usage, "input_tokens", 0) or 0)
                 + int(getattr(resp_usage, "output_tokens", 0) or 0),
             }
@@ -891,9 +920,7 @@ def _extract_gemini_usage_from_response(response: Any) -> dict[str, int]:
         if um is not None:
             return {
                 "prompt_tokens": int(getattr(um, "prompt_token_count", 0) or 0),
-                "completion_tokens": int(
-                    getattr(um, "candidates_token_count", 0) or 0
-                ),
+                "completion_tokens": int(getattr(um, "candidates_token_count", 0) or 0),
                 "total_tokens": int(getattr(um, "total_token_count", 0) or 0),
             }
         usage_meta = {}
@@ -945,101 +972,7 @@ async def _compensate_quota(
     quotas = await service.repo.get_active_quotas(
         user.user_id, user.department_id, logical_model_id
     )
-    await service.quota.compensate(
-        user.user_id, user.department_id, logical_model_id, quotas
-    )
-
-
-def _compute_internal_cost(
-    logical_model: LogicalModel, usage: dict[str, int]
-) -> Decimal | None:
-    """Compute internal cost from the logical model's pricing."""
-    return compute_cost(logical_model, usage["prompt_tokens"], usage["completion_tokens"])
-
-
-def _record_usage_task(
-    *,
-    user: AuthenticatedUser,
-    logical_model: LogicalModel,
-    usage: dict[str, int],
-    status_value: str,
-    latency_ms: int | None,
-    request_id: str,
-    channel_id: int | None = None,
-    upstream_model: str | None = None,
-) -> None:
-    # Primary: direct DB write (existing behavior, preserved for tests).
-    asyncio.create_task(
-        record_usage(
-            UsageData(
-                user_id=user.user_id,
-                api_key_id=user.api_key_id,
-                logical_model=logical_model,
-                channel_id=channel_id,
-                upstream_model=upstream_model,
-                prompt_tokens=usage["prompt_tokens"],
-                completion_tokens=usage["completion_tokens"],
-                total_tokens=usage["total_tokens"],
-                status=status_value,
-                latency_ms=latency_ms,
-                request_id=request_id,
-                downgraded_features=None,
-            )
-        )
-    )
-    # Secondary: durable enqueue to Redis queue (P3) for gateway log / metrics.
-    # This is fire-and-forget; if Redis is down, the primary path above handles it.
-    asyncio.create_task(
-        _enqueue_log_event(
-            user=user,
-            logical_model=logical_model,
-            usage=usage,
-            status_value=status_value,
-            latency_ms=latency_ms,
-            request_id=request_id,
-            channel_id=channel_id,
-            upstream_model=upstream_model,
-        )
-    )
-
-
-async def _enqueue_log_event(
-    *,
-    user: AuthenticatedUser,
-    logical_model: LogicalModel,
-    usage: dict[str, int],
-    status_value: str,
-    latency_ms: int | None,
-    request_id: str,
-    channel_id: int | None = None,
-    upstream_model: str | None = None,
-) -> None:
-    """Enqueue a gateway log event to the durable Redis queue (P1 observability)."""
-    from src.gateway.events import enqueue_log_event
-
-    with suppress(Exception):
-        payload = {
-            "request_id": request_id,
-            "user_id": user.user_id,
-            "api_key_id": user.api_key_id,
-            "logical_model_id": logical_model.id,
-            "model": logical_model.name,
-            "channel_id": channel_id,
-            "upstream_model": upstream_model,
-            "provider": None,
-            "status_code": 200 if status_value == UsageStatus.success.value else 502,
-            "error_code": None,
-            "error_body": None,
-            "latency_ms": latency_ms,
-            "ttft_ms": None,
-            "tokens_in": usage["prompt_tokens"],
-            "tokens_out": usage["completion_tokens"],
-            "cache_hit": False,
-            "stream": False,
-            "retry_count": 0,
-            "fallback_used": False,
-        }
-        await enqueue_log_event(payload)
+    await service.quota.compensate(user.user_id, user.department_id, logical_model_id, quotas)
 
 
 def _extract_usage(response: Any) -> dict[str, int]:

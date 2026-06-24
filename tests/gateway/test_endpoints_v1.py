@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from src.auth.service import AuthenticatedUser
+from src.enums import ErrorCode
 from src.gateway.endpoints_v1 import (
     EmbeddingsRequest,
     ResponsesRequest,
+    _fire_usage,
     _latency_ms,
     _request_id,
     _upstream_error,
 )
-from src.enums import ErrorCode
-from tests._async_redis_double import AsyncRedisDouble
 
 
 def _fake_user() -> AuthenticatedUser:
@@ -114,3 +113,39 @@ def test_upstream_error_timeout() -> None:
 def test_upstream_error_generic() -> None:
     err = _upstream_error(RuntimeError("something"))
     assert err.code == ErrorCode.upstream_error
+
+
+# ---------------------------------------------------------------------------
+# _fire_usage: durable enqueue (H1 — GC-safe single write path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fire_usage_enqueues_durable_event() -> None:
+    """_fire_usage awaits enqueue_usage_event (no fire-and-forget create_task)."""
+    from src.enums import UsageStatus
+
+    with patch(
+        "src.gateway.endpoints_v1.enqueue_usage_event", new_callable=AsyncMock
+    ) as mock_enqueue:
+        await _fire_usage(
+            user=_fake_user(),
+            logical_model=_fake_logical_model(),
+            status_value=UsageStatus.success.value,
+            latency_ms=42,
+            request_id="req-fire",
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+        )
+
+    mock_enqueue.assert_awaited_once()
+    payload = mock_enqueue.await_args[0][0]
+    assert payload["request_id"] == "req-fire"
+    assert payload["user_id"] == 100
+    assert payload["logical_model_id"] == 1
+    assert payload["prompt_tokens"] == 10
+    assert payload["completion_tokens"] == 5
+    assert payload["total_tokens"] == 15
+    assert payload["status"] == UsageStatus.success.value
+    assert payload["latency_ms"] == 42

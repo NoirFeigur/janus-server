@@ -14,7 +14,6 @@ from src.gateway.response_cache import (
 )
 from tests._async_redis_double import AsyncRedisDouble
 
-
 # ---------------------------------------------------------------------------
 # Fingerprint
 # ---------------------------------------------------------------------------
@@ -71,6 +70,31 @@ def test_is_cacheable_request_tools() -> None:
 
 
 def test_is_cacheable_request_eligible() -> None:
+    assert is_cacheable_request(stream=False, response_cache_enabled=True, params={}) is True
+
+
+def test_is_cacheable_request_temperature_positive_false() -> None:
+    # temperature > 0 → non-deterministic sampling, must not cache
+    assert (
+        is_cacheable_request(
+            stream=False, response_cache_enabled=True, params={"temperature": 0.7}
+        )
+        is False
+    )
+
+
+def test_is_cacheable_request_temperature_zero_true() -> None:
+    # temperature == 0 → deterministic, eligible for caching
+    assert (
+        is_cacheable_request(
+            stream=False, response_cache_enabled=True, params={"temperature": 0.0}
+        )
+        is True
+    )
+
+
+def test_is_cacheable_request_temperature_unset_true() -> None:
+    # unset temperature → treated as deterministic-eligible (matches prior behavior)
     assert is_cacheable_request(stream=False, response_cache_enabled=True, params={}) is True
 
 

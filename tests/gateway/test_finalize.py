@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from decimal import Decimal
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from src.enums import UsageStatus
 from src.gateway.context import GatewayRequestContext
-from src.gateway.events import USAGE_QUEUE_KEY, LOG_QUEUE_KEY
+from src.gateway.events import LOG_QUEUE_KEY, USAGE_QUEUE_KEY
 from src.gateway.finalize import finalize_gateway_request
+from src.gateway.quota import QuotaReservation
 from tests._async_redis_double import AsyncRedisDouble
 
 
@@ -119,3 +121,190 @@ async def test_finalize_individual_step_failure_does_not_block_others(
 
     # Log event should still be enqueued despite usage failure
     assert await fake_redis.llen(LOG_QUEUE_KEY) == 1
+
+
+# ---------------------------------------------------------------------------
+# M6: TPM reservation refund (estimated tokens reserved upfront - actual used)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finalize_refunds_unused_tpm(fake_redis: AsyncRedisDouble) -> None:
+    """Actual usage below the upfront reservation refunds the difference."""
+    from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST
+
+    rules = [{"id": 1, "tpm_limit": 10000, "subject_type": "user", "subject_id": 1}]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        request_id="req-tpm",
+        logical_model_id=10,
+        total_tokens=30,  # below the 100-token reservation
+    )
+
+    with patch(
+        "src.gateway.rate_limit.refund_tpm", new_callable=AsyncMock
+    ) as mock_refund:
+        await finalize_gateway_request(ctx, rate_limit_rules=rules)
+
+    mock_refund.assert_awaited_once()
+    call_request_id, call_rules, call_refund = mock_refund.await_args[0]
+    assert call_request_id == "req-tpm"
+    assert call_rules == rules
+    assert call_refund == ESTIMATED_TOKENS_PER_REQUEST - 30
+
+
+@pytest.mark.asyncio
+async def test_finalize_no_tpm_refund_when_usage_exceeds_estimate(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """Actual usage at/above the reservation refunds nothing (no negative refund)."""
+    rules = [{"id": 1, "tpm_limit": 10000, "subject_type": "user", "subject_id": 1}]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        request_id="req-tpm2",
+        logical_model_id=10,
+        total_tokens=5000,  # well above the 100-token reservation
+    )
+
+    with patch(
+        "src.gateway.rate_limit.refund_tpm", new_callable=AsyncMock
+    ) as mock_refund:
+        await finalize_gateway_request(ctx, rate_limit_rules=rules)
+
+    mock_refund.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_no_tpm_refund_without_rules(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """No rate-limit rules means no TPM reservation to refund."""
+    ctx = GatewayRequestContext(user_id=1, total_tokens=10)
+
+    with patch(
+        "src.gateway.rate_limit.refund_tpm", new_callable=AsyncMock
+    ) as mock_refund:
+        await finalize_gateway_request(ctx)
+
+    mock_refund.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# M1: reservation-based settlement preferred over legacy re-query
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finalize_settles_against_captured_reservations(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """When reservations are captured, settle targets them (no re-query)."""
+    reservations = [
+        QuotaReservation(
+            key="quota:u:1:10:2026-06:tokens",
+            quota_id=7,
+            metric="tokens",
+            scope="user",
+            enforce=True,
+            limit_value=Decimal("100000"),
+        )
+    ]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        logical_model_id=10,
+        total_tokens=75,
+        quota_reserved=True,
+    )
+    logical_model = Mock()
+    logical_model.id = 10
+    logical_model.price_input = None
+    logical_model.price_output = None
+
+    service = AsyncMock()
+    service.quota = AsyncMock()
+    service.repo = AsyncMock()
+
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        quota_reservations=reservations,
+    )
+
+    # Reservation-based settle used; legacy re-query NOT used.
+    service.quota.settle_reservations.assert_awaited_once()
+    service.repo.get_active_quotas.assert_not_called()
+    service.settle_quota.assert_not_called()
+    assert ctx.quota_settled is True
+
+
+@pytest.mark.asyncio
+async def test_finalize_compensates_reservations_on_error(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """Error/zero-token requests compensate the captured reservations."""
+    reservations = [
+        QuotaReservation(
+            key="quota:u:1:10:2026-06:tokens",
+            quota_id=7,
+            metric="tokens",
+            scope="user",
+            enforce=True,
+            limit_value=Decimal("100000"),
+        )
+    ]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        logical_model_id=10,
+        total_tokens=0,
+        quota_reserved=True,
+    )
+    ctx.mark_error(UsageStatus.error.value)
+    logical_model = Mock()
+    logical_model.id = 10
+
+    service = AsyncMock()
+    service.quota = AsyncMock()
+    service.repo = AsyncMock()
+
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        quota_reservations=reservations,
+    )
+
+    service.quota.compensate_reservations.assert_awaited_once_with(reservations)
+    service.quota.settle_reservations.assert_not_called()
+    service.repo.get_active_quotas.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_falls_back_to_legacy_settle_without_reservations(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """No reservations (e.g. cache-hit synthetic ctx) uses the legacy re-query path."""
+    ctx = GatewayRequestContext(
+        user_id=1,
+        logical_model_id=10,
+        total_tokens=75,
+        quota_reserved=True,
+    )
+    logical_model = Mock()
+    logical_model.id = 10
+    logical_model.price_input = None
+    logical_model.price_output = None
+
+    service = AsyncMock()
+    service.quota = AsyncMock()
+    service.repo = AsyncMock()
+
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+    )
+
+    # Legacy re-query settle used; reservation-based NOT used.
+    service.settle_quota.assert_awaited_once()
+    service.quota.settle_reservations.assert_not_called()

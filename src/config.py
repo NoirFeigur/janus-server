@@ -130,6 +130,14 @@ class Settings(BaseSettings):
     # Probe interval for degraded channels (seconds).
     channel_health_probe_interval_seconds: int = 60
 
+    # --- Response cache (P4) ---
+    # 精确匹配响应缓存：非流式成功响应按 (model + messages + 关键参数) 指纹缓存,命中直接
+    # 返回(跳过上游调用),但仍按 cache_hit=True 记账/扣配额。**默认关闭**——缓存对幂等性
+    # 有隐含假设(同输入同输出),仅在确定性场景(temperature=0)安全;开启需运维显式决策。
+    # 缓存键已内嵌 catalog generation,模型配置变更自动失效;键按 model_id 隔离,跨模型不串。
+    response_cache_enabled: bool = False  # 响应缓存总开关;默认关,需显式开启
+    response_cache_ttl_seconds: int = 300  # 缓存 TTL(秒,默认 5min);命中后此时长内复用
+
     log_level: str = "INFO"  # 根 logger 级别（DEBUG/INFO/WARNING/ERROR）
     log_json: bool = True  # True=JSON 行（生产/采集）；False=彩色控制台（本地开发）
 

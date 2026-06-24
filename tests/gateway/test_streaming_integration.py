@@ -98,8 +98,6 @@ async def test_anthropic_stream_returns_sse_bytes() -> None:
         "src.gateway.router.RouterManager.get_router", return_value=fake_router
     ), patch(
         "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
-    ), patch(
-        "src.gateway.router.record_usage", new_callable=AsyncMock
     ):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -165,8 +163,6 @@ async def test_gemini_stream_returns_sse_bytes() -> None:
         "src.gateway.router.RouterManager.get_router", return_value=fake_router
     ), patch(
         "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
-    ), patch(
-        "src.gateway.router.record_usage", new_callable=AsyncMock
     ):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -262,8 +258,6 @@ async def test_openai_stream_returns_sse_text() -> None:
         "src.gateway.router.RouterManager.get_router", return_value=fake_router
     ), patch(
         "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
-    ), patch(
-        "src.gateway.router.record_usage", new_callable=AsyncMock
     ):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"

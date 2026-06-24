@@ -23,9 +23,10 @@ from src.auth.service import AuthenticatedUser
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
 from src.gateway.dependencies import get_gateway_service
+from src.gateway.events import enqueue_usage_event
 from src.gateway.router_manager import RouterManager
 from src.gateway.service import GatewayService
-from src.gateway.usage import UsageData, compute_cost, record_usage
+from src.gateway.usage import compute_cost
 
 router = APIRouter(tags=["gateway"])
 
@@ -84,7 +85,7 @@ async def embeddings(
     try:
         response = await llm_router.aembedding(**kwargs)
     except Exception as exc:
-        _fire_usage(
+        await _fire_usage(
             user=user,
             logical_model=logical_model,
             status_value=UsageStatus.error.value,
@@ -105,7 +106,7 @@ async def embeddings(
         total_tokens,
         compute_cost(logical_model, prompt_tokens, 0),
     )
-    _fire_usage(
+    await _fire_usage(
         user=user,
         logical_model=logical_model,
         prompt_tokens=prompt_tokens,
@@ -177,7 +178,7 @@ async def responses(
     try:
         response = await litellm.aresponses(**kwargs)
     except Exception as exc:
-        _fire_usage(
+        await _fire_usage(
             user=user,
             logical_model=logical_model,
             status_value=UsageStatus.error.value,
@@ -212,7 +213,7 @@ async def responses(
         total_tokens,
         compute_cost(logical_model, prompt_tokens, completion_tokens),
     )
-    _fire_usage(
+    await _fire_usage(
         user=user,
         logical_model=logical_model,
         prompt_tokens=prompt_tokens,
@@ -274,7 +275,7 @@ async def _stream_responses(
                 actual_tokens=total_tokens,
                 actual_cost=compute_cost(logical_model, prompt_tokens, completion_tokens),
             )
-        _fire_usage(
+        await _fire_usage(
             user=user,
             logical_model=logical_model,
             prompt_tokens=prompt_tokens,
@@ -291,7 +292,7 @@ async def _stream_responses(
 # ---------------------------------------------------------------------------
 
 
-def _fire_usage(
+async def _fire_usage(
     *,
     user: AuthenticatedUser,
     logical_model: Any,
@@ -302,26 +303,32 @@ def _fire_usage(
     completion_tokens: int = 0,
     total_tokens: int = 0,
 ) -> None:
-    """Fire-and-enqueue usage (temporary: uses old create_task until full finalize wiring)."""
-    import asyncio
+    """Enqueue usage to the durable Redis queue (single write path, GC-safe).
 
-    asyncio.create_task(
-        record_usage(
-            UsageData(
-                user_id=user.user_id,
-                api_key_id=user.api_key_id,
-                logical_model=logical_model,
-                channel_id=None,
-                upstream_model=None,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                status=status_value,
-                latency_ms=latency_ms,
-                request_id=request_id,
-                downgraded_features=None,
-            )
-        )
+    Awaits a single Redis RPUSH (sub-millisecond, non-blocking); the batch
+    worker drains the queue into ``usage_record``.  This replaces the
+    fire-and-forget ``asyncio.create_task`` pattern, which could drop writes
+    when the task was garbage-collected before completion.
+    """
+    cost = compute_cost(logical_model, prompt_tokens, completion_tokens)
+    await enqueue_usage_event(
+        {
+            "request_id": request_id,
+            "user_id": user.user_id,
+            "api_key_id": user.api_key_id,
+            "logical_model_id": logical_model.id,
+            "logical_model_name": getattr(logical_model, "name", None),
+            "channel_id": None,
+            "upstream_model": None,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cost": str(cost) if cost is not None else None,
+            "status": status_value,
+            "latency_ms": latency_ms,
+            "cache_hit": False,
+            "downgraded_features": None,
+        }
     )
 
 
