@@ -82,6 +82,28 @@ DEPLOYMENT_SORT_COLUMNS = {
 
 
 class CatalogService:
+    """目录服务：上游渠道 / 号池 key / 逻辑模型 / 部署的 CRUD。
+
+    访问模型（有意的读写不对称，非缺陷）：
+
+    - **catalog 是平台基础设施，不是 user-owned 数据**。channel/key/model/
+      deployment 是全公司共享的上游厂商连接与逻辑模型定义，与 usage / credential
+      等带强制 ``user_id`` 的用户数据表性质不同。``created_by`` / ``create_dept``
+      仅为 ``BaseEntity`` 继承来的审计列，不构成 catalog 的数据权限边界。
+    - **读取（list/get）按权限门控，不做 data-scope 过滤**：端点要求
+      ``ai:catalog:list`` / ``ai:catalog:query``，持有者即平台管理员，需要看到
+      全部渠道才能配置部署（restricted-scope admin 配 deployment 时必须能引用
+      他人创建的 channel）。secret 在 ``ChannelKeyRead`` 已脱敏（仅暴露
+      ``key_hint``），读取无敏感泄露面。
+    - **写入（create/update/delete）才施加 scope**：create 要求 unrestricted
+      scope；update/delete 要求 catalog wildcard + (unrestricted 或本人创建)。
+      因 restricted-scope admin 无法 create，正常不会 own 任何 catalog 记录，
+      ownership 分支仅覆盖「创建后被降权」的边缘场景。
+
+    若未来 catalog 需按部门隔离（如多租户上游隔离），应在 list/get 接入
+    ``DataScopeFilter`` 并同步调整部署配置流程，避免破坏跨部门引用。
+    """
+
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.channels = UpstreamChannelRepository(session)
