@@ -7,7 +7,7 @@ from starlette import status
 
 from src.admin.rate_limits.repository import RateLimitRepository
 from src.admin.rate_limits.schemas import RateLimitRuleCreate, RateLimitRuleUpdate
-from src.auth.service import AuthenticatedUser
+from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.core.pagination import PageResult
 from src.core.query import ListQuery
 from src.db.models.rate_limit import RateLimitRule
@@ -21,6 +21,10 @@ class RateLimitService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.repo = RateLimitRepository(session)
+        self.auth = AuthService(session)
+
+    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
+        return await self.auth.resolve_data_scope(actor)
 
     async def _validate_subject(
         self, payload: RateLimitRuleCreate, *, actor: AuthenticatedUser
@@ -49,6 +53,32 @@ class RateLimitService:
             exists = await self.repo.api_key_exists(subject_id)
         if not exists:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+        scope_filter = await self._scope(actor)
+        if not await self.repo.subject_in_scope(
+            subject_type=payload.subject_type.value,
+            subject_id=subject_id,
+            scope_filter=scope_filter,
+            actor_id=actor.user_id,
+        ):
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+
+    async def _require_visible_rule(
+        self, rule_id: int, *, actor: AuthenticatedUser
+    ) -> RateLimitRule:
+        rule = await self.get_rule(rule_id)
+        if rule.subject_type == RateLimitScope.global_.value:
+            if not actor.is_superuser:
+                raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+            return rule
+        scope_filter = await self._scope(actor)
+        if not await self.repo.subject_in_scope(
+            subject_type=rule.subject_type,
+            subject_id=rule.subject_id,
+            scope_filter=scope_filter,
+            actor_id=actor.user_id,
+        ):
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+        return rule
 
     async def list_rules(
         self,
@@ -58,13 +88,18 @@ class RateLimitService:
         subject_id: int | None = None,
         logical_model_id: int | None = None,
         rule_status: str | None = None,
+        actor: AuthenticatedUser | None = None,
     ) -> PageResult[RateLimitRule]:
+        scope_filter = await self._scope(actor) if actor is not None else None
         return await self.repo.list_rules(
             query,
             subject_type=subject_type,
             subject_id=subject_id,
             logical_model_id=logical_model_id,
             status=rule_status,
+            scope_filter=scope_filter,
+            actor_id=actor.user_id if actor is not None else None,
+            include_global=actor.is_superuser if actor is not None else False,
         )
 
     async def get_rule(self, rule_id: int) -> RateLimitRule:
@@ -96,7 +131,7 @@ class RateLimitService:
     async def update_rule(
         self, rule_id: int, payload: RateLimitRuleUpdate, *, actor: AuthenticatedUser
     ) -> RateLimitRule:
-        rule = await self.get_rule(rule_id)
+        rule = await self._require_visible_rule(rule_id, actor=actor)
 
         if payload.rpm_limit is not None:
             rule.rpm_limit = payload.rpm_limit
@@ -118,6 +153,6 @@ class RateLimitService:
         return rule
 
     async def delete_rule(self, rule_id: int, *, actor: AuthenticatedUser) -> None:
-        rule = await self.get_rule(rule_id)
+        rule = await self._require_visible_rule(rule_id, actor=actor)
         rule.updated_by = actor.user_id
         await self.repo.soft_delete(rule)

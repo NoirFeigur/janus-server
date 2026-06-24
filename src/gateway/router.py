@@ -387,7 +387,12 @@ async def _check_rate_limits(
     Returns the applicable rules so the caller can release the concurrent slot
     in the stream finally block.  Raises 429 if any limit is exceeded.
     """
-    rules = await service.get_rate_limit_rules(user.user_id, user.department_id, logical_model_id)
+    rules = await service.get_rate_limit_rules(
+        user.user_id,
+        user.department_id,
+        logical_model_id,
+        user.api_key_id,
+    )
     if rules:
         rl_result = await check_rate_limits(
             request_id=request_id,

@@ -121,6 +121,7 @@ class GatewayService:
         user_id: int,
         department_id: int | None,
         logical_model_id: int,
+        api_key_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch active rate limit rules applicable to this user/model (fail-open).
 
@@ -147,6 +148,10 @@ class GatewayService:
                         (RateLimitRule.subject_type == "department")
                         & (RateLimitRule.subject_id == department_id)
                     )
+                    | (
+                        (RateLimitRule.subject_type == "api_key")
+                        & (RateLimitRule.subject_id == api_key_id)
+                    )
                     | (RateLimitRule.subject_type == "global")
                 )
             )
@@ -160,6 +165,7 @@ class GatewayService:
                     "logical_model_id": r.logical_model_id,
                     "rpm_limit": r.rpm_limit,
                     "tpm_limit": r.tpm_limit,
+                    "tpm_burst_limit": r.tpm_burst_limit,
                     "max_concurrent": r.max_concurrent,
                 }
                 for r in rules

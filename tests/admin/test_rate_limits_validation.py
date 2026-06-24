@@ -13,16 +13,18 @@ rule against a non-existent subject. These tests pin the hardened contract:
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from src.admin.rate_limits.schemas import RateLimitRuleCreate
+from src.admin.rate_limits.schemas import RateLimitRuleCreate, RateLimitRuleUpdate
 from src.admin.rate_limits.service import RateLimitService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
-from src.auth.service import AuthenticatedUser
+from src.auth.service import AuthenticatedUser, DataScopeFilter
+from src.core.query import ListQuery
 from src.db.base import Base
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, User
@@ -52,6 +54,18 @@ SCOPED_ACTOR = AuthenticatedUser(
     permissions=frozenset({"ai:rate_limit:add"}),
     role_codes=frozenset(),
 )
+
+
+def _scoped_service(session: AsyncSession) -> RateLimitService:
+    service = RateLimitService(session)
+    service.auth.resolve_data_scope = AsyncMock(
+        return_value=DataScopeFilter(
+            unrestricted=False,
+            department_ids=frozenset({20}),
+            include_self=True,
+        )
+    )
+    return service
 
 
 @pytest_asyncio.fixture
@@ -193,3 +207,67 @@ async def test_api_key_rule_existing_subject_created(
 
     assert rule.subject_type == "api_key"
     assert rule.subject_id == 100
+
+
+@pytest.mark.asyncio
+async def test_scoped_actor_cannot_create_out_of_scope_user_rule(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_subjects(db_session)
+    db_session.add(User(id=2, username="bob", employee_no="E002", department_id=99))
+    await db_session.flush()
+    service = _scoped_service(db_session)
+    payload = RateLimitRuleCreate(subject_type="user", subject_id=2, rpm_limit=60)
+
+    with pytest.raises(AppError) as exc:
+        await service.create_rule(payload, actor=SCOPED_ACTOR)
+
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_scoped_actor_lists_only_visible_rate_limit_rules(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_subjects(db_session)
+    db_session.add(User(id=2, username="bob", employee_no="E002", department_id=99))
+    db_session.add_all(
+        [
+            RateLimitRule(subject_type="user", subject_id=2000, rpm_limit=10),
+            RateLimitRule(subject_type="user", subject_id=2, rpm_limit=20),
+            RateLimitRule(subject_type="global", subject_id=None, rpm_limit=30),
+        ]
+    )
+    await db_session.flush()
+    service = _scoped_service(db_session)
+
+    page = await service.list_rules(ListQuery(limit=50), actor=SCOPED_ACTOR)
+
+    assert [rule.subject_id for rule in page.items] == [2000]
+
+
+@pytest.mark.asyncio
+async def test_scoped_actor_cannot_update_out_of_scope_api_key_rule(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_subjects(db_session)
+    db_session.add(User(id=2, username="bob", employee_no="E002", department_id=99))
+    db_session.add(
+        ApiKey(
+            id=101,
+            user_id=2,
+            name="k2",
+            key_hash="i" * 64,
+            key_prefix="sk-bbbb",
+            status="active",
+        )
+    )
+    rule = RateLimitRule(subject_type="api_key", subject_id=101, rpm_limit=10)
+    db_session.add(rule)
+    await db_session.flush()
+    service = _scoped_service(db_session)
+
+    with pytest.raises(AppError) as exc:
+        await service.update_rule(rule.id, RateLimitRuleUpdate(rpm_limit=20), actor=SCOPED_ACTOR)
+
+    assert exc.value.status_code == 403

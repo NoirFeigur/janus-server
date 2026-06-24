@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.gateway.repository import RouterDeploymentRow
 from src.gateway.router_manager import RouterManager
 
 _DUMMY_FACTORY = cast("async_sessionmaker[AsyncSession]", object())
@@ -92,6 +93,51 @@ async def test_old_router_closed_after_grace_not_immediately(
     await asyncio.sleep(0.15)
     router.close.assert_awaited_once()
     assert not RouterManager._pending_close_tasks
+
+
+@pytest.mark.asyncio
+async def test_rebuild_skips_unchanged_config_without_closing_old_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = RouterDeploymentRow(
+        logical_model_name="gpt-4",
+        logical_model_id=1,
+        upstream_model="gpt-4o",
+        provider="openai",
+        protocol="openai",
+        api_base=None,
+        extra_config=None,
+        api_key_encrypted="ciphertext",
+        channel_id=10,
+        channel_key_id=20,
+        deployment_weight=1,
+        deployment_priority=0,
+        key_weight=1,
+        key_rpm_limit=None,
+        key_tpm_limit=None,
+    )
+    old_router = AsyncMock()
+    session = AsyncMock()
+    session.__aenter__.return_value = session
+    session.__aexit__.return_value = None
+    def session_factory() -> AsyncMock:
+        return session
+
+    repo = AsyncMock()
+    repo.get_router_config.return_value = [row]
+
+    monkeypatch.setattr("src.gateway.router_manager.GatewayRepository", lambda _: repo)
+    monkeypatch.setattr(RouterManager, "_get_degraded_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(RouterManager, "_router", old_router)
+    monkeypatch.setattr(RouterManager, "_router_fingerprint", RouterManager._fingerprint([row]))
+    monkeypatch.setattr(RouterManager, "_pending_close_tasks", set())
+    schedule_close = AsyncMock()
+    monkeypatch.setattr(RouterManager, "_schedule_router_close", schedule_close)
+
+    await RouterManager.rebuild(cast("async_sessionmaker[AsyncSession]", session_factory))
+
+    assert RouterManager._router is old_router
+    schedule_close.assert_not_called()
 
 
 @pytest.mark.asyncio

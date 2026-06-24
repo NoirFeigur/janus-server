@@ -20,6 +20,7 @@ def _make_rule(
     logical_model_id: int = 1,
     rpm_limit: int | None = None,
     tpm_limit: int | None = None,
+    tpm_burst_limit: int | None = None,
     max_concurrent: int | None = None,
 ) -> dict:
     return {
@@ -29,6 +30,7 @@ def _make_rule(
         "logical_model_id": logical_model_id,
         "rpm_limit": rpm_limit,
         "tpm_limit": tpm_limit,
+        "tpm_burst_limit": tpm_burst_limit,
         "max_concurrent": max_concurrent,
     }
 
@@ -109,6 +111,21 @@ async def test_tpm_denied_when_exhausted(fake_redis: AsyncRedisDouble) -> None:
     )
     assert result2.allowed is False
     assert result2.denied_reason == "tpm_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_tpm_burst_limit_used_as_bucket_capacity(fake_redis: AsyncRedisDouble) -> None:
+    rule = _make_rule(tpm_limit=100, tpm_burst_limit=250)
+    first = await check_rate_limits(
+        request_id="req-1", member="m-1", rules=[rule], estimated_tokens=200
+    )
+    assert first.allowed is True
+
+    second = await check_rate_limits(
+        request_id="req-2", member="m-2", rules=[rule], estimated_tokens=60
+    )
+    assert second.allowed is False
+    assert second.denied_reason == "tpm_exceeded"
 
 
 @pytest.mark.asyncio
@@ -244,6 +261,56 @@ async def test_multiple_rules_first_blocks(fake_redis: AsyncRedisDouble) -> None
     # Second blocked by rule1 even though rule2 has capacity
     result = await check_rate_limits(request_id="req-2", member="m-2", rules=[rule1, rule2])
     assert result.allowed is False
+
+
+@pytest.mark.asyncio
+async def test_later_rule_denial_rolls_back_prior_tpm_reservation(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    rule1 = _make_rule(rule_id=1, tpm_limit=300)
+    rule2 = _make_rule(rule_id=2, rpm_limit=1)
+    await check_rate_limits(request_id="req-fill", member="m-fill", rules=[rule2])
+
+    denied = await check_rate_limits(
+        request_id="req-denied",
+        member="m-denied",
+        rules=[rule1, rule2],
+        estimated_tokens=100,
+    )
+    assert denied.allowed is False
+
+    allowed = await check_rate_limits(
+        request_id="req-after",
+        member="m-after",
+        rules=[rule1],
+        estimated_tokens=300,
+    )
+    assert allowed.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_later_rule_denial_rolls_back_prior_concurrent_slot(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    rule1 = _make_rule(rule_id=1, max_concurrent=1)
+    rule2 = _make_rule(rule_id=2, rpm_limit=1)
+    await check_rate_limits(request_id="req-fill", member="m-fill", rules=[rule2])
+
+    denied = await check_rate_limits(
+        request_id="req-denied",
+        member="m-denied",
+        rules=[rule1, rule2],
+        is_stream=True,
+    )
+    assert denied.allowed is False
+
+    allowed = await check_rate_limits(
+        request_id="req-after",
+        member="m-after",
+        rules=[rule1],
+        is_stream=True,
+    )
+    assert allowed.allowed is True
 
 
 # ---------------------------------------------------------------------------

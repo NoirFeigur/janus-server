@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from src.auth.service import AuthenticatedUser
-from src.enums import ErrorCode
+from src.enums import ErrorCode, UsageStatus
 from src.gateway.endpoints_v1 import (
     EmbeddingsRequest,
     ResponsesRequest,
@@ -15,7 +16,10 @@ from src.gateway.endpoints_v1 import (
     _latency_ms,
     _request_id,
     _upstream_error,
+    embeddings,
+    list_models,
 )
+from src.gateway.quota import QuotaCheckResult, QuotaReservation
 
 
 def _fake_user() -> AuthenticatedUser:
@@ -36,6 +40,12 @@ def _fake_logical_model() -> Mock:
     model.price_input = None
     model.price_output = None
     return model
+
+
+def _fake_request() -> Mock:
+    request = Mock()
+    request.state.trace_id = "req-v1"
+    return request
 
 
 # ---------------------------------------------------------------------------
@@ -149,3 +159,62 @@ async def test_fire_usage_enqueues_durable_event() -> None:
     assert payload["total_tokens"] == 15
     assert payload["status"] == UsageStatus.success.value
     assert payload["latency_ms"] == 42
+
+
+@pytest.mark.asyncio
+async def test_embeddings_uses_rate_limit_quota_reservations_and_finalizer() -> None:
+    reservation = QuotaReservation(
+        key="quota:u:100:1:2026-06:tokens",
+        quota_id=1,
+        metric="tokens",
+        scope="user",
+        enforce=True,
+        limit_value=Decimal("1000"),
+    )
+    service = AsyncMock()
+    service.resolve_model.return_value = _fake_logical_model()
+    service.get_rate_limit_rules.return_value = [{"id": 1, "tpm_limit": 1000}]
+    service.check_quota.return_value = QuotaCheckResult(
+        passed=True, reservations=[reservation]
+    )
+    router = AsyncMock()
+    response = {"object": "embedding", "usage": {"prompt_tokens": 7, "total_tokens": 7}}
+    router.aembedding.return_value = response
+
+    with (
+        patch("src.gateway.endpoints_v1.RouterManager.get_router", return_value=router),
+        patch("src.gateway.endpoints_v1.check_rate_limits", new_callable=AsyncMock) as rl,
+        patch(
+            "src.gateway.endpoints_v1.finalize_gateway_request", new_callable=AsyncMock
+        ) as finalize,
+    ):
+        rl.return_value = Mock(allowed=True)
+        resp = await embeddings(
+            request=_fake_request(),
+            user=_fake_user(),
+            service=service,
+            payload=EmbeddingsRequest(model="gpt-4", input="hi"),
+        )
+
+    assert resp.status_code == 200
+    service.settle_quota.assert_not_called()
+    finalize.assert_awaited_once()
+    kwargs = finalize.await_args.kwargs
+    assert kwargs["quota_reservations"] == [reservation]
+    ctx = finalize.await_args.args[0]
+    assert ctx.total_tokens == 7
+    assert ctx.status == UsageStatus.success.value
+
+
+@pytest.mark.asyncio
+async def test_list_models_batches_granted_model_lookup() -> None:
+    service = AsyncMock()
+    model = _fake_logical_model()
+    service.repo.get_user_granted_models.return_value = {model.id}
+    service.repo.get_logical_models_by_ids.return_value = [model]
+
+    resp = await list_models(user=_fake_user(), service=service)
+
+    assert resp.status_code == 200
+    service.repo.get_logical_models_by_ids.assert_awaited_once_with([model.id])
+    service.repo.get_logical_model_by_id.assert_not_called()

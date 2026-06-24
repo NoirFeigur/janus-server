@@ -9,6 +9,7 @@ from redis.exceptions import RedisError
 from src.auth.service import AuthenticatedUser
 from src.db.models.model_catalog import LogicalModel
 from src.db.models.quota import Quota
+from src.db.models.rate_limit import RateLimitRule
 from src.enums import ErrorCode, QuotaMetric, QuotaPeriod, QuotaScope
 from src.exceptions import AppError
 from src.gateway.quota import QuotaCheckResult, QuotaExceeded, QuotaLimitExceeded
@@ -166,3 +167,43 @@ async def test_check_quota_redis_down_fails_closed_503() -> None:
 
     assert exc_info.value.code == ErrorCode.service_unavailable
     assert exc_info.value.status_code == 503
+
+
+async def test_get_rate_limit_rules_includes_api_key_and_burst(
+    gateway_session,
+) -> None:
+    service = GatewayService(gateway_session)
+    gateway_session.add_all(
+        [
+            RateLimitRule(
+                subject_type="api_key",
+                subject_id=900,
+                logical_model_id=10,
+                tpm_limit=100,
+                tpm_burst_limit=250,
+                status="active",
+                enforce=True,
+            ),
+            RateLimitRule(
+                subject_type="api_key",
+                subject_id=901,
+                logical_model_id=10,
+                rpm_limit=1,
+                status="active",
+                enforce=True,
+            ),
+        ]
+    )
+    await gateway_session.flush()
+
+    rules = await service.get_rate_limit_rules(
+        user_id=100,
+        department_id=200,
+        logical_model_id=10,
+        api_key_id=900,
+    )
+
+    assert len(rules) == 1
+    assert rules[0]["subject_type"] == "api_key"
+    assert rules[0]["subject_id"] == 900
+    assert rules[0]["tpm_burst_limit"] == 250

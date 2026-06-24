@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -165,6 +166,22 @@ class GatewayRepository:
             LogicalModel.id == logical_model_id,
         )
         return await self.session.scalar(stmt)
+
+    async def get_logical_models_by_ids(
+        self, logical_model_ids: Sequence[int]
+    ) -> list[LogicalModel]:
+        if not logical_model_ids:
+            return []
+        stmt = (
+            select(LogicalModel)
+            .where(
+                LogicalModel.is_deleted.is_(False),
+                LogicalModel.status == ActiveStatus.active.value,
+                LogicalModel.id.in_(logical_model_ids),
+            )
+            .order_by(LogicalModel.name)
+        )
+        return list((await self.session.scalars(stmt)).all())
 
     async def get_active_quotas(
         self,

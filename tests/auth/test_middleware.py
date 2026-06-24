@@ -75,6 +75,18 @@ async def _client(
     async def anthropic_messages(request: Request) -> dict[str, int | None]:
         return {"api_key_id": request.state.user.api_key_id}
 
+    @app.post("/v1/embeddings")
+    async def openai_embeddings(request: Request) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
+    @app.get("/v1/models")
+    async def openai_models(request: Request) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
+    @app.post("/v1/responses")
+    async def openai_responses(request: Request) -> dict[str, int | None]:
+        return {"api_key_id": request.state.user.api_key_id}
+
     @app.post("/v1beta/models/{model_and_action:path}")
     async def gemini_generate(
         model_and_action: str, request: Request
@@ -160,7 +172,10 @@ async def test_llm_and_mcp_protocol_endpoints_allow_sk_key(
 
         for method, path in (
             ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/embeddings"),
             ("POST", "/v1/messages"),
+            ("GET", "/v1/models"),
+            ("POST", "/v1/responses"),
             ("POST", "/v1beta/models/gemini-pro:generateContent"),
             ("POST", "/mcp"),
         ):

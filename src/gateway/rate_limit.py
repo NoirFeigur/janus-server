@@ -176,6 +176,15 @@ async def check_rate_limits(
     tpm_remaining: int | None = None
     concurrent_remaining: int | None = None
 
+    tpm_acquired: list[dict[str, Any]] = []
+    concurrent_acquired = False
+
+    async def _rollback() -> None:
+        if tpm_acquired:
+            await settle_tpm(request_id, tpm_acquired, estimated_tokens)
+        if concurrent_acquired:
+            await release_concurrent(member, rules)
+
     try:
         redis = get_redis()
 
@@ -193,6 +202,7 @@ async def check_rate_limits(
                 allowed, current, limit = int(result[0]), int(result[1]), int(result[2])
                 rpm_remaining = max(0, limit - current)
                 if not allowed:
+                    await _rollback()
                     return RateLimitCheckResult(
                         allowed=False,
                         rpm_remaining=0,
@@ -204,19 +214,28 @@ async def check_rate_limits(
             tpm_limit = rule.get("tpm_limit")
             if tpm_limit is not None and estimated_tokens > 0:
                 key = f"rl:tpm:{rule_id}:{subject_key}"
+                tpm_burst_limit = rule.get("tpm_burst_limit") or tpm_limit
                 refill_rate = tpm_limit  # tokens per minute
                 result = await redis.eval(  # type: ignore[union-attr]
-                    _LUA_TPM_CHECK, 1, key, now_ms, tpm_limit, estimated_tokens, refill_rate
+                    _LUA_TPM_CHECK,
+                    1,
+                    key,
+                    now_ms,
+                    tpm_burst_limit,
+                    estimated_tokens,
+                    refill_rate,
                 )
                 allowed, current, limit = int(result[0]), int(result[1]), int(result[2])
                 tpm_remaining = current if allowed else 0
                 if not allowed:
+                    await _rollback()
                     return RateLimitCheckResult(
                         allowed=False,
                         tpm_remaining=0,
                         retry_after_seconds=10,
                         denied_reason="tpm_exceeded",
                     )
+                tpm_acquired.append(rule)
 
             # Concurrent check (streaming only)
             max_concurrent = rule.get("max_concurrent")
@@ -230,12 +249,14 @@ async def check_rate_limits(
                 allowed, current, limit = int(result[0]), int(result[1]), int(result[2])
                 concurrent_remaining = max(0, limit - current)
                 if not allowed:
+                    await _rollback()
                     return RateLimitCheckResult(
                         allowed=False,
                         concurrent_remaining=0,
                         retry_after_seconds=5,
                         denied_reason="concurrent_exceeded",
                     )
+                concurrent_acquired = True
 
     except RedisError:
         # Fail-open: if Redis is down, allow the request through
@@ -290,12 +311,19 @@ async def settle_tpm(request_id: str, rules: list[dict[str, Any]], delta_tokens:
         for rule in rules:
             tpm_limit = rule.get("tpm_limit")
             if tpm_limit is not None:
+                tpm_burst_limit = rule.get("tpm_burst_limit") or tpm_limit
                 rule_id = rule.get("id", 0)
                 subject_key = _subject_key(rule)
                 key = f"rl:tpm:{rule_id}:{subject_key}"
                 await cast(
                     "Awaitable[Any]",
-                    redis.eval(_LUA_TPM_SETTLE, 1, key, str(delta_tokens), str(tpm_limit)),
+                    redis.eval(
+                        _LUA_TPM_SETTLE,
+                        1,
+                        key,
+                        str(delta_tokens),
+                        str(tpm_burst_limit),
+                    ),
                 )
 
 

@@ -36,7 +36,7 @@ ServiceDep = Annotated[RateLimitService, Depends(get_rate_limit_service)]
 async def list_rate_limit_rules(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:rate_limit:list"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:rate_limit:list"))],
     subject_type: str | None = None,
     subject_id: int | None = None,
     logical_model_id: int | None = None,
@@ -58,6 +58,7 @@ async def list_rate_limit_rules(
         subject_id=subject_id,
         logical_model_id=logical_model_id,
         rule_status=status,
+        actor=user,
     )
     return success(
         page(
@@ -75,9 +76,9 @@ async def get_rate_limit_rule(
     rule_id: int,
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:rate_limit:query"))],
+    user: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:rate_limit:query"))],
 ) -> SuccessEnvelope[RateLimitRuleRead]:
-    rule = await service.get_rule(rule_id)
+    rule = await service._require_visible_rule(rule_id, actor=user)
     return success(RateLimitRuleRead.model_validate(rule), trace_id=trace_id)
 
 

@@ -43,6 +43,7 @@ class RouterManager:
     _debounce_task: asyncio.Task[None] | None = None
     _pending_close_tasks: set[asyncio.Task[None]] = set()
     _session_factory: async_sessionmaker[AsyncSession] | None = None
+    _router_fingerprint: tuple[object, ...] | None = None
 
     @classmethod
     async def startup(cls, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -81,9 +82,19 @@ class RouterManager:
             if degraded_ids:
                 rows = [r for r in rows if r.channel_id not in degraded_ids]
 
+            fingerprint = cls._fingerprint(rows)
+            if cls._router is not None and fingerprint == cls._router_fingerprint:
+                _log.debug(
+                    "gateway.router.rebuild_skipped_unchanged",
+                    deployments=len(rows),
+                    degraded_excluded=len(degraded_ids),
+                )
+                return
+
             new_router = build_router(rows)
             old_router = cls._router
             cls._router = new_router
+            cls._router_fingerprint = fingerprint
             # Defer closing the old Router so in-flight requests holding it can
             # drain; closing inline tore down their sessions mid-stream.
             if old_router is not None:
@@ -93,6 +104,30 @@ class RouterManager:
                 deployments=len(rows),
                 degraded_excluded=len(degraded_ids),
             )
+
+    @classmethod
+    def _fingerprint(cls, rows: object) -> tuple[object, ...]:
+        """Return a stable config fingerprint for the Router inputs."""
+        return tuple(
+            (
+                row.logical_model_name,
+                row.logical_model_id,
+                row.upstream_model,
+                row.provider,
+                row.protocol,
+                row.api_base,
+                tuple(sorted((row.extra_config or {}).items())),
+                row.api_key_encrypted,
+                row.channel_id,
+                row.channel_key_id,
+                row.deployment_weight,
+                row.deployment_priority,
+                row.key_weight,
+                row.key_rpm_limit,
+                row.key_tpm_limit,
+            )
+            for row in rows
+        )
 
     @classmethod
     def _schedule_router_close(cls, router: Router) -> None:

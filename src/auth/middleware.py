@@ -36,10 +36,13 @@ PUBLIC_PATHS = frozenset(
 LLM_API_KEY_PATHS = frozenset(
     {
         "/v1/chat/completions",
+        "/v1/embeddings",
         "/v1/messages",
+        "/v1/models",
+        "/v1/responses",
     }
 )
-LLM_API_KEY_METHODS = frozenset({"POST"})
+LLM_API_KEY_METHODS = frozenset({"GET", "POST"})
 MCP_API_KEY_PATHS = frozenset({"/mcp", "/mcp/"})
 MCP_API_KEY_METHODS = frozenset({"GET", "POST"})
 GEMINI_API_KEY_ACTIONS = (":generateContent", ":streamGenerateContent")
@@ -58,9 +61,9 @@ def _is_gemini_generation_path(path: str) -> bool:
 
 
 def _allows_api_key(path: str, method: str) -> bool:
-    if method in LLM_API_KEY_METHODS and (
-        path in LLM_API_KEY_PATHS or _is_gemini_generation_path(path)
-    ):
+    if method in LLM_API_KEY_METHODS and path in LLM_API_KEY_PATHS:
+        return True
+    if method == "POST" and _is_gemini_generation_path(path):
         return True
     return method in MCP_API_KEY_METHODS and path in MCP_API_KEY_PATHS
 

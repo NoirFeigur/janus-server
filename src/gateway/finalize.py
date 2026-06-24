@@ -80,21 +80,19 @@ async def _settle_quota(
     logical_model: LogicalModel | None,
     service: GatewayService | None,
 ) -> None:
-    """Settle quota: compensate on error (no tokens used), settle with actuals on success."""
+    """Settle quota, charging any usage already observed before a failure."""
     if ctx.quota_settled or not ctx.quota_reserved:
         return
     if service is None or logical_model is None:
         return
 
     with suppress(Exception):
-        from src.enums import UsageStatus
-
-        error_or_zero = ctx.status != UsageStatus.success.value or ctx.total_tokens == 0
+        should_compensate = ctx.total_tokens == 0
 
         # Preferred path: settle against the exact keys reserved at check time.
         # Immune to quota hot-reload / period rollover between check and settle.
         if ctx.quota_reservations:
-            if error_or_zero:
+            if should_compensate:
                 await service.quota.compensate_reservations(ctx.quota_reservations)
             else:
                 cost = _compute_cost(ctx, logical_model)
@@ -106,7 +104,7 @@ async def _settle_quota(
 
         # Legacy fallback: re-query active quotas (used where reservations were
         # not captured, e.g. cache-hit synthetic contexts).
-        if error_or_zero:
+        if should_compensate:
             quotas = await service.repo.get_active_quotas(
                 ctx.user_id, ctx.department_id, logical_model.id
             )

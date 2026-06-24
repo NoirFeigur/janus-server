@@ -289,6 +289,50 @@ async def test_finalize_compensates_reservations_on_error(
 
 
 @pytest.mark.asyncio
+async def test_finalize_settles_partial_usage_even_when_stream_errors(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """A failed/aborted stream with parsed usage still charges observed tokens."""
+    reservations = [
+        QuotaReservation(
+            key="quota:u:1:10:2026-06:tokens",
+            quota_id=7,
+            metric="tokens",
+            scope="user",
+            enforce=True,
+            limit_value=Decimal("100000"),
+        )
+    ]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        logical_model_id=10,
+        prompt_tokens=20,
+        completion_tokens=30,
+        total_tokens=50,
+        quota_reserved=True,
+    )
+    ctx.mark_error(UsageStatus.error.value)
+    logical_model = Mock()
+    logical_model.id = 10
+    logical_model.price_input = None
+    logical_model.price_output = None
+
+    service = AsyncMock()
+    service.quota = AsyncMock()
+    service.repo = AsyncMock()
+
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        quota_reservations=reservations,
+    )
+
+    service.quota.settle_reservations.assert_awaited_once()
+    service.quota.compensate_reservations.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_finalize_falls_back_to_legacy_settle_without_reservations(
     fake_redis: AsyncRedisDouble,
 ) -> None:

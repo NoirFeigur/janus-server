@@ -22,6 +22,7 @@ from src.db.models.model_catalog import (
     UpstreamChannel,
 )
 from src.db.models.quota import Quota
+from src.db.models.rate_limit import RateLimitRule
 from src.db.models.usage import UsageRecord
 from src.enums import (
     ActiveStatus,
@@ -45,6 +46,7 @@ _TABLES = [
         ModelDeployment,
         UserModelGrant,
         Quota,
+        RateLimitRule,
         UsageRecord,
     )
 ]
