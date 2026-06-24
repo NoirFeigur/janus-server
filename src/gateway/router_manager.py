@@ -23,26 +23,36 @@ class RouterManager:
     _router: Router | None = None
     _lock = asyncio.Lock()
     _rebuild_interval_seconds: int = 30
+    # Trailing-edge debounce: admin bulk writes (e.g. a script adding many keys)
+    # publish a burst of invalidate events. Without debounce each event triggers a
+    # full rebuild (DB query + new Router + closing the old Router's aiohttp/Redis
+    # sessions under in-flight requests). We coalesce a burst into a single rebuild
+    # by waiting for a short quiet window; each new event resets the timer.
+    _debounce_seconds: float = 1.5
+    _invalidate_event: asyncio.Event = asyncio.Event()
     _poll_task: asyncio.Task[None] | None = None
     _sub_task: asyncio.Task[None] | None = None
+    _debounce_task: asyncio.Task[None] | None = None
     _session_factory: async_sessionmaker[AsyncSession] | None = None
 
     @classmethod
     async def startup(cls, session_factory: async_sessionmaker[AsyncSession]) -> None:
         cls._session_factory = session_factory
         await cls.rebuild(session_factory)
+        cls._debounce_task = asyncio.create_task(cls._debounce_worker(session_factory))
         cls._poll_task = asyncio.create_task(cls._poll(session_factory))
         cls._sub_task = asyncio.create_task(cls._subscribe(session_factory))
 
     @classmethod
     async def shutdown(cls) -> None:
-        for task in (cls._poll_task, cls._sub_task):
+        for task in (cls._poll_task, cls._sub_task, cls._debounce_task):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
         cls._poll_task = None
         cls._sub_task = None
+        cls._debounce_task = None
 
     @classmethod
     async def rebuild(cls, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -84,6 +94,33 @@ class RouterManager:
                 _log.exception("gateway.router.rebuild_failed")
 
     @classmethod
+    async def _debounce_worker(
+        cls, session_factory: async_sessionmaker[AsyncSession]
+    ) -> NoReturn:
+        """Coalesce invalidate bursts into a single trailing-edge rebuild.
+
+        Blocks until an invalidate is signalled, then waits for a quiet window of
+        ``_debounce_seconds`` with no further signals before rebuilding. Each new
+        signal during the window resets the timer, so a burst of N events yields
+        exactly one rebuild shortly after the burst ends.
+        """
+        while True:
+            await cls._invalidate_event.wait()
+            # Quiet-window loop: extend while events keep arriving.
+            while True:
+                cls._invalidate_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        cls._invalidate_event.wait(), timeout=cls._debounce_seconds
+                    )
+                except TimeoutError:
+                    break  # window elapsed with no new event → rebuild
+            try:
+                await cls.rebuild(session_factory)
+            except Exception:
+                _log.exception("gateway.router.rebuild_after_invalidate_failed")
+
+    @classmethod
     async def _get_degraded_ids(cls) -> set[int]:
         """Load degraded channel IDs from Redis (fail-open: empty set on error)."""
         with suppress(Exception):
@@ -111,12 +148,9 @@ class RouterManager:
                         )
                         if msg is not None and msg.get("type") == "message":
                             _log.info("gateway.router.invalidate_received")
-                            try:
-                                await cls.rebuild(session_factory)
-                            except Exception:
-                                _log.exception(
-                                    "gateway.router.rebuild_after_invalidate_failed"
-                                )
+                            # Signal the debounce worker instead of rebuilding
+                            # inline; a burst of events coalesces into one rebuild.
+                            cls._invalidate_event.set()
                 finally:
                     await pubsub.unsubscribe("gateway:router:invalidate")
                     await pubsub.aclose()
