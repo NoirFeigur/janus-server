@@ -37,6 +37,7 @@ from src.core.security import issue_access_token
 from src.core.session_store import SessionStore
 from src.db.base import Base
 from src.db.models.audit import LoginLog, OperLog
+from src.db.models.catalog_ops import CatalogChangeLog
 from src.db.models.credential import ApiKey
 from src.db.models.grant import UserModelGrant
 from src.db.models.identity import (
@@ -95,6 +96,7 @@ _TABLES = [
         OperLog,
         LoginLog,
         SysConfig,
+        CatalogChangeLog,
     )
 ]
 

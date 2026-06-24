@@ -6,16 +6,18 @@ Implements three admission controls:
 3. Concurrent — streaming semaphore (sorted set: score=started_ms, member=request_id).
 
 All checks run BEFORE quota reservation.  RPM is never refunded; TPM reserves
-estimated tokens upfront and settles/refunds with actuals; concurrent is released
-in stream finally.
+estimated tokens upfront and settles the signed difference with actuals (refund
+when under-estimated, extra deduction when over-estimated); concurrent is
+released in stream finally.
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from redis.exceptions import RedisError
 
@@ -24,8 +26,8 @@ from src.core.redis import get_redis
 
 _log = get_logger(__name__)
 
-# Conservative upfront TPM reservation per request.  Settled/refunded against
-# actual token usage at request finalization (see finalize._refund_tpm).
+# Conservative upfront TPM reservation per request.  Settled against actual
+# token usage at request finalization (see finalize._settle_tpm).
 ESTIMATED_TOKENS_PER_REQUEST = 100
 
 
@@ -93,6 +95,29 @@ redis.call('PEXPIRE', key, 120000)
 return {1, tokens, limit}
 """
 
+# TPM settle: apply a signed delta (estimated - actual) to the bucket.
+# Positive delta refunds unused reservation (capped at limit); negative delta
+# deducts over-consumption beyond the upfront estimate (may drive the bucket
+# into debt that recovers via refill). Never touches the refill timestamp.
+_LUA_TPM_SETTLE = """
+local key = KEYS[1]
+local delta = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+
+if redis.call('EXISTS', key) == 0 then
+    return 0
+end
+
+local tokens = tonumber(redis.call('HGET', key, 'tokens')) or 0
+tokens = tokens + delta
+if tokens > limit then
+    tokens = limit
+end
+redis.call('HSET', key, 'tokens', tokens)
+redis.call('PEXPIRE', key, 120000)
+return 1
+"""
+
 # Concurrent semaphore: acquire slot.
 _LUA_CONCURRENT_CHECK = """
 local key = KEYS[1]
@@ -123,6 +148,7 @@ return {1, count + 1, limit}
 async def check_rate_limits(
     *,
     request_id: str,
+    member: str,
     rules: list[dict[str, Any]],
     estimated_tokens: int = 100,
     is_stream: bool = False,
@@ -130,7 +156,14 @@ async def check_rate_limits(
     """Check all applicable rate limit rules for a request.
 
     Args:
-        request_id: Unique request identifier (used as sorted set member).
+        request_id: Request identifier, for logging/correlation only.
+        member: Server-side unguessable sorted-set member for the RPM sliding
+            window and the concurrent semaphore. MUST NOT be derived from any
+            client-controllable value (e.g. the ``x-request-id`` header): a
+            fixed/repeated member collapses ``ZCARD`` to 1, letting a caller
+            replay the same id to defeat RPM and concurrency limits entirely.
+            Generate it per request (e.g. ``uuid4().hex``) and pass the *same*
+            value to :func:`release_concurrent`.
         rules: List of rate limit rule dicts (from DB/cache).
         estimated_tokens: Conservative token estimate for TPM reservation.
         is_stream: Whether this is a streaming request (for concurrent check).
@@ -155,7 +188,7 @@ async def check_rate_limits(
             if rpm_limit is not None:
                 key = f"rl:rpm:{rule_id}:{subject_key}"
                 result = await redis.eval(  # type: ignore[union-attr]
-                    _LUA_RPM_CHECK, 1, key, now_ms, 60000, rpm_limit, request_id
+                    _LUA_RPM_CHECK, 1, key, now_ms, 60000, rpm_limit, member
                 )
                 allowed, current, limit = int(result[0]), int(result[1]), int(result[2])
                 rpm_remaining = max(0, limit - current)
@@ -192,7 +225,7 @@ async def check_rate_limits(
                 timeout_ms = 1800 * 1000  # 30 min max stream
                 result = await redis.eval(  # type: ignore[union-attr]
                     _LUA_CONCURRENT_CHECK, 1, key, now_ms, max_concurrent,
-                    request_id, timeout_ms
+                    member, timeout_ms
                 )
                 allowed, current, limit = int(result[0]), int(result[1]), int(result[2])
                 concurrent_remaining = max(0, limit - current)
@@ -217,8 +250,13 @@ async def check_rate_limits(
     )
 
 
-async def release_concurrent(request_id: str, rules: list[dict[str, Any]]) -> None:
-    """Release concurrent semaphore slot after stream ends."""
+async def release_concurrent(member: str, rules: list[dict[str, Any]]) -> None:
+    """Release the concurrent semaphore slot acquired at check time.
+
+    ``member`` MUST be the same server-side token passed to
+    :func:`check_rate_limits`. Releasing by a client-controllable id would let a
+    caller free *other* requests' slots (or fail to free their own).
+    """
     with suppress(RedisError):
         redis = get_redis()
         for rule in rules:
@@ -227,12 +265,25 @@ async def release_concurrent(request_id: str, rules: list[dict[str, Any]]) -> No
                 rule_id = rule.get("id", 0)
                 subject_key = _subject_key(rule)
                 key = f"rl:conc:{rule_id}:{subject_key}"
-                await redis.zrem(key, request_id)
+                await redis.zrem(key, member)
 
 
-async def refund_tpm(request_id: str, rules: list[dict[str, Any]], refund_tokens: int) -> None:
-    """Refund TPM tokens when actual usage is less than estimated."""
-    if refund_tokens <= 0:
+async def settle_tpm(request_id: str, rules: list[dict[str, Any]], delta_tokens: int) -> None:
+    """Reconcile the upfront TPM reservation against actual usage.
+
+    ``delta_tokens`` is ``ESTIMATED_TOKENS_PER_REQUEST - actual_tokens``:
+
+    - **Positive** (actual < estimate): refund the unused reservation, capped at
+      the bucket limit so the bucket never exceeds capacity.
+    - **Negative** (actual > estimate): deduct the over-consumption beyond the
+      upfront estimate so the bucket reflects *real* token usage. Without this,
+      TPM would only ever bill the flat estimate per request — i.e. limiting on
+      request count, not tokens. The bucket may go into debt and recover via the
+      normal time-based refill, which correctly throttles heavy callers.
+
+    A zero delta is a no-op.
+    """
+    if delta_tokens == 0:
         return
     with suppress(RedisError):
         redis = get_redis()
@@ -242,8 +293,10 @@ async def refund_tpm(request_id: str, rules: list[dict[str, Any]], refund_tokens
                 rule_id = rule.get("id", 0)
                 subject_key = _subject_key(rule)
                 key = f"rl:tpm:{rule_id}:{subject_key}"
-                # Add back tokens (capped at limit)
-                await redis.hincrby(key, "tokens", refund_tokens)
+                await cast(
+                    "Awaitable[Any]",
+                    redis.eval(_LUA_TPM_SETTLE, 1, key, str(delta_tokens), str(tpm_limit)),
+                )
 
 
 def _subject_key(rule: dict[str, Any]) -> str:

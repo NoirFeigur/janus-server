@@ -140,7 +140,11 @@ class QuotaEnforcer:
         if failed:
             failed_index = result[1]
             failed_quota = quotas[failed_index]
-            current = Decimal(result[2])
+            # result[2] is the raw Redis counter (micro-units for cost); convert
+            # back to points so `current` is comparable with `limit_value`.
+            current = self._points_from_redis(
+                failed_quota.metric, Decimal(result[2])
+            )
             raise QuotaLimitExceeded(
                 QuotaExceeded(quota=failed_quota, current=current)
             )
@@ -148,7 +152,7 @@ class QuotaEnforcer:
         warnings: list[QuotaWarning] = []
         for key, quota in zip(keys, quotas, strict=True):
             count = await self._count(redis, key)
-            current = Decimal(count)
+            current = self._points_from_redis(quota.metric, Decimal(count))
             if not quota.enforce and current > quota.limit_value:
                 warnings.append(
                     QuotaWarning(
@@ -387,6 +391,19 @@ class QuotaEnforcer:
         if quota.metric == QuotaMetric.cost.value:
             return quota.limit_value * Decimal(1_000_000)
         return quota.limit_value
+
+    @staticmethod
+    def _points_from_redis(metric: str, raw: Decimal) -> Decimal:
+        """Convert a raw Redis counter back to user-facing units.
+
+        Cost is stored in micro-units (×1_000_000) for integer precision; every
+        value surfaced to a caller (429 ``current``, soft-limit warnings) must be
+        divided back to cost points so it is comparable with ``limit_value``.
+        Tokens/requests are stored 1:1 and pass through unchanged.
+        """
+        if metric == QuotaMetric.cost.value:
+            return raw / Decimal(1_000_000)
+        return raw
 
     @staticmethod
     def _period_key(period: str) -> str:

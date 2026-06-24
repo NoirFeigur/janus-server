@@ -11,7 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.admin.catalog.schemas import (
     ChannelKeyCreate,
     LogicalModelCreate,
+    LogicalModelUpdate,
     ModelDeploymentCreate,
+    ModelDeploymentUpdate,
     UpstreamChannelCreate,
 )
 from src.admin.catalog.service import CatalogService
@@ -35,6 +37,17 @@ ACTOR = AuthenticatedUser(
     department_id=10,
     permissions=frozenset({"*:*:*"}),
     role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
+)
+
+# Holds catalog wildcard but is NOT superadmin and has no seeded roles, so
+# resolve_data_scope yields a restricted scope (unrestricted=False). Used to
+# prove model/deployment writes enforce scope (M3-1).
+RESTRICTED_ACTOR = AuthenticatedUser(
+    user_id=2000,
+    username="restricted",
+    department_id=20,
+    permissions=frozenset({"ai:catalog:*"}),
+    role_codes=frozenset(),
 )
 
 
@@ -179,3 +192,106 @@ async def test_delete_channel_soft_deletes(admin_session: AsyncSession) -> None:
         await svc.get_channel(channel.id)
 
     assert exc.value.status_code == 404
+
+
+async def test_create_model_restricted_scope_forbidden(
+    admin_session: AsyncSession,
+) -> None:
+    svc = CatalogService(admin_session)
+
+    with pytest.raises(AppError) as exc:
+        await svc.create_model(_model_payload(), actor=RESTRICTED_ACTOR)
+
+    assert exc.value.status_code == 403
+
+
+async def test_update_model_restricted_scope_forbidden(
+    admin_session: AsyncSession,
+) -> None:
+    svc = CatalogService(admin_session)
+    model = await svc.create_model(_model_payload(), actor=ACTOR)
+
+    with pytest.raises(AppError) as exc:
+        await svc.update_model(
+            model.id, LogicalModelUpdate(display_name="x"), actor=RESTRICTED_ACTOR
+        )
+
+    assert exc.value.status_code == 403
+
+
+async def test_delete_model_restricted_scope_forbidden(
+    admin_session: AsyncSession,
+) -> None:
+    svc = CatalogService(admin_session)
+    model = await svc.create_model(_model_payload(), actor=ACTOR)
+
+    with pytest.raises(AppError) as exc:
+        await svc.delete_model(model.id, actor=RESTRICTED_ACTOR)
+
+    assert exc.value.status_code == 403
+
+
+async def test_create_deployment_restricted_scope_forbidden(
+    admin_session: AsyncSession,
+) -> None:
+    svc = CatalogService(admin_session)
+    channel = await svc.create_channel(_channel_payload(), actor=ACTOR)
+    model = await svc.create_model(_model_payload(), actor=ACTOR)
+
+    with pytest.raises(AppError) as exc:
+        await svc.create_deployment(
+            ModelDeploymentCreate(
+                logical_model_id=model.id,
+                channel_id=channel.id,
+                upstream_model="claude-3-5-sonnet",
+            ),
+            actor=RESTRICTED_ACTOR,
+        )
+
+    assert exc.value.status_code == 403
+
+
+async def test_update_deployment_restricted_scope_forbidden(
+    admin_session: AsyncSession,
+) -> None:
+    svc = CatalogService(admin_session)
+    channel = await svc.create_channel(_channel_payload(), actor=ACTOR)
+    model = await svc.create_model(_model_payload(), actor=ACTOR)
+    deployment = await svc.create_deployment(
+        ModelDeploymentCreate(
+            logical_model_id=model.id,
+            channel_id=channel.id,
+            upstream_model="claude-3-5-sonnet",
+        ),
+        actor=ACTOR,
+    )
+
+    with pytest.raises(AppError) as exc:
+        await svc.update_deployment(
+            deployment.id,
+            ModelDeploymentUpdate(weight=5),
+            actor=RESTRICTED_ACTOR,
+        )
+
+    assert exc.value.status_code == 403
+
+
+async def test_delete_deployment_restricted_scope_forbidden(
+    admin_session: AsyncSession,
+) -> None:
+    svc = CatalogService(admin_session)
+    channel = await svc.create_channel(_channel_payload(), actor=ACTOR)
+    model = await svc.create_model(_model_payload(), actor=ACTOR)
+    deployment = await svc.create_deployment(
+        ModelDeploymentCreate(
+            logical_model_id=model.id,
+            channel_id=channel.id,
+            upstream_model="claude-3-5-sonnet",
+        ),
+        actor=ACTOR,
+    )
+
+    with pytest.raises(AppError) as exc:
+        await svc.delete_deployment(deployment.id, actor=RESTRICTED_ACTOR)
+
+    assert exc.value.status_code == 403

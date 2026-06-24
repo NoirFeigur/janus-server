@@ -11,7 +11,7 @@ from src.auth.service import AuthenticatedUser
 from src.core.pagination import PageResult
 from src.core.query import ListQuery
 from src.db.models.rate_limit import RateLimitRule
-from src.enums import ErrorCode
+from src.enums import ErrorCode, RateLimitScope
 from src.exceptions import AppError
 
 
@@ -21,6 +21,34 @@ class RateLimitService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.repo = RateLimitRepository(session)
+
+    async def _validate_subject(
+        self, payload: RateLimitRuleCreate, *, actor: AuthenticatedUser
+    ) -> None:
+        """Authorize + validate the rule's subject before persisting.
+
+        - A platform-wide (``global``) rule is a blast-radius-wide control, so it
+          is restricted to super-admins; a scoped admin must not throttle the
+          whole platform.
+        - For concrete scopes the referenced subject must actually exist, else a
+          rule silently targets a non-existent id (schema already guarantees a
+          non-null ``subject_id`` for these scopes).
+        """
+        if payload.subject_type == RateLimitScope.global_:
+            if not actor.is_superuser:
+                raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+            return
+
+        subject_id = payload.subject_id
+        assert subject_id is not None  # guaranteed by RateLimitRuleCreate validator
+        if payload.subject_type == RateLimitScope.user:
+            exists = await self.repo.user_exists(subject_id)
+        elif payload.subject_type == RateLimitScope.department:
+            exists = await self.repo.department_exists(subject_id)
+        else:  # RateLimitScope.api_key (enum is exhaustive; global_ returned above)
+            exists = await self.repo.api_key_exists(subject_id)
+        if not exists:
+            raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
     async def list_rules(
         self,
@@ -42,14 +70,15 @@ class RateLimitService:
     async def get_rule(self, rule_id: int) -> RateLimitRule:
         rule = await self.repo.get_by_id(rule_id)
         if rule is None:
-            raise AppError(ErrorCode.resource_not_found, status.HTTP_404_NOT_FOUND)
+            raise AppError(ErrorCode.request_invalid, status.HTTP_404_NOT_FOUND)
         return rule
 
     async def create_rule(
         self, payload: RateLimitRuleCreate, *, actor: AuthenticatedUser
     ) -> RateLimitRule:
+        await self._validate_subject(payload, actor=actor)
         rule = RateLimitRule(
-            subject_type=payload.subject_type,
+            subject_type=payload.subject_type.value,
             subject_id=payload.subject_id,
             logical_model_id=payload.logical_model_id,
             rpm_limit=payload.rpm_limit,

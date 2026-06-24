@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 
 
 class GatewayLogRead(BaseModel):
@@ -29,6 +29,15 @@ class GatewayLogRead(BaseModel):
     created_at: str | None = None
 
     model_config = {"from_attributes": True}
+
+    @field_serializer("id")
+    def _ser_id(self, value: int) -> str:
+        # Snowflake IDs exceed JS Number.MAX_SAFE_INTEGER; serialize as string.
+        return str(value)
+
+    @field_serializer("user_id", "api_key_id", "logical_model_id", "channel_id")
+    def _ser_optional_id(self, value: int | None) -> str | None:
+        return str(value) if value is not None else None
 
 
 class QueueHealthRead(BaseModel):

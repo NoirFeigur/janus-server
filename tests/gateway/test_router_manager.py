@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -69,3 +70,48 @@ async def test_separate_bursts_trigger_separate_rebuilds(
         worker.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker
+
+
+@pytest.mark.asyncio
+async def test_old_router_closed_after_grace_not_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D: a superseded Router must close only AFTER the grace window, so in-flight
+    requests holding it can drain instead of having their sessions torn down."""
+    monkeypatch.setattr(RouterManager, "_router_close_grace_seconds", 0.1)
+    monkeypatch.setattr(RouterManager, "_pending_close_tasks", set())
+    router = AsyncMock()
+
+    RouterManager._schedule_router_close(cast("Any", router))
+
+    # Immediately after scheduling, the old Router must still be open.
+    await asyncio.sleep(0.02)
+    router.close.assert_not_awaited()
+
+    # After the grace window elapses, it is closed exactly once.
+    await asyncio.sleep(0.15)
+    router.close.assert_awaited_once()
+    assert not RouterManager._pending_close_tasks
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flushes_pending_router_close_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D: shutdown must not wait out the grace window — it flushes pending closes
+    (close runs in the task's `finally`, so no Router session is leaked)."""
+    monkeypatch.setattr(RouterManager, "_router_close_grace_seconds", 1000.0)
+    monkeypatch.setattr(RouterManager, "_pending_close_tasks", set())
+    monkeypatch.setattr(RouterManager, "_poll_task", None)
+    monkeypatch.setattr(RouterManager, "_sub_task", None)
+    monkeypatch.setattr(RouterManager, "_debounce_task", None)
+    router = AsyncMock()
+
+    RouterManager._schedule_router_close(cast("Any", router))
+    await asyncio.sleep(0.02)  # let the close task start sleeping
+    router.close.assert_not_awaited()
+
+    await RouterManager.shutdown()
+
+    router.close.assert_awaited_once()
+    assert not RouterManager._pending_close_tasks

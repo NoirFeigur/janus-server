@@ -97,6 +97,14 @@ class CredentialService:
     ) -> tuple[ApiKey, str]:
         if not await self.repo.user_exists(payload.user_id):
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
+        # An sk-key is a plaintext bearer credential. Minting one *for another
+        # user* lets the actor impersonate them, so it requires superuser or a
+        # dedicated grant — data-scope membership alone is not sufficient. Issuing
+        # one's own key only needs the endpoint's base ``ai:credential:add`` perm.
+        if payload.user_id != actor.user_id and not actor.has_permission(
+            "ai:credential:issue"
+        ):
+            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
         await self._require_owner_in_scope(payload.user_id, actor)
 
         plain_key = f"sk-{secrets.token_hex(24)}"

@@ -184,7 +184,9 @@ class CatalogService:
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
     async def _check_catalog_write_access(
-        self, actor: AuthenticatedUser, resource: ChannelKey | UpstreamChannel
+        self,
+        actor: AuthenticatedUser,
+        resource: ChannelKey | UpstreamChannel | LogicalModel | ModelDeployment,
     ) -> None:
         self._require_catalog_wildcard(actor)
         scope = await self._scope(actor)
@@ -401,6 +403,7 @@ class CatalogService:
     async def create_model(
         self, payload: LogicalModelCreate, *, actor: AuthenticatedUser
     ) -> LogicalModel:
+        await self._require_catalog_create_access(actor)
         await self._ensure_model_name_unique(payload.name)
         model = LogicalModel(
             name=payload.name,
@@ -429,6 +432,7 @@ class CatalogService:
         actor: AuthenticatedUser,
     ) -> LogicalModel:
         model = await self._require_model(model_id)
+        await self._check_catalog_write_access(actor, model)
         values = payload.model_dump(exclude_unset=True)
         name = values.get("name")
         if name is not None:
@@ -442,6 +446,7 @@ class CatalogService:
 
     async def delete_model(self, model_id: int, *, actor: AuthenticatedUser) -> None:
         model = await self._require_model(model_id)
+        await self._check_catalog_write_access(actor, model)
         if await self.models.count_active_deployments(model_id) > 0:
             raise AppError(ErrorCode.request_conflict, status.HTTP_409_CONFLICT)
 
@@ -480,6 +485,7 @@ class CatalogService:
     async def create_deployment(
         self, payload: ModelDeploymentCreate, *, actor: AuthenticatedUser
     ) -> ModelDeployment:
+        await self._require_catalog_create_access(actor)
         await self._require_active_model(payload.logical_model_id)
         await self._require_active_channel(payload.channel_id)
         await self._ensure_deployment_unique(
@@ -511,6 +517,7 @@ class CatalogService:
         actor: AuthenticatedUser,
     ) -> ModelDeployment:
         deployment = await self._require_deployment(deployment_id)
+        await self._check_catalog_write_access(actor, deployment)
         values = payload.model_dump(exclude_unset=True)
         logical_model_id = values.get("logical_model_id", deployment.logical_model_id)
         channel_id = values.get("channel_id", deployment.channel_id)
@@ -535,6 +542,7 @@ class CatalogService:
         self, deployment_id: int, *, actor: AuthenticatedUser
     ) -> None:
         deployment = await self._require_deployment(deployment_id)
+        await self._check_catalog_write_access(actor, deployment)
         deployment.updated_by = actor.user_id
         await self.deployments.soft_delete(deployment)
         add_after_commit_hook(self.session, _publish_router_invalidation)

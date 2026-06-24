@@ -65,8 +65,8 @@ async def finalize_gateway_request(
     # 5. Channel health recording
     await _record_channel_health(ctx)
 
-    # 6. TPM reservation refund (estimated tokens reserved upfront - actual used)
-    await _refund_tpm(ctx, rate_limit_rules=rate_limit_rules)
+    # 6. TPM reservation settlement (reconcile estimate vs actual, both ways)
+    await _settle_tpm(ctx, rate_limit_rules=rate_limit_rules)
 
 
 # ---------------------------------------------------------------------------
@@ -233,23 +233,28 @@ async def _record_channel_health(ctx: GatewayRequestContext) -> None:
         await svc.record_and_evaluate(ctx.channel_id, success=success, error_class=error_class)
 
 
-async def _refund_tpm(
+async def _settle_tpm(
     ctx: GatewayRequestContext,
     *,
     rate_limit_rules: list[dict[str, Any]] | None,
 ) -> None:
-    """Refund the unused portion of the upfront TPM reservation.
+    """Reconcile the upfront TPM reservation against actual usage (both ways).
 
     Each request reserves ``ESTIMATED_TOKENS_PER_REQUEST`` tokens against the
-    TPM bucket before the upstream call.  Once actual usage is known, give back
-    the difference (estimated - actual) so the bucket reflects real consumption.
-    Errors and zero-token requests refund the full reservation.
+    TPM bucket before the upstream call. Once actual usage is known, settle the
+    signed difference ``estimated - actual``:
+
+    - actual **below** the estimate refunds the unused portion;
+    - actual **above** the estimate deducts the overage so the bucket reflects
+      real token consumption (otherwise TPM degenerates into a request-count
+      limit of ``estimate`` tokens each).
+
+    Errors and zero-token requests refund the full reservation (delta == estimate).
     """
     if not rate_limit_rules:
         return
     with suppress(Exception):
-        from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST, refund_tpm
+        from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST, settle_tpm
 
-        refund_tokens = ESTIMATED_TOKENS_PER_REQUEST - ctx.total_tokens
-        if refund_tokens > 0:
-            await refund_tpm(ctx.request_id, rate_limit_rules, refund_tokens)
+        delta_tokens = ESTIMATED_TOKENS_PER_REQUEST - ctx.total_tokens
+        await settle_tpm(ctx.request_id, rate_limit_rules, delta_tokens)

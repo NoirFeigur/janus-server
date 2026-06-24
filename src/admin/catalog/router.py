@@ -446,7 +446,7 @@ async def list_changelog(
 ) -> SuccessEnvelope[Page[dict]]:
     """List catalog change log entries."""
     from sqlalchemy import desc as sa_desc
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     from src.db.models.catalog_ops import CatalogChangeLog
 
@@ -463,16 +463,15 @@ async def list_changelog(
     else:
         stmt = stmt.order_by(CatalogChangeLog.id)
 
-    # Count
-    count_stmt = select(CatalogChangeLog.id)
+    # Count (DB-side aggregate — never materialize rows just to count them).
+    count_stmt = select(func.count()).select_from(CatalogChangeLog)
     if resource_type is not None:
         count_stmt = count_stmt.where(CatalogChangeLog.resource_type == resource_type)
     if action is not None:
         count_stmt = count_stmt.where(CatalogChangeLog.action == action)
     if actor_id is not None:
         count_stmt = count_stmt.where(CatalogChangeLog.actor_id == actor_id)
-    count_result = await service.session.execute(count_stmt)
-    total = len(count_result.all())
+    total = int(await service.session.scalar(count_stmt) or 0)
 
     stmt = stmt.offset(offset).limit(limit)
     result = await service.session.execute(stmt)

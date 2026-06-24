@@ -4,6 +4,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
+from redis.exceptions import RedisError
 
 from src.auth.service import AuthenticatedUser
 from src.db.models.model_catalog import LogicalModel
@@ -139,3 +140,29 @@ async def test_check_quota_exceeded_raises_429() -> None:
     assert exc_info.value.code == ErrorCode.quota_exceeded
     assert exc_info.value.status_code == 429
     assert exc_info.value.params["current"] == "2"
+
+
+async def test_check_quota_redis_down_fails_closed_503() -> None:
+    """E: a Redis outage during the quota check must fail CLOSED (503), not 500.
+
+    Quota is spend control; allowing traffic through blind would risk unbounded
+    overspend. The pre-flight check translates RedisError to a transient 503.
+    """
+    service = _service()
+    quota = Quota(
+        id=1,
+        scope=QuotaScope.user.value,
+        scope_id=100,
+        logical_model_id=10,
+        period=QuotaPeriod.daily.value,
+        metric=QuotaMetric.requests.value,
+        limit_value=Decimal("10"),
+    )
+    service.repo.get_active_quotas.return_value = [quota]
+    service.quota.check_and_increment.side_effect = RedisError("connection refused")
+
+    with pytest.raises(AppError) as exc_info:
+        await service.check_quota(100, 10)
+
+    assert exc_info.value.code == ErrorCode.service_unavailable
+    assert exc_info.value.status_code == 503

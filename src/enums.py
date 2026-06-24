@@ -127,4 +127,5 @@ class ErrorCode(StrEnum):
     upstream_rate_limited = "upstream.rate_limited"  # Upstream pool is rate-limited.
     request_invalid = "request.invalid"  # Request payload or parameters are invalid.
     request_conflict = "request.conflict"  # Write violates a uniqueness/FK constraint.
+    service_unavailable = "service.unavailable"  # Backend dep (Redis) down; transient/retryable.
     internal_error = "internal.error"  # Unexpected platform error.

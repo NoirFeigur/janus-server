@@ -418,6 +418,22 @@ class AsyncRedisDouble:
             self._zsets[key] = zs
             return [1, count + 1, limit]
 
+        # TPM settle script detection: signed-delta reconciliation (unique
+        # marker: "delta" ARGV). Applies estimated-minus-actual to the bucket,
+        # capped at limit; no-op when the key is absent. Mirrors _LUA_TPM_SETTLE.
+        if "delta" in script:
+            key = keys[0]
+            delta = int(argv[0])
+            limit = int(argv[1])
+            if key not in self._hashes:
+                return [0]
+            h = self._hashes[key]
+            tokens = int(h.get("tokens", "0")) + delta
+            if tokens > limit:
+                tokens = limit
+            h["tokens"] = str(tokens)
+            return [1]
+
         # TPM script detection: HMGET + HSET pattern
         if "HMGET" in script and "HSET" in script:
             key = keys[0]

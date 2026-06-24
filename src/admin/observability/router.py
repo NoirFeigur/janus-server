@@ -32,7 +32,9 @@ ServiceDep = Annotated[ObservabilityService, Depends(get_observability_service)]
 async def list_gateway_logs(
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:observability:list"))],
+    actor: Annotated[
+        AuthenticatedUser, Depends(RequiredPerms("ai:observability:list"))
+    ],
     user_id: int | None = None,
     model: str | None = None,
     channel_id: int | None = None,
@@ -52,6 +54,7 @@ async def list_gateway_logs(
             limit=limit,
             offset=offset,
         ),
+        actor=actor,
         user_id=user_id,
         model=model,
         channel_id=channel_id,
@@ -75,16 +78,18 @@ async def get_gateway_log(
     request_id: str,
     service: ServiceDep,
     trace_id: TraceId,
-    _: Annotated[AuthenticatedUser, Depends(RequiredPerms("ai:observability:query"))],
+    actor: Annotated[
+        AuthenticatedUser, Depends(RequiredPerms("ai:observability:query"))
+    ],
 ) -> SuccessEnvelope[GatewayLogRead]:
     from starlette import status as http_status
 
     from src.enums import ErrorCode
     from src.exceptions import AppError
 
-    log = await service.get_log_by_request_id(request_id)
+    log = await service.get_log_by_request_id(request_id, actor=actor)
     if log is None:
-        raise AppError(ErrorCode.resource_not_found, http_status.HTTP_404_NOT_FOUND)
+        raise AppError(ErrorCode.request_invalid, http_status.HTTP_404_NOT_FOUND)
     return success(GatewayLogRead.model_validate(log), trace_id=trace_id)
 
 

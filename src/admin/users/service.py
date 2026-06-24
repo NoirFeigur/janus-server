@@ -44,7 +44,7 @@ from src.core.query import BatchResult, ListQuery, resolve_sort
 from src.core.security import hash_password_async, password_strength_violations
 from src.db.models.identity import Department, Role, User
 from src.db.session import add_after_commit_hook
-from src.enums import DataScope, ErrorCode, UserStatus
+from src.enums import ActiveStatus, DataScope, ErrorCode, UserStatus
 from src.exceptions import AppError
 
 UserDetail = tuple[User, list[int]]
@@ -107,10 +107,16 @@ class UserService:
     async def _validate_roles(self, role_ids: Sequence[int]) -> None:
         if not role_ids:
             return
+        # Roles must exist, be non-deleted, AND be active. Assigning a disabled
+        # role would silently confer no effect now yet re-activate its grants the
+        # moment an admin re-enables it — a non-disabled role is the only valid
+        # assignment target. A disabled role drops out of the result set and trips
+        # the set-equality check below → 400 request_invalid.
         stmt = (
             select(Role.id)
             .where(Role.id.in_(role_ids))
             .where(Role.is_deleted.is_(False))
+            .where(Role.status == ActiveStatus.active.value)
         )
         result = await self.session.scalars(stmt)
         if set(result.all()) != set(role_ids):

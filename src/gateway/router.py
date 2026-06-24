@@ -88,6 +88,7 @@ async def anthropic_messages(
 ) -> JSONResponse | StreamingResponse:
     payload = await _parse_body(request, AnthropicRequest)
     request_id = _request_id(request)
+    rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, payload.model)
 
     # P2: Rate limiting (before quota reservation)
@@ -96,6 +97,7 @@ async def anthropic_messages(
         user=user,
         logical_model_id=logical_model.id,
         request_id=request_id,
+        member=rl_member,
         is_stream=payload.stream,
     )
 
@@ -161,6 +163,7 @@ async def anthropic_messages(
                 service=service,
                 started_at=started_at,
                 request_id=request_id,
+                member=rl_member,
                 channel_id=channel_id,
                 upstream_model=upstream_model,
                 rate_limit_rules=rate_limit_rules,
@@ -215,6 +218,7 @@ async def gemini_generate_content(
 ) -> JSONResponse | StreamingResponse:
     payload = await _parse_body(request, GeminiRequest)
     request_id = _request_id(request)
+    rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, model_name)
 
     stream = request.url.path.endswith(":streamGenerateContent")
@@ -225,6 +229,7 @@ async def gemini_generate_content(
         user=user,
         logical_model_id=logical_model.id,
         request_id=request_id,
+        member=rl_member,
         is_stream=stream,
     )
 
@@ -294,6 +299,7 @@ async def gemini_generate_content(
                 service=service,
                 started_at=started_at,
                 request_id=request_id,
+                member=rl_member,
                 channel_id=channel_id,
                 upstream_model=upstream_model,
                 rate_limit_rules=rate_limit_rules,
@@ -369,9 +375,14 @@ async def _check_rate_limits(
     user: AuthenticatedUser,
     logical_model_id: int,
     request_id: str,
+    member: str,
     is_stream: bool,
 ) -> list[dict[str, Any]]:
     """Enforce rate limits before quota reservation (P2).
+
+    ``member`` is a server-side unguessable token (not the client-controllable
+    request id) used as the RPM/concurrent sorted-set member; the same value
+    must be passed to ``release_concurrent`` in the stream finally block.
 
     Returns the applicable rules so the caller can release the concurrent slot
     in the stream finally block.  Raises 429 if any limit is exceeded.
@@ -380,6 +391,7 @@ async def _check_rate_limits(
     if rules:
         rl_result = await check_rate_limits(
             request_id=request_id,
+            member=member,
             rules=rules,
             estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
             is_stream=is_stream,
@@ -403,6 +415,7 @@ async def _execute_completion(
     params: dict[str, Any],
 ) -> JSONResponse | StreamingResponse:
     request_id = _request_id(request)
+    rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, requested_model)
 
     # P2: Rate limiting (before quota reservation)
@@ -411,6 +424,7 @@ async def _execute_completion(
         user=user,
         logical_model_id=logical_model.id,
         request_id=request_id,
+        member=rl_member,
         is_stream=stream,
     )
 
@@ -500,6 +514,7 @@ async def _execute_completion(
                 service=service,
                 started_at=started_at,
                 request_id=request_id,
+                member=rl_member,
                 rate_limit_rules=rate_limit_rules,
                 quota_reservations=quota_reservations,
             ),
@@ -560,6 +575,7 @@ async def _stream_openai(
     service: GatewayService,
     started_at: float,
     request_id: str,
+    member: str,
     rate_limit_rules: list[dict[str, Any]] | None = None,
     quota_reservations: list[QuotaReservation] | None = None,
 ) -> AsyncIterator[str]:
@@ -636,7 +652,10 @@ async def _stream_openai(
         )
         # Release concurrent semaphore slot acquired at rate-limit check.
         if rate_limit_rules:
-            await release_concurrent(request_id, rate_limit_rules)
+            await release_concurrent(member, rate_limit_rules)
+        # Close the upstream iterator so aborted streams (idle timeout, max
+        # duration, client disconnect) don't leak the upstream connection.
+        await _aclose_response(response)
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +671,7 @@ async def _stream_anthropic_native(
     service: GatewayService,
     started_at: float,
     request_id: str,
+    member: str,
     channel_id: int | None,
     upstream_model: str | None,
     rate_limit_rules: list[dict[str, Any]] | None = None,
@@ -722,7 +742,10 @@ async def _stream_anthropic_native(
         )
         # Release concurrent semaphore slot acquired at rate-limit check.
         if rate_limit_rules:
-            await release_concurrent(request_id, rate_limit_rules)
+            await release_concurrent(member, rate_limit_rules)
+        # Close the upstream iterator so aborted streams (idle timeout, max
+        # duration, client disconnect) don't leak the upstream connection.
+        await _aclose_response(response)
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +761,7 @@ async def _stream_gemini_native(
     service: GatewayService,
     started_at: float,
     request_id: str,
+    member: str,
     channel_id: int | None,
     upstream_model: str | None,
     rate_limit_rules: list[dict[str, Any]] | None = None,
@@ -807,7 +831,10 @@ async def _stream_gemini_native(
         )
         # Release concurrent semaphore slot acquired at rate-limit check.
         if rate_limit_rules:
-            await release_concurrent(request_id, rate_limit_rules)
+            await release_concurrent(member, rate_limit_rules)
+        # Close the upstream iterator so aborted streams (idle timeout, max
+        # duration, client disconnect) don't leak the upstream connection.
+        await _aclose_response(response)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1079,23 @@ def _latency_ms(started_at: float) -> int:
 
 def _request_id(request: Request) -> str:
     return getattr(request.state, "trace_id", None) or str(uuid4())
+
+
+async def _aclose_response(response: Any) -> None:
+    """Close an upstream streaming response, swallowing any close-time error.
+
+    litellm streaming wrappers expose ``aclose()`` (CustomStreamWrapper) over the
+    underlying provider iterator. When a stream is abandoned mid-flight (idle
+    timeout, max-duration cap, client disconnect, upstream error) the generator's
+    ``finally`` must close it, otherwise the upstream HTTP connection is leaked
+    back to the pool unconsumed. Best-effort: a missing ``aclose`` or a close-time
+    exception must never mask the original outcome.
+    """
+    aclose = getattr(response, "aclose", None)
+    if aclose is None:
+        return
+    with suppress(Exception):
+        await aclose()
 
 
 def _quota_headers(quota_result: QuotaCheckResult) -> dict[str, str]:

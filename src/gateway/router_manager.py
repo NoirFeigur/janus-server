@@ -29,10 +29,19 @@ class RouterManager:
     # sessions under in-flight requests). We coalesce a burst into a single rebuild
     # by waiting for a short quiet window; each new event resets the timer.
     _debounce_seconds: float = 1.5
+    # Grace period before closing a *superseded* Router. A rebuild swaps the live
+    # reference atomically, but requests that already obtained the old Router via
+    # get_router() are still streaming through its aiohttp/Redis sessions. Closing
+    # inline tore those sessions down mid-flight (connection-reset errors). We
+    # defer the close so in-flight requests drain first. (Very long streams beyond
+    # this window are an accepted edge for a config hot-reload; the next rebuild
+    # will not affect already-started streams that completed within the grace.)
+    _router_close_grace_seconds: float = 60.0
     _invalidate_event: asyncio.Event = asyncio.Event()
     _poll_task: asyncio.Task[None] | None = None
     _sub_task: asyncio.Task[None] | None = None
     _debounce_task: asyncio.Task[None] | None = None
+    _pending_close_tasks: set[asyncio.Task[None]] = set()
     _session_factory: async_sessionmaker[AsyncSession] | None = None
 
     @classmethod
@@ -53,6 +62,13 @@ class RouterManager:
         cls._poll_task = None
         cls._sub_task = None
         cls._debounce_task = None
+        # Flush deferred Router closes: cancelling triggers the close in `finally`,
+        # so superseded Routers release their sessions before the process exits.
+        for close_task in list(cls._pending_close_tasks):
+            close_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await close_task
+        cls._pending_close_tasks.clear()
 
     @classmethod
     async def rebuild(cls, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -68,15 +84,35 @@ class RouterManager:
             new_router = build_router(rows)
             old_router = cls._router
             cls._router = new_router
-            # Close old router to release aiohttp sessions / Redis connections
+            # Defer closing the old Router so in-flight requests holding it can
+            # drain; closing inline tore down their sessions mid-stream.
             if old_router is not None:
-                with suppress(Exception):
-                    await old_router.close()  # type-safe: litellm Router exposes close()
+                cls._schedule_router_close(old_router)
             _log.info(
                 "gateway.router.rebuilt",
                 deployments=len(rows),
                 degraded_excluded=len(degraded_ids),
             )
+
+    @classmethod
+    def _schedule_router_close(cls, router: Router) -> None:
+        """Close ``router`` after the grace period, tracking the task for shutdown."""
+        task = asyncio.create_task(cls._close_router_after_grace(router))
+        cls._pending_close_tasks.add(task)
+        task.add_done_callback(cls._pending_close_tasks.discard)
+
+    @classmethod
+    async def _close_router_after_grace(cls, router: Router) -> None:
+        """Wait the grace window, then close the Router.
+
+        The close runs in ``finally`` so a shutdown-time cancellation still
+        releases the Router's aiohttp/Redis sessions instead of leaking them.
+        """
+        try:
+            await asyncio.sleep(cls._router_close_grace_seconds)
+        finally:
+            with suppress(Exception):
+                await router.close()  # type-safe: litellm Router exposes close()
 
     @classmethod
     def get_router(cls) -> Router:

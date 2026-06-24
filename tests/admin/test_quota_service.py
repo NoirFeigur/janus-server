@@ -11,8 +11,9 @@ from src.admin.quota.schemas import QuotaCreate, QuotaUpdate
 from src.admin.quota.service import QuotaService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
-from src.db.models.identity import User
+from src.db.models.identity import Role, User, UserRole
 from src.db.models.model_catalog import LogicalModel
+from src.enums import DataScope
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -24,6 +25,36 @@ ACTOR = AuthenticatedUser(
     permissions=frozenset({"*:*:*"}),
     role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
 )
+
+# Unrestricted data scope (via an all_data role) but NOT superadmin. Sees every
+# department/user quota, yet platform-level `global` quotas must stay hidden — it
+# isolates the M3-5 global-leak gate on the list path.
+UNRESTRICTED_NON_SUPER = AuthenticatedUser(
+    user_id=2000,
+    username="scoped-admin",
+    department_id=20,
+    permissions=frozenset({"ai:quota:list"}),
+    role_codes=frozenset(),
+)
+
+
+async def _seed_unrestricted_role(session: AsyncSession, *, user_id: int) -> None:
+    """Give ``user_id`` an active all_data role (unrestricted, non-superadmin)."""
+    session.add(
+        Role(
+            id=900,
+            name="platform-admin",
+            code="platform_admin",
+            status="active",
+            data_scope=DataScope.all_data.value,
+        )
+    )
+    session.add(
+        User(id=user_id, username="scoped-admin", employee_no="E900", status="active")
+    )
+    await session.flush()
+    session.add(UserRole(user_id=user_id, role_id=900))
+    await session.commit()
 
 
 def _quota_payload(**overrides: object) -> QuotaCreate:
@@ -126,3 +157,47 @@ async def test_delete_quota_soft_deletes(admin_session: AsyncSession) -> None:
         await svc.get_quota(quota.id, actor=ACTOR)
 
     assert exc.value.status_code == 404
+
+
+async def test_list_quotas_unrestricted_non_super_excludes_global(
+    admin_session: AsyncSession,
+) -> None:
+    """M3-5: an unrestricted (all_data) non-superuser lists every user/department
+    quota but must NOT see platform-level `global` quotas on the list path."""
+    await _seed_user(admin_session)
+    await _seed_unrestricted_role(
+        admin_session, user_id=UNRESTRICTED_NON_SUPER.user_id
+    )
+    svc = QuotaService(admin_session)
+    user_quota = await svc.create_quota(_quota_payload(), actor=ACTOR)
+    global_quota = await svc.create_quota(
+        _quota_payload(scope="global", scope_id=None, logical_model_id=None),
+        actor=ACTOR,
+    )
+
+    page = await svc.list_quotas(actor=UNRESTRICTED_NON_SUPER)
+
+    visible_ids = {q.id for q in page.items}
+    assert user_quota.id in visible_ids
+    assert global_quota.id not in visible_ids
+    assert page.total == 1
+
+
+async def test_list_quotas_superuser_sees_global(
+    admin_session: AsyncSession,
+) -> None:
+    """M3-5 control: the superuser still sees global quotas (include_global)."""
+    await _seed_user(admin_session)
+    svc = QuotaService(admin_session)
+    user_quota = await svc.create_quota(_quota_payload(), actor=ACTOR)
+    global_quota = await svc.create_quota(
+        _quota_payload(scope="global", scope_id=None, logical_model_id=None),
+        actor=ACTOR,
+    )
+
+    page = await svc.list_quotas(actor=ACTOR)
+
+    visible_ids = {q.id for q in page.items}
+    assert user_quota.id in visible_ids
+    assert global_quota.id in visible_ids
+    assert page.total == 2

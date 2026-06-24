@@ -22,7 +22,14 @@ class QuotaRepository(BaseRepository[Quota]):
         self, scope_filter: DataScope, *, actor_id: int, include_global: bool
     ) -> ColumnElement[bool] | None:
         if scope_filter.unrestricted:
-            return None
+            # An `all_data` role sees every department/user quota, but
+            # platform-level `global` quotas stay superuser-only. ``include_global``
+            # is set iff the actor is a superuser, so an unrestricted *non*-superuser
+            # must still have global rows filtered out (write/get paths already gate
+            # global on is_superuser; this closes the list-path leak).
+            if include_global:
+                return None
+            return Quota.scope != "global"
         clauses: list[ColumnElement[bool]] = []
         if include_global:
             clauses.append(Quota.scope == "global")

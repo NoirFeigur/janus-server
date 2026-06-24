@@ -49,6 +49,19 @@ def _quota(*, limit: str, enforce: bool = True) -> Quota:
     )
 
 
+def _cost_quota(*, limit: str, enforce: bool = True) -> Quota:
+    return Quota(
+        id=1,
+        scope=QuotaScope.user.value,
+        scope_id=100,
+        logical_model_id=10,
+        period=QuotaPeriod.daily.value,
+        metric=QuotaMetric.cost.value,
+        limit_value=Decimal(limit),
+        enforce=enforce,
+    )
+
+
 async def test_check_and_increment_passes_under_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -91,6 +104,49 @@ async def test_check_and_increment_warns_when_soft_quota_exceeded(
     assert len(result.warnings) == 1
     assert result.warnings[0].current == Decimal("2")
     assert result.warnings[0].limit == Decimal("1")
+
+
+async def test_cost_quota_exceeded_reports_current_in_points_not_micro_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F: a cost quota stores micro-units (×1e6) in Redis, but the 429 `current`
+    must be reported in cost POINTS so it is comparable with `limit_value`.
+
+    Limit is 10 points (10_000_000 micro-units). We pre-seed the counter to the
+    limit, so the next reservation (+1 micro-unit) trips the hard quota. The raw
+    Redis value is 10_000_001 micro-units, which must surface as 10.000001 points
+    — NOT the raw micro-unit integer."""
+    redis = FakeRedis()
+    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
+    quota = _cost_quota(limit="10")
+    enforcer = QuotaEnforcer()
+    # Seed the counter right at the limit (10 points = 10_000_000 micro-units).
+    redis._data[enforcer._key(100, 10, quota)] = 10_000_000
+
+    with pytest.raises(QuotaLimitExceeded) as exc_info:
+        await enforcer.check_and_increment(100, 10, [quota])
+
+    # +1 micro-unit → 10_000_001 raw, reported as 10.000001 points (not 10000001).
+    assert exc_info.value.exceeded.current == Decimal("10.000001")
+
+
+async def test_cost_quota_soft_warning_current_in_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F: the soft-limit warning `current` is also in points (micro-units / 1e6)."""
+    redis = FakeRedis()
+    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
+    quota = _cost_quota(limit="5", enforce=False)
+    enforcer = QuotaEnforcer()
+    # Seed above the 5-point limit: 6_000_000 micro-units = 6 points.
+    redis._data[enforcer._key(100, 10, quota)] = 6_000_000
+
+    result = await enforcer.check_and_increment(100, 10, [quota])
+
+    assert len(result.warnings) == 1
+    # 6_000_001 micro-units → 6.000001 points; limit stays 5 points.
+    assert result.warnings[0].current == Decimal("6.000001")
+    assert result.warnings[0].limit == Decimal("5")
 
 
 async def test_compensate_decrements_counter(monkeypatch: pytest.MonkeyPatch) -> None:

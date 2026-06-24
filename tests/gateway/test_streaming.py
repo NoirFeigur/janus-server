@@ -281,6 +281,7 @@ async def test_stream_anthropic_native_pipes_bytes_and_extracts_usage() -> None:
             service=fake_service,
             started_at=0.0,
             request_id="req-1",
+            member="m-1",
             channel_id=42,
             upstream_model="anthropic/claude-sonnet-4-20250514",
         ):
@@ -332,6 +333,7 @@ async def test_stream_anthropic_native_records_usage() -> None:
             service=fake_service,
             started_at=0.0,
             request_id="req-u",
+            member="m-u",
             channel_id=7,
             upstream_model="anthropic/claude-sonnet-4-20250514",
         ):
@@ -390,6 +392,7 @@ async def test_stream_gemini_native_pipes_bytes_and_extracts_usage() -> None:
             service=fake_service,
             started_at=0.0,
             request_id="req-g",
+            member="m-g",
             channel_id=99,
             upstream_model="gemini/gemini-2.0-flash",
         ):
@@ -433,6 +436,7 @@ async def test_stream_gemini_native_records_usage() -> None:
             service=fake_service,
             started_at=0.0,
             request_id="req-gu",
+            member="m-gu",
             channel_id=11,
             upstream_model="gemini/gemini-2.0-flash",
         ):
@@ -480,13 +484,129 @@ async def test_stream_anthropic_releases_concurrent_slot() -> None:
             service=fake_service,
             started_at=0.0,
             request_id="req-rel",
+            member="m-rel",
             channel_id=7,
             upstream_model="anthropic/claude-sonnet-4-20250514",
             rate_limit_rules=rules,
         ):
             pass
 
-    mock_release.assert_awaited_once_with("req-rel", rules)
+    mock_release.assert_awaited_once_with("m-rel", rules)
+
+
+# ---------------------------------------------------------------------------
+# C: upstream iterator is closed in the stream finally (connection-leak guard)
+# ---------------------------------------------------------------------------
+
+
+class _ClosableByteStream:
+    """An async byte iterator that records whether ``aclose()`` was called.
+
+    Mirrors litellm's CustomStreamWrapper surface: it is its own async iterator
+    and exposes ``aclose()``. Used to prove the stream finally closes the
+    upstream so an abandoned stream cannot leak the upstream connection.
+    """
+
+    def __init__(self, chunks: list[bytes], *, abort_after: int | None = None) -> None:
+        self._chunks = chunks
+        self._index = 0
+        self._abort_after = abort_after
+        self.aclose_calls = 0
+
+    def __aiter__(self) -> _ClosableByteStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._abort_after is not None and self._index >= self._abort_after:
+            raise RuntimeError("simulated upstream failure mid-stream")
+        if self._index >= len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self._index]
+        self._index += 1
+        return chunk
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_stream_anthropic_closes_upstream_on_normal_completion() -> None:
+    """The upstream iterator is closed once the stream drains normally."""
+    sse_chunks = _make_anthropic_sse(
+        ("message_start", {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 5, "output_tokens": 0}},
+        }),
+        ("message_stop", {"type": "message_stop"}),
+    )
+    upstream = _ClosableByteStream(sse_chunks)
+
+    fake_service = AsyncMock()
+    fake_service.repo = AsyncMock()
+    fake_service.repo.get_active_quotas = AsyncMock(return_value=[])
+    fake_service.quota = AsyncMock()
+
+    with patch(
+        "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
+    ):
+        async for _ in _stream_anthropic_native(
+            response=upstream,
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=fake_service,
+            started_at=0.0,
+            request_id="req-close",
+            member="m-close",
+            channel_id=7,
+            upstream_model="anthropic/claude-sonnet-4-20250514",
+        ):
+            pass
+
+    assert upstream.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_gemini_closes_upstream_on_abort() -> None:
+    """An upstream that fails mid-stream is still closed in the finally block.
+
+    Regression for bug C: without ``_aclose_response`` in the finally, an aborted
+    stream (idle timeout, max-duration cap, client disconnect, upstream error)
+    abandons the upstream iterator and leaks the connection.
+    """
+    sse_chunks = _make_gemini_sse(
+        {"candidates": [{"content": {"parts": [{"text": "partial"}]}}]},
+        {"candidates": [{"content": {"parts": [{"text": "never reached"}]}}]},
+    )
+    upstream = _ClosableByteStream(sse_chunks, abort_after=1)
+
+    fake_service = AsyncMock()
+    fake_service.repo = AsyncMock()
+    fake_service.repo.get_active_quotas = AsyncMock(return_value=[])
+    fake_service.quota = AsyncMock()
+
+    collected: list[bytes] = []
+    with (
+        patch(
+            "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
+        ),
+        pytest.raises(Exception),  # noqa: B017 - re-raised as upstream error
+    ):
+        async for chunk in _stream_gemini_native(
+            response=upstream,
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=fake_service,
+            started_at=0.0,
+            request_id="req-abort",
+            member="m-abort",
+            channel_id=11,
+            upstream_model="gemini/gemini-2.0-flash",
+        ):
+            collected.append(chunk)
+
+    # One chunk made it through before the abort, and the upstream was closed.
+    assert collected == sse_chunks[:1]
+    assert upstream.aclose_calls == 1
 
 
 @pytest.mark.asyncio
@@ -520,6 +640,7 @@ async def test_stream_gemini_no_release_without_rules() -> None:
             service=fake_service,
             started_at=0.0,
             request_id="req-gu2",
+            member="m-gu2",
             channel_id=11,
             upstream_model="gemini/gemini-2.0-flash",
         ):
@@ -551,6 +672,7 @@ async def test_check_rate_limits_returns_rules_when_allowed() -> None:
             user=FakeUser(),
             logical_model_id=1,
             request_id="req-rl",
+            member="m-rl",
             is_stream=True,
         )
 
@@ -582,6 +704,7 @@ async def test_check_rate_limits_raises_429_when_denied() -> None:
                 user=FakeUser(),
                 logical_model_id=1,
                 request_id="req-rl",
+                member="m-rl",
                 is_stream=False,
             )
 
@@ -603,6 +726,7 @@ async def test_check_rate_limits_skips_check_when_no_rules() -> None:
             user=FakeUser(),
             logical_model_id=1,
             request_id="req-rl",
+            member="m-rl",
             is_stream=True,
         )
 

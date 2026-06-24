@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
+from src.db.models.credential import ApiKey
+from src.db.models.identity import Department, User
 from src.db.models.rate_limit import RateLimitRule
 
 SORT_COLUMNS = {
@@ -43,31 +45,33 @@ class RateLimitRepository:
         if status is not None:
             stmt = stmt.where(RateLimitRule.status == status)
 
-        order_col = resolve_sort(SORT_COLUMNS, query.sort_by, default=RateLimitRule.id)
-        if query.sort_order == "desc":
-            stmt = stmt.order_by(desc(order_col))
-        else:
-            stmt = stmt.order_by(order_col)
+        order_col, is_desc = resolve_sort(query, allowed=SORT_COLUMNS, default="id")
+        stmt = stmt.order_by(desc(order_col) if is_desc else order_col)
 
         # Count
-        count_stmt = select(RateLimitRule.id).where(RateLimitRule.is_deleted == False)  # noqa: E712
+        count_stmt = select(func.count()).select_from(RateLimitRule).where(
+            RateLimitRule.is_deleted == False  # noqa: E712
+        )
         if subject_type is not None:
             count_stmt = count_stmt.where(RateLimitRule.subject_type == subject_type)
         if subject_id is not None:
             count_stmt = count_stmt.where(RateLimitRule.subject_id == subject_id)
         if logical_model_id is not None:
-            count_stmt = count_stmt.where(RateLimitRule.logical_model_id == logical_model_id)
+            count_stmt = count_stmt.where(
+                RateLimitRule.logical_model_id == logical_model_id
+            )
         if status is not None:
             count_stmt = count_stmt.where(RateLimitRule.status == status)
 
-        count_result = await self.session.execute(count_stmt)
-        total = len(count_result.all())
+        total = await self.session.scalar(count_stmt) or 0
 
         stmt = stmt.offset(query.offset).limit(query.limit)
         result = await self.session.execute(stmt)
         items = list(result.scalars().all())
 
-        return page_result(items=items, total=total, limit=query.limit, offset=query.offset)
+        return page_result(
+            items=items, total=int(total), limit=query.limit, offset=query.offset
+        )
 
     async def get_by_id(self, rule_id: int) -> RateLimitRule | None:
         result = await self.session.execute(
@@ -76,6 +80,24 @@ class RateLimitRepository:
             .where(RateLimitRule.is_deleted == False)  # noqa: E712
         )
         return result.scalar_one_or_none()
+
+    async def user_exists(self, user_id: int) -> bool:
+        stmt = select(User.id).where(
+            User.id == user_id, User.is_deleted == False  # noqa: E712
+        )
+        return await self.session.scalar(stmt) is not None
+
+    async def department_exists(self, dept_id: int) -> bool:
+        stmt = select(Department.id).where(
+            Department.id == dept_id, Department.is_deleted == False  # noqa: E712
+        )
+        return await self.session.scalar(stmt) is not None
+
+    async def api_key_exists(self, key_id: int) -> bool:
+        stmt = select(ApiKey.id).where(
+            ApiKey.id == key_id, ApiKey.is_deleted == False  # noqa: E712
+        )
+        return await self.session.scalar(stmt) is not None
 
     async def create(self, rule: RateLimitRule) -> RateLimitRule:
         self.session.add(rule)

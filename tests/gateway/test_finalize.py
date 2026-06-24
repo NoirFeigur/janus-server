@@ -124,13 +124,13 @@ async def test_finalize_individual_step_failure_does_not_block_others(
 
 
 # ---------------------------------------------------------------------------
-# M6: TPM reservation refund (estimated tokens reserved upfront - actual used)
+# M6 / A: TPM reservation settlement (reconcile estimate vs actual, both ways)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_finalize_refunds_unused_tpm(fake_redis: AsyncRedisDouble) -> None:
-    """Actual usage below the upfront reservation refunds the difference."""
+    """Actual usage below the upfront reservation settles a positive delta (refund)."""
     from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST
 
     rules = [{"id": 1, "tpm_limit": 10000, "subject_type": "user", "subject_id": 1}]
@@ -142,22 +142,28 @@ async def test_finalize_refunds_unused_tpm(fake_redis: AsyncRedisDouble) -> None
     )
 
     with patch(
-        "src.gateway.rate_limit.refund_tpm", new_callable=AsyncMock
-    ) as mock_refund:
+        "src.gateway.rate_limit.settle_tpm", new_callable=AsyncMock
+    ) as mock_settle:
         await finalize_gateway_request(ctx, rate_limit_rules=rules)
 
-    mock_refund.assert_awaited_once()
-    call_request_id, call_rules, call_refund = mock_refund.await_args[0]
+    mock_settle.assert_awaited_once()
+    call_request_id, call_rules, call_delta = mock_settle.await_args[0]
     assert call_request_id == "req-tpm"
     assert call_rules == rules
-    assert call_refund == ESTIMATED_TOKENS_PER_REQUEST - 30
+    assert call_delta == ESTIMATED_TOKENS_PER_REQUEST - 30  # positive refund
 
 
 @pytest.mark.asyncio
-async def test_finalize_no_tpm_refund_when_usage_exceeds_estimate(
+async def test_finalize_deducts_tpm_overage_when_usage_exceeds_estimate(
     fake_redis: AsyncRedisDouble,
 ) -> None:
-    """Actual usage at/above the reservation refunds nothing (no negative refund)."""
+    """Actual usage above the reservation settles a NEGATIVE delta (extra deduction).
+
+    Regression for bug A: the old refund-only path skipped this case entirely, so
+    over-consumption beyond the flat estimate was never billed to the TPM bucket.
+    """
+    from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST
+
     rules = [{"id": 1, "tpm_limit": 10000, "subject_type": "user", "subject_id": 1}]
     ctx = GatewayRequestContext(
         user_id=1,
@@ -167,26 +173,29 @@ async def test_finalize_no_tpm_refund_when_usage_exceeds_estimate(
     )
 
     with patch(
-        "src.gateway.rate_limit.refund_tpm", new_callable=AsyncMock
-    ) as mock_refund:
+        "src.gateway.rate_limit.settle_tpm", new_callable=AsyncMock
+    ) as mock_settle:
         await finalize_gateway_request(ctx, rate_limit_rules=rules)
 
-    mock_refund.assert_not_called()
+    mock_settle.assert_awaited_once()
+    _request_id, _rules, call_delta = mock_settle.await_args[0]
+    assert call_delta == ESTIMATED_TOKENS_PER_REQUEST - 5000  # negative deduction
+    assert call_delta < 0
 
 
 @pytest.mark.asyncio
-async def test_finalize_no_tpm_refund_without_rules(
+async def test_finalize_no_tpm_settle_without_rules(
     fake_redis: AsyncRedisDouble,
 ) -> None:
-    """No rate-limit rules means no TPM reservation to refund."""
+    """No rate-limit rules means no TPM reservation to settle."""
     ctx = GatewayRequestContext(user_id=1, total_tokens=10)
 
     with patch(
-        "src.gateway.rate_limit.refund_tpm", new_callable=AsyncMock
-    ) as mock_refund:
+        "src.gateway.rate_limit.settle_tpm", new_callable=AsyncMock
+    ) as mock_settle:
         await finalize_gateway_request(ctx)
 
-    mock_refund.assert_not_called()
+    mock_settle.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

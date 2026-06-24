@@ -177,6 +177,47 @@ async def test_create_user_with_roles(admin_session: AsyncSession) -> None:
     assert role_ids == [role.id]
 
 
+async def test_create_user_disabled_role_rejected(
+    admin_session: AsyncSession,
+) -> None:
+    """M3-6: assigning a *disabled* role is rejected (400). A disabled role
+    confers nothing now but would silently re-activate its grants the moment an
+    admin re-enables it — only an active role is a valid assignment target."""
+    role = Role(name="dis", code="dis-role", data_scope="self", status="disabled")
+    admin_session.add(role)
+    await admin_session.commit()
+    svc = UserService(admin_session)
+    with pytest.raises(AppError) as exc:
+        await svc.create_user(
+            UserCreate(username="z", employee_no="E-z", role_ids=[role.id]),
+            _superuser(),
+        )
+    assert exc.value.code is ErrorCode.request_invalid
+    assert exc.value.status_code == 400
+    # Nothing persisted.
+    assert (
+        await admin_session.scalar(select(User).where(User.username == "z"))
+    ) is None
+
+
+async def test_update_user_assign_disabled_role_rejected(
+    admin_session: AsyncSession,
+) -> None:
+    """M3-6: the same active-role gate applies on update_user role replacement."""
+    active = Role(name="act", code="act-role", data_scope="self", status="active")
+    disabled = Role(name="dis2", code="dis-role2", data_scope="self", status="disabled")
+    admin_session.add_all([active, disabled])
+    await admin_session.commit()
+    svc = UserService(admin_session)
+    user, _ = await svc.create_user(
+        UserCreate(username="upd-dis", employee_no="E-ud", role_ids=[active.id]),
+        _superuser(),
+    )
+    with pytest.raises(AppError) as exc:
+        await svc.update_user(user.id, UserUpdate(role_ids=[disabled.id]), _superuser())
+    assert exc.value.status_code == 400
+
+
 async def test_get_user_not_visible_raises(admin_session: AsyncSession) -> None:
     svc = UserService(admin_session)
     with pytest.raises(AppError) as exc:
