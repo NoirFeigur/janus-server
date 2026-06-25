@@ -173,7 +173,7 @@ async def test_get_active_quotas_matches_user_and_global(
     gateway_session.add_all([matching_user, matching_global, wrong_user, disabled])
     await gateway_session.flush()
 
-    quotas = await GatewayRepository(gateway_session).get_active_quotas(100, model.id)
+    quotas = await GatewayRepository(gateway_session).get_active_quotas(100, None, model.id)
 
     assert {quota.id for quota in quotas} == {matching_user.id, matching_global.id}
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 
 from src.gateway.rate_limit import (
+    ESTIMATED_TOKENS_PER_REQUEST,
     check_rate_limits,
+    estimate_request_tokens,
     release_concurrent,
     settle_tpm,
 )
@@ -322,3 +324,37 @@ async def test_later_rule_denial_rolls_back_prior_concurrent_slot(
 async def test_empty_rules_allowed(fake_redis: AsyncRedisDouble) -> None:
     result = await check_rate_limits(request_id="req-1", member="m-1", rules=[])
     assert result.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# Upfront TPM estimate — cross-provider input shapes
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_tokens_openai_chat_content() -> None:
+    messages = [{"role": "user", "content": "x" * 8000}]
+    # 8000 chars / 4 chars-per-token = 2000, well above the default floor.
+    assert estimate_request_tokens(messages) == 2000
+
+
+def test_estimate_tokens_anthropic_content_blocks() -> None:
+    messages = [{"role": "user", "content": [{"type": "text", "text": "z" * 8000}]}]
+    assert estimate_request_tokens(messages) == 2000
+
+
+def test_estimate_tokens_gemini_parts_not_collapsed_to_floor() -> None:
+    # Gemini carries text under contents[].parts[].text. A regression here made a
+    # multi-thousand-char Gemini prompt estimate the default 100-token floor,
+    # letting a large prompt bypass a tight TPM bucket on its first request.
+    contents = [{"role": "user", "parts": [{"text": "g" * 8000}]}]
+    assert estimate_request_tokens(contents) == 2000
+
+
+def test_estimate_tokens_gemini_multi_parts() -> None:
+    contents = [{"role": "user", "parts": [{"text": "a" * 4000}, {"text": "b" * 4000}]}]
+    assert estimate_request_tokens(contents) == 2000
+
+
+def test_estimate_tokens_empty_input_falls_back_to_floor() -> None:
+    assert estimate_request_tokens([]) == ESTIMATED_TOKENS_PER_REQUEST
+    assert estimate_request_tokens([{"role": "user", "parts": []}]) == ESTIMATED_TOKENS_PER_REQUEST

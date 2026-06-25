@@ -43,6 +43,30 @@ def test_fingerprint_differs_on_temperature() -> None:
     assert fp1 != fp2
 
 
+def test_fingerprint_differs_on_frequency_penalty() -> None:
+    # Params that change output (but were excluded by the old allowlist) MUST key
+    # separately, otherwise two requests share one cache entry and the gateway
+    # returns a response computed under different parameters.
+    msgs = [{"role": "user", "content": "hello"}]
+    fp1 = compute_fingerprint("gpt-4", msgs, {"temperature": 0.0, "frequency_penalty": 0.0})
+    fp2 = compute_fingerprint("gpt-4", msgs, {"temperature": 0.0, "frequency_penalty": 2.0})
+    assert fp1 != fp2
+
+
+def test_fingerprint_differs_on_stop() -> None:
+    msgs = [{"role": "user", "content": "hello"}]
+    fp1 = compute_fingerprint("gpt-4", msgs, {"temperature": 0.0})
+    fp2 = compute_fingerprint("gpt-4", msgs, {"temperature": 0.0, "stop": ["X"]})
+    assert fp1 != fp2
+
+
+def test_fingerprint_differs_on_presence_penalty() -> None:
+    msgs = [{"role": "user", "content": "hello"}]
+    fp1 = compute_fingerprint("gpt-4", msgs, {"temperature": 0.0, "presence_penalty": 0.0})
+    fp2 = compute_fingerprint("gpt-4", msgs, {"temperature": 0.0, "presence_penalty": 1.5})
+    assert fp1 != fp2
+
+
 # ---------------------------------------------------------------------------
 # Eligibility
 # ---------------------------------------------------------------------------
@@ -57,20 +81,33 @@ def test_is_cacheable_request_disabled() -> None:
 
 
 def test_is_cacheable_request_n_greater_than_1() -> None:
-    assert is_cacheable_request(stream=False, response_cache_enabled=True, params={"n": 2}) is False
+    assert (
+        is_cacheable_request(
+            stream=False, response_cache_enabled=True, params={"n": 2, "temperature": 0}
+        )
+        is False
+    )
 
 
 def test_is_cacheable_request_tools() -> None:
     assert (
         is_cacheable_request(
-            stream=False, response_cache_enabled=True, params={"tools": [{"type": "function"}]}
+            stream=False,
+            response_cache_enabled=True,
+            params={"temperature": 0, "tools": [{"type": "function"}]},
         )
         is False
     )
 
 
 def test_is_cacheable_request_eligible() -> None:
-    assert is_cacheable_request(stream=False, response_cache_enabled=True, params={}) is True
+    # Explicit temperature=0 is the only deterministic-eligible case.
+    assert (
+        is_cacheable_request(
+            stream=False, response_cache_enabled=True, params={"temperature": 0}
+        )
+        is True
+    )
 
 
 def test_is_cacheable_request_temperature_positive_false() -> None:
@@ -93,9 +130,11 @@ def test_is_cacheable_request_temperature_zero_true() -> None:
     )
 
 
-def test_is_cacheable_request_temperature_unset_true() -> None:
-    # unset temperature → treated as deterministic-eligible (matches prior behavior)
-    assert is_cacheable_request(stream=False, response_cache_enabled=True, params={}) is True
+def test_is_cacheable_request_temperature_unset_false() -> None:
+    # Unset temperature is NOT deterministic: providers default to ~1.0, so an
+    # unset request must NOT be cached (else a random sample is replayed for every
+    # later identical prompt). Only explicit temperature=0 caches.
+    assert is_cacheable_request(stream=False, response_cache_enabled=True, params={}) is False
 
 
 def test_is_cacheable_response_with_content() -> None:

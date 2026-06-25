@@ -75,7 +75,7 @@ def estimate_request_tokens(messages: object) -> int:
 
 
 def _count_input_chars(value: object) -> int:
-    """Best-effort character count across chat/embeddings/responses input shapes."""
+    """Best-effort character count across chat/embeddings/responses/Gemini shapes."""
     if isinstance(value, str):
         return len(value)
     if not isinstance(value, list):
@@ -85,21 +85,45 @@ def _count_input_chars(value: object) -> int:
         if isinstance(item, str):
             total_chars += len(item)
         elif isinstance(item, dict):
-            content = item.get("content")
-            if content is None:
-                # Responses API items may carry text under "text" directly.
-                text = item.get("text")
-                if isinstance(text, str):
-                    total_chars += len(text)
-            elif isinstance(content, str):
-                total_chars += len(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict):
-                        text = part.get("text")
-                        if isinstance(text, str):
-                            total_chars += len(text)
+            total_chars += _count_item_chars(item)
     return total_chars
+
+
+def _count_item_chars(item: dict[str, Any]) -> int:
+    """Count text chars in one input item across all provider message shapes.
+
+    Handled shapes:
+    - Gemini content: ``{"role": ..., "parts": [{"text": str}]}`` — the ``parts``
+      array MUST be inspected, otherwise a multi-thousand-char Gemini prompt
+      counts as 0 and the TPM upfront estimate collapses to the default floor,
+      letting a large prompt bypass a tight TPM bucket on its first request.
+    - chat content: ``{"content": str | list[{"text": str}]}``
+    - responses item: ``{"text": str}`` (text carried directly).
+    """
+    parts = item.get("parts")
+    if isinstance(parts, list):
+        return _count_parts_chars(parts)
+    content = item.get("content")
+    if content is None:
+        # Responses API items may carry text under "text" directly.
+        text = item.get("text")
+        return len(text) if isinstance(text, str) else 0
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return _count_parts_chars(content)
+    return 0
+
+
+def _count_parts_chars(parts: list[Any]) -> int:
+    """Sum ``text`` chars across a list of content/parts blocks."""
+    total = 0
+    for part in parts:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                total += len(text)
+    return total
 
 
 @dataclass(frozen=True, slots=True)

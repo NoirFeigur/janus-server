@@ -190,11 +190,8 @@ class GatewayRepository:
         self,
         user_id: int,
         department_id: int | None,
-        logical_model_id: int | None = None,
+        logical_model_id: int,
     ) -> list[Quota]:
-        if logical_model_id is None:
-            logical_model_id = int(department_id or 0)
-            department_id = None
         predicates = [
             and_(Quota.scope == QuotaScope.user.value, Quota.scope_id == user_id),
             and_(Quota.scope == QuotaScope.global_.value, Quota.scope_id.is_(None)),

@@ -88,7 +88,20 @@ class QuotaLimitExceeded(RuntimeError):
 
 
 class QuotaEnforcer:
-    """Redis-backed quota checking and compensation primitives."""
+    """Redis-backed quota checking and compensation primitives.
+
+    **Quota is a SOFT upper bound — single-request overshoot is by design.**
+    Pre-flight ``check_and_increment`` only reserves ``+1`` on each counter; the
+    real token/cost amount is reconciled in ``settle_reservations`` after the
+    upstream call completes. A request that sits exactly at the limit therefore
+    still passes pre-flight and runs to completion — only the *next* request is
+    rejected once settlement has pushed the counter over. For streaming calls the
+    final token count is unknowable up front, so this is the correct trade; the
+    consequence is that ``tokens``/``cost`` ceilings can be exceeded by at most
+    one in-flight request's worth. ``settle_reservations`` logs (does not reject)
+    a post-settlement breach. Hard, no-overshoot enforcement would require a
+    blocking pre-estimate that streaming cannot provide.
+    """
 
     def __init__(self) -> None:
         self._check_script: Any | None = None

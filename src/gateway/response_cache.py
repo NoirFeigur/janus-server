@@ -42,16 +42,20 @@ def compute_fingerprint(
 ) -> str:
     """Compute a deterministic hash of the request for cache keying.
 
-    Includes model name, messages content, and key parameters that affect output
-    (temperature, max_tokens, top_p, seed).  Excludes stream, user metadata, etc.
+    The fingerprint includes the model name, the messages content, and **every**
+    request parameter. Hashing the full param dict (rather than an allowlist of
+    sampling knobs) is deliberate: any parameter that can change the output
+    (``frequency_penalty``, ``presence_penalty``, ``stop``, ``logit_bias``,
+    ``response_format``, ``seed``, …) MUST key separately, otherwise two requests
+    differing only in such a param would collide on one cache entry and the
+    gateway would serve the wrong response. A slightly lower hit rate (e.g. a
+    differing ``user`` field keys separately) is the correct trade for never
+    returning a response computed under different parameters.
     """
     canonical: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": params.get("temperature"),
-        "max_tokens": params.get("max_tokens"),
-        "top_p": params.get("top_p"),
-        "seed": params.get("seed"),
+        "params": params,
     }
     raw = json.dumps(canonical, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
@@ -76,13 +80,16 @@ def is_cacheable_request(
     # n > 1 produces multiple choices — don't cache
     if params.get("n", 1) > 1:
         return False
-    # Non-deterministic sampling (temperature > 0) yields different output each
-    # call — caching would serve a stale sample as if fresh. Only deterministic
-    # requests (temperature == 0, or unset → treated as deterministic-eligible)
-    # are cacheable. The fingerprint embeds temperature, so a later explicit
-    # temperature=0 keys separately from an unset request.
+    # Non-deterministic sampling yields different output each call — caching would
+    # serve a stale sample as if fresh. ONLY an explicit temperature == 0 is
+    # cacheable. An UNSET temperature is NOT deterministic: OpenAI / Anthropic /
+    # Gemini all default to ~1.0, so treating "unset" as cacheable would cache a
+    # random sample and replay it for every later identical prompt. The
+    # fingerprint embeds the full params, so an explicit temperature=0 keys
+    # separately from an unset request either way.
     temperature = params.get("temperature")
-    if isinstance(temperature, (int, float)) and temperature > 0:
+    if not (isinstance(temperature, (int, float)) and not isinstance(temperature, bool)
+            and temperature == 0):
         return False
     # Tool calls are context-dependent — don't cache
     return not (params.get("tools") or params.get("tool_choice"))

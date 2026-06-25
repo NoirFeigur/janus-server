@@ -174,6 +174,16 @@ class GatewayService:
             # traffic through with the counter blind risks unbounded overspend, so
             # reject with a transient, retryable 503 rather than a 500 (which would
             # read as an unexpected bug) — and never silently bypass the limit.
+            #
+            # NOTE (operational blind spot): rate limiting fails OPEN on a Redis
+            # outage (see rate_limit.check_rate_limits) while quota fails CLOSED
+            # here. The combination is safe ONLY when a quota rule exists for the
+            # caller — quota then back-stops the open rate limiter. A user/model
+            # with NO quota rule configured has nothing to fail closed: during a
+            # Redis outage the open rate limiter admits the request and quota
+            # returns "no rules → pass", so that path is effectively unlimited.
+            # Mitigation is operational (ensure a global quota exists, monitor
+            # Redis), not code — documented so it is a known risk, not a surprise.
             _log.warning("quota.redis_unavailable", user_id=user_id)
             raise AppError(
                 ErrorCode.service_unavailable,
