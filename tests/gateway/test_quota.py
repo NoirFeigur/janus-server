@@ -68,12 +68,12 @@ async def test_check_and_increment_passes_under_limit(
     redis = FakeRedis()
     monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
 
-    result = await QuotaEnforcer().check_and_increment(100, 10, [_quota(limit="2")])
+    result = await QuotaEnforcer().check_and_increment(100, None, 10, [_quota(limit="2")])
 
     assert result.passed is True
     assert result.warnings == []
     period = QuotaEnforcer._period_key("daily")
-    assert redis._data[f"quota:100:10:{period}:requests"] == 1
+    assert redis._data[f"quota:u:100:10:{period}:requests"] == 1
 
 
 async def test_check_and_increment_raises_when_hard_quota_exceeded(
@@ -82,10 +82,10 @@ async def test_check_and_increment_raises_when_hard_quota_exceeded(
     redis = FakeRedis()
     monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
     quota = _quota(limit="1")
-    await QuotaEnforcer().check_and_increment(100, 10, [quota])
+    await QuotaEnforcer().check_and_increment(100, None, 10, [quota])
 
     with pytest.raises(QuotaLimitExceeded) as exc_info:
-        await QuotaEnforcer().check_and_increment(100, 10, [quota])
+        await QuotaEnforcer().check_and_increment(100, None, 10, [quota])
 
     assert exc_info.value.exceeded.quota is quota
     assert exc_info.value.exceeded.current == Decimal("2")
@@ -97,9 +97,9 @@ async def test_check_and_increment_warns_when_soft_quota_exceeded(
     redis = FakeRedis()
     monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
     quota = _quota(limit="1", enforce=False)
-    await QuotaEnforcer().check_and_increment(100, 10, [quota])
+    await QuotaEnforcer().check_and_increment(100, None, 10, [quota])
 
-    result = await QuotaEnforcer().check_and_increment(100, 10, [quota])
+    result = await QuotaEnforcer().check_and_increment(100, None, 10, [quota])
 
     assert len(result.warnings) == 1
     assert result.warnings[0].current == Decimal("2")
@@ -121,10 +121,10 @@ async def test_cost_quota_exceeded_reports_current_in_points_not_micro_units(
     quota = _cost_quota(limit="10")
     enforcer = QuotaEnforcer()
     # Seed the counter right at the limit (10 points = 10_000_000 micro-units).
-    redis._data[enforcer._key(100, 10, quota)] = 10_000_000
+    redis._data[enforcer._key_for_quota(100, None, 10, quota)] = 10_000_000
 
     with pytest.raises(QuotaLimitExceeded) as exc_info:
-        await enforcer.check_and_increment(100, 10, [quota])
+        await enforcer.check_and_increment(100, None, 10, [quota])
 
     # +1 micro-unit → 10_000_001 raw, reported as 10.000001 points (not 10000001).
     assert exc_info.value.exceeded.current == Decimal("10.000001")
@@ -139,26 +139,14 @@ async def test_cost_quota_soft_warning_current_in_points(
     quota = _cost_quota(limit="5", enforce=False)
     enforcer = QuotaEnforcer()
     # Seed above the 5-point limit: 6_000_000 micro-units = 6 points.
-    redis._data[enforcer._key(100, 10, quota)] = 6_000_000
+    redis._data[enforcer._key_for_quota(100, None, 10, quota)] = 6_000_000
 
-    result = await enforcer.check_and_increment(100, 10, [quota])
+    result = await enforcer.check_and_increment(100, None, 10, [quota])
 
     assert len(result.warnings) == 1
     # 6_000_001 micro-units → 6.000001 points; limit stays 5 points.
     assert result.warnings[0].current == Decimal("6.000001")
     assert result.warnings[0].limit == Decimal("5")
-
-
-async def test_compensate_decrements_counter(monkeypatch: pytest.MonkeyPatch) -> None:
-    redis = FakeRedis()
-    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
-    quota = _quota(limit="2")
-    enforcer = QuotaEnforcer()
-    await enforcer.check_and_increment(100, 10, [quota])
-
-    await enforcer.compensate(100, 10, [quota])
-
-    assert redis._data[enforcer._key(100, 10, quota)] == 0
 
 
 async def test_period_key_daily_format() -> None:

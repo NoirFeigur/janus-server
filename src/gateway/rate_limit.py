@@ -5,10 +5,12 @@ Implements three admission controls:
 2. TPM — token bucket (hash: tokens + last_ts; refills tokens/min).
 3. Concurrent — streaming semaphore (sorted set: score=started_ms, member=request_id).
 
-All checks run BEFORE quota reservation.  RPM is never refunded; TPM reserves
-estimated tokens upfront and settles the signed difference with actuals (refund
-when under-estimated, extra deduction when over-estimated); concurrent is
-released in stream finally.
+All checks run BEFORE quota reservation.  RPM is not refunded on normal
+completion (it counts attempts over a sliding window); it IS returned on the
+rollback path when a later gate rejects a request that already passed RPM.  TPM
+reserves estimated tokens upfront and settles the signed difference with actuals
+(refund when under-estimated, extra deduction when over-estimated); concurrent
+is released in stream finally.
 """
 
 from __future__ import annotations
@@ -40,6 +42,15 @@ _CHARS_PER_TOKEN = 4
 # bills the actual overage at finalize time.
 _MAX_UPFRONT_ESTIMATE = 4000
 
+# TPM bucket TTL. MUST outlive the longest possible request so settlement still
+# finds the bucket. A stream may run up to ``_STREAM_MAX_DURATION_SECONDS`` (30
+# min, mirrored in router._STREAM_MAX_DURATION_SECONDS) before settle_tpm runs;
+# at the old 2-min TTL the bucket expired mid-stream, so _LUA_TPM_SETTLE hit
+# ``EXISTS == 0`` and silently dropped every over-estimate deduction — letting a
+# heavy long-stream caller bypass TPM entirely. 30 min + 1 min slack covers the
+# cap plus finalize latency.
+_TPM_BUCKET_TTL_MS = 1_860_000
+
 
 def estimate_request_tokens(messages: object) -> int:
     """Estimate prompt tokens for an upfront TPM reservation.
@@ -49,14 +60,38 @@ def estimate_request_tokens(messages: object) -> int:
     against a 30k-TPM bucket cannot bypass the limit by reserving only 100
     tokens upfront and relying on settle-time reconciliation. The estimate is
     capped so a malicious payload cannot starve the bucket.
+
+    Accepts the several input shapes the gateway endpoints carry:
+
+    - chat ``messages``: ``list[{"content": str | list[{"text": str}]}]``
+    - embeddings ``input``: ``str`` or ``list[str]``
+    - responses ``input``: ``str`` or ``list`` of strings/dicts
     """
-    if not isinstance(messages, list):
+    total_chars = _count_input_chars(messages)
+    if total_chars <= 0:
         return ESTIMATED_TOKENS_PER_REQUEST
+    estimate = max(ESTIMATED_TOKENS_PER_REQUEST, total_chars // _CHARS_PER_TOKEN)
+    return min(estimate, _MAX_UPFRONT_ESTIMATE)
+
+
+def _count_input_chars(value: object) -> int:
+    """Best-effort character count across chat/embeddings/responses input shapes."""
+    if isinstance(value, str):
+        return len(value)
+    if not isinstance(value, list):
+        return 0
     total_chars = 0
-    for msg in messages:
-        if isinstance(msg, dict):
-            content = msg.get("content")
-            if isinstance(content, str):
+    for item in value:
+        if isinstance(item, str):
+            total_chars += len(item)
+        elif isinstance(item, dict):
+            content = item.get("content")
+            if content is None:
+                # Responses API items may carry text under "text" directly.
+                text = item.get("text")
+                if isinstance(text, str):
+                    total_chars += len(text)
+            elif isinstance(content, str):
                 total_chars += len(content)
             elif isinstance(content, list):
                 for part in content:
@@ -64,10 +99,7 @@ def estimate_request_tokens(messages: object) -> int:
                         text = part.get("text")
                         if isinstance(text, str):
                             total_chars += len(text)
-    if total_chars <= 0:
-        return ESTIMATED_TOKENS_PER_REQUEST
-    estimate = max(ESTIMATED_TOKENS_PER_REQUEST, total_chars // _CHARS_PER_TOKEN)
-    return min(estimate, _MAX_UPFRONT_ESTIMATE)
+    return total_chars
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,12 +131,20 @@ redis.call('ZREMRANGEBYSCORE', key, '-inf', now_ms - window_ms)
 local count = redis.call('ZCARD', key)
 
 if count >= limit then
-    return {0, count, limit}
+    -- Oldest in-window entry's score (ms). It frees a slot once it ages out of
+    -- the window, so the precise retry-after is (oldest + window - now), not a
+    -- flat 60s. ZRANGE WITHSCORES returns {member, score}; -1 on empty.
+    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+    local oldest_score = -1
+    if oldest[2] ~= nil then
+        oldest_score = tonumber(oldest[2])
+    end
+    return {0, count, limit, oldest_score}
 end
 
 redis.call('ZADD', key, now_ms, member)
 redis.call('PEXPIRE', key, window_ms + 1000)
-return {1, count + 1, limit}
+return {1, count + 1, limit, -1}
 """
 
 # TPM token bucket check: reserve tokens if available.
@@ -114,6 +154,7 @@ local now_ms = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
 local request_tokens = tonumber(ARGV[3])
 local refill_rate = tonumber(ARGV[4])
+local ttl_ms = tonumber(ARGV[5])
 
 local data = redis.call('HMGET', key, 'tokens', 'ts')
 local tokens = tonumber(data[1]) or limit
@@ -130,7 +171,7 @@ end
 
 tokens = tokens - request_tokens
 redis.call('HSET', key, 'tokens', tokens, 'ts', now_ms)
-redis.call('PEXPIRE', key, 120000)
+redis.call('PEXPIRE', key, ttl_ms)
 return {1, tokens, limit}
 """
 
@@ -142,6 +183,7 @@ _LUA_TPM_SETTLE = """
 local key = KEYS[1]
 local delta = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
+local ttl_ms = tonumber(ARGV[3])
 
 if redis.call('EXISTS', key) == 0 then
     return 0
@@ -153,7 +195,7 @@ if tokens > limit then
     tokens = limit
 end
 redis.call('HSET', key, 'tokens', tokens)
-redis.call('PEXPIRE', key, 120000)
+redis.call('PEXPIRE', key, ttl_ms)
 return 1
 """
 
@@ -241,11 +283,19 @@ async def check_rate_limits(
                 allowed, current, limit = int(result[0]), int(result[1]), int(result[2])
                 rpm_remaining = max(0, limit - current)
                 if not allowed:
+                    # Precise retry-after: the oldest in-window request frees a
+                    # slot once it ages out. result[3] is its score (ms); fall
+                    # back to the full window when unavailable.
+                    oldest_score = int(result[3]) if len(result) > 3 else -1
+                    if oldest_score >= 0:
+                        retry_after = max(1, (oldest_score + 60000 - now_ms + 999) // 1000)
+                    else:
+                        retry_after = 60
                     await _rollback()
                     return RateLimitCheckResult(
                         allowed=False,
                         rpm_remaining=0,
-                        retry_after_seconds=60,
+                        retry_after_seconds=retry_after,
                         denied_reason="rpm_exceeded",
                     )
 
@@ -263,6 +313,7 @@ async def check_rate_limits(
                     tpm_burst_limit,
                     estimated_tokens,
                     refill_rate,
+                    _TPM_BUCKET_TTL_MS,
                 )
                 allowed, current, limit = int(result[0]), int(result[1]), int(result[2])
                 tpm_remaining = current if allowed else 0
@@ -308,6 +359,29 @@ async def check_rate_limits(
         tpm_remaining=tpm_remaining,
         concurrent_remaining=concurrent_remaining,
     )
+
+
+async def release_rpm(member: str, rules: list[dict[str, Any]]) -> None:
+    """Remove this request's RPM sliding-window entry.
+
+    Used only on the rollback path: when a *later* admission gate (quota) rejects
+    a request that already passed RPM, the request never executes, so its RPM
+    slot should be returned to keep the rollback symmetric with TPM/concurrent.
+    ``member`` MUST be the same server-side token passed to
+    :func:`check_rate_limits` — removing by a client-controllable id would let a
+    caller evict *other* requests' RPM entries.
+
+    Note: this is NOT called on normal completion. A request that actually ran
+    keeps consuming its RPM slot for the full window (RPM counts attempts).
+    """
+    with suppress(RedisError):
+        redis = get_redis()
+        for rule in rules:
+            if rule.get("rpm_limit") is not None:
+                rule_id = rule.get("id", 0)
+                subject_key = _subject_key(rule)
+                key = f"rl:rpm:{rule_id}:{subject_key}"
+                await redis.zrem(key, member)
 
 
 async def release_concurrent(member: str, rules: list[dict[str, Any]]) -> None:
@@ -360,6 +434,7 @@ async def settle_tpm(request_id: str, rules: list[dict[str, Any]], delta_tokens:
                     key,
                     str(delta_tokens),
                     str(tpm_burst_limit),
+                    str(_TPM_BUCKET_TTL_MS),
                 )
 
 

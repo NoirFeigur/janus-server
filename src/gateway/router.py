@@ -18,6 +18,7 @@ from starlette import status
 from src.auth.dependencies import CurrentUser
 from src.auth.service import AuthenticatedUser
 from src.config import get_settings
+from src.core.logging import get_logger
 from src.db.models.model_catalog import LogicalModel
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
@@ -50,12 +51,11 @@ from src.gateway.service import GatewayService
 
 router = APIRouter(tags=["gateway"])
 
+_log = get_logger(__name__)
+
 GatewayServiceDep = Annotated[GatewayService, Depends(get_gateway_service)]
 RequestSchemaT = TypeVar("RequestSchemaT", bound=BaseModel)
 
-# 4 MiB accommodates Anthropic 200K-token requests with base64 images and
-# tool definitions; the previous 1 MiB cap rejected legitimate Claude payloads.
-_MAX_BODY_BYTES = 4 * 1_048_576
 _STREAM_MAX_DURATION_SECONDS = 1800
 _STREAM_IDLE_TIMEOUT_SECONDS = 60
 
@@ -88,6 +88,19 @@ async def _finalize_stream(
         rate_limit_rules=rate_limit_rules,
         quota_reservations=quota_reservations,
     )
+    # A stream that completed successfully but reported zero tokens almost
+    # always means SSE usage parsing failed (non-standard framing, missing
+    # usage event). That silently refunds the full quota reservation and bills
+    # nothing — a revenue/limit hole worth surfacing for ops to investigate.
+    if ctx.status == UsageStatus.success.value and ctx.total_tokens == 0:
+        _log.warning(
+            "gateway.stream.usage_unparsed",
+            request_id=ctx.request_id,
+            user_id=ctx.user_id,
+            logical_model_id=ctx.logical_model_id,
+            provider=ctx.provider,
+            upstream_model=ctx.upstream_model,
+        )
     if rate_limit_rules:
         await release_concurrent(member, rate_limit_rules)
     await _aclose_response(response)
@@ -107,6 +120,10 @@ async def _rollback_rate_limit_reservations(
         from src.gateway.rate_limit import settle_tpm
 
         await settle_tpm(request_id, rate_limit_rules, estimated_tokens)
+    with suppress(Exception):
+        from src.gateway.rate_limit import release_rpm
+
+        await release_rpm(member, rate_limit_rules)
     with suppress(Exception):
         await release_concurrent(member, rate_limit_rules)
 
@@ -435,6 +452,14 @@ async def gemini_generate_content(
 
     # Non-streaming: return native Gemini response
     usage = _extract_gemini_usage_from_response(response)
+    # litellm does not always backfill the mutable litellm_metadata dict for
+    # agenerate_content, leaving channel attribution null. The non-streaming
+    # response carries _hidden_params, so fall back to it for channel_id /
+    # upstream_model (same source the OpenAI path uses).
+    if channel_id is None or upstream_model is None:
+        fallback_channel_id, fallback_upstream_model = _extract_routing_info(response)
+        channel_id = channel_id if channel_id is not None else fallback_channel_id
+        upstream_model = upstream_model if upstream_model is not None else fallback_upstream_model
     downgraded_features = detect_downgraded_features(
         requested_features=requested_features_from_params(
             messages=payload.contents, params=native_params
@@ -478,11 +503,12 @@ async def gemini_generate_content(
 
 
 async def _parse_body(request: Request, schema: type[RequestSchemaT]) -> RequestSchemaT:
+    max_body_bytes = get_settings().gateway_max_body_bytes
     chunks: list[bytes] = []
     total = 0
     async for chunk in request.stream():
         total += len(chunk)
-        if total > _MAX_BODY_BYTES:
+        if total > max_body_bytes:
             raise AppError(
                 ErrorCode.request_invalid,
                 status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -1305,10 +1331,6 @@ def _dump_json(value: Any) -> str:
     if hasattr(value, "model_dump_json"):
         return str(value.model_dump_json())
     return json.dumps(jsonable_encoder(value), ensure_ascii=False)
-
-
-def _latency_ms(started_at: float) -> int:
-    return int((monotonic() - started_at) * 1000)
 
 
 def _request_id(request: Request) -> str:

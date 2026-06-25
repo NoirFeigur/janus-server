@@ -113,10 +113,10 @@ async def test_check_quota_delegates_to_enforcer() -> None:
     service.repo.get_active_quotas.return_value = [quota]
     service.quota.check_and_increment.return_value = result
 
-    checked = await service.check_quota(100, 10)
+    checked = await service.check_quota(100, None, 10)
 
     assert checked is result
-    service.quota.check_and_increment.assert_awaited_once_with(100, 10, [quota])
+    service.quota.check_and_increment.assert_awaited_once_with(100, None, 10, [quota])
 
 
 async def test_check_quota_exceeded_raises_429() -> None:
@@ -136,7 +136,7 @@ async def test_check_quota_exceeded_raises_429() -> None:
     )
 
     with pytest.raises(AppError) as exc_info:
-        await service.check_quota(100, 10)
+        await service.check_quota(100, None, 10)
 
     assert exc_info.value.code == ErrorCode.quota_exceeded
     assert exc_info.value.status_code == 429
@@ -163,7 +163,7 @@ async def test_check_quota_redis_down_fails_closed_503() -> None:
     service.quota.check_and_increment.side_effect = RedisError("connection refused")
 
     with pytest.raises(AppError) as exc_info:
-        await service.check_quota(100, 10)
+        await service.check_quota(100, None, 10)
 
     assert exc_info.value.code == ErrorCode.service_unavailable
     assert exc_info.value.status_code == 503

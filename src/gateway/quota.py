@@ -97,19 +97,9 @@ class QuotaEnforcer:
         self,
         user_id: int,
         department_id: int | None,
-        logical_model_id: int | Sequence[Quota],
-        quotas: Sequence[Quota] | None = None,
+        logical_model_id: int,
+        quotas: Sequence[Quota],
     ) -> QuotaCheckResult:
-        legacy_key_format = quotas is None
-        if quotas is None:
-            quotas = cast("Sequence[Quota]", logical_model_id)
-            model_id = int(department_id or 0)
-            department_id = None
-        else:
-            # mypy: narrow the int | Sequence[Quota] union now that we know the
-            # caller used the modern (logical_model_id, quotas=...) form.
-            assert isinstance(logical_model_id, int)
-            model_id = logical_model_id
         if not quotas:
             return QuotaCheckResult(passed=True)
         redis = get_redis()
@@ -117,9 +107,8 @@ class QuotaEnforcer:
             self._key_for_quota(
                 user_id,
                 department_id,
-                model_id,
+                logical_model_id,
                 quota,
-                legacy_key_format=legacy_key_format,
             )
             for quota in quotas
         ]
@@ -178,70 +167,6 @@ class QuotaEnforcer:
             for key, quota in zip(keys, quotas, strict=True)
         ]
         return QuotaCheckResult(passed=True, warnings=warnings, reservations=reservations)
-
-    async def compensate(
-        self,
-        user_id: int,
-        department_id: int | None,
-        logical_model_id: int | Sequence[Quota],
-        quotas: Sequence[Quota] | None = None,
-    ) -> None:
-        legacy_key_format = quotas is None
-        if quotas is None:
-            quotas = cast("Sequence[Quota]", logical_model_id)
-            model_id = int(department_id or 0)
-            department_id = None
-        else:
-            assert isinstance(logical_model_id, int)
-            model_id = logical_model_id
-        redis = get_redis()
-        for quota in quotas:
-            await redis.decr(
-                self._key_for_quota(
-                    user_id,
-                    department_id,
-                    model_id,
-                    quota,
-                    legacy_key_format=legacy_key_format,
-                )
-            )
-
-    async def settle(
-        self,
-        user_id: int,
-        department_id: int | None,
-        logical_model_id: int,
-        quotas: Sequence[Quota],
-        actual_tokens: int,
-        actual_cost: Decimal | None,
-    ) -> None:
-        """Adjust reservation to actual usage. Called after LLM response completes."""
-
-        redis = get_redis()
-        for quota in quotas:
-            # Pre-flight reserves 1 unit for fairness; post-flight settles actual.
-            # Under high concurrency near limits, brief over-quota is possible.
-            adjustment = self._settlement_adjustment(quota, actual_tokens, actual_cost)
-            if adjustment == 0:
-                continue
-            key = self._key_for_quota(user_id, department_id, logical_model_id, quota)
-            await redis.incrby(
-                key,
-                adjustment,
-            )
-            current = Decimal(await self._count(redis, key))
-            limit = self._redis_limit(quota)
-            if quota.enforce and current > limit:
-                logger.warning(
-                    "quota exceeded after settlement",
-                    extra={
-                        "quota_id": quota.id,
-                        "metric": quota.metric,
-                        "scope": quota.scope,
-                        "current": str(current),
-                        "limit": str(limit),
-                    },
-                )
 
     async def settle_reservations(
         self,
@@ -307,49 +232,20 @@ class QuotaEnforcer:
         return limit_value
 
     @staticmethod
-    def _settlement_adjustment(
-        quota: Quota, actual_tokens: int, actual_cost: Decimal | None
-    ) -> int:
-        if quota.metric == QuotaMetric.requests.value:
-            return 0
-        if quota.metric == QuotaMetric.tokens.value:
-            return actual_tokens - 1
-        if quota.metric == QuotaMetric.cost.value:
-            # Cost stored in micro-units (×1_000_000) for Redis integer precision.
-            # Reservation was 1 micro-unit; settle to actual micro-cost.
-            micro_cost = int((actual_cost or Decimal(0)) * 1_000_000)
-            return micro_cost - 1
-        return 0
-
-    @staticmethod
     def _key_for_quota(
         user_id: int,
         department_id: int | None,
         logical_model_id: int,
         quota: Quota,
-        *,
-        legacy_key_format: bool = False,
     ) -> str:
         model_id = quota.logical_model_id if quota.logical_model_id is not None else 0
         period_key = QuotaEnforcer._period_key(quota.period)
-        if legacy_key_format:
-            return f"quota:{user_id}:{model_id}:{period_key}:{quota.metric}"
         if quota.scope == QuotaScope.user.value:
             return f"quota:u:{user_id}:{model_id}:{period_key}:{quota.metric}"
         if quota.scope == QuotaScope.department.value:
             dept_id = quota.scope_id if quota.scope_id is not None else department_id
             return f"quota:d:{dept_id}:{model_id}:{period_key}:{quota.metric}"
         return f"quota:g:{model_id}:{period_key}:{quota.metric}"
-
-    @staticmethod
-    def _key(user_id: int, logical_model_id: int, quota: Quota) -> str:
-        return QuotaEnforcer._key_for_quota(
-            user_id,
-            None,
-            logical_model_id,
-            quota,
-            legacy_key_format=True,
-        )
 
     async def _run_check(
         self, redis: AsyncRedis, keys: Sequence[str], argv: Sequence[str | int]

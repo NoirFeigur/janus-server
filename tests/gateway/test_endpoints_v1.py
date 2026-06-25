@@ -13,8 +13,6 @@ from src.gateway.endpoints_v1 import (
     EmbeddingsRequest,
     ResponsesRequest,
     _embeddings_impl,
-    _fire_usage,
-    _latency_ms,
     _parse_body,
     _request_id,
     _responses_impl,
@@ -117,14 +115,6 @@ class TestResponsesRequestSchema:
 # ---------------------------------------------------------------------------
 
 
-def test_latency_ms() -> None:
-    from time import monotonic
-
-    start = monotonic() - 0.1
-    ms = _latency_ms(start)
-    assert ms >= 90  # ~100ms
-
-
 def test_request_id_from_state() -> None:
     request = Mock()
     request.state.trace_id = "trace-abc"
@@ -140,10 +130,13 @@ def test_request_id_fallback() -> None:
 
 @pytest.mark.asyncio
 async def test_parse_body_rejects_oversized_request() -> None:
+    from src.config import get_settings
+
+    max_body = get_settings().gateway_max_body_bytes
     request = Mock()
 
     async def stream():
-        yield b"x" * (4 * 1_048_576 + 1)
+        yield b"x" * (max_body + 1)
 
     request.stream = stream
 
@@ -172,42 +165,6 @@ def test_upstream_error_timeout() -> None:
 def test_upstream_error_generic() -> None:
     err = _upstream_error(RuntimeError("something"))
     assert err.code == ErrorCode.upstream_error
-
-
-# ---------------------------------------------------------------------------
-# _fire_usage: durable enqueue (H1 — GC-safe single write path)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_fire_usage_enqueues_durable_event() -> None:
-    """_fire_usage awaits enqueue_usage_event (no fire-and-forget create_task)."""
-    from src.enums import UsageStatus
-
-    with patch(
-        "src.gateway.endpoints_v1.enqueue_usage_event", new_callable=AsyncMock
-    ) as mock_enqueue:
-        await _fire_usage(
-            user=_fake_user(),
-            logical_model=_fake_logical_model(),
-            status_value=UsageStatus.success.value,
-            latency_ms=42,
-            request_id="req-fire",
-            prompt_tokens=10,
-            completion_tokens=5,
-            total_tokens=15,
-        )
-
-    mock_enqueue.assert_awaited_once()
-    payload = mock_enqueue.await_args[0][0]
-    assert payload["request_id"] == "req-fire"
-    assert payload["user_id"] == 100
-    assert payload["logical_model_id"] == 1
-    assert payload["prompt_tokens"] == 10
-    assert payload["completion_tokens"] == 5
-    assert payload["total_tokens"] == 15
-    assert payload["status"] == UsageStatus.success.value
-    assert payload["latency_ms"] == 42
 
 
 @pytest.mark.asyncio

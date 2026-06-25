@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
@@ -11,6 +14,7 @@ from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.quota import Quota
+from src.db.session import add_after_commit_hook
 from src.enums import ErrorCode
 from src.exceptions import AppError
 
@@ -159,6 +163,9 @@ class QuotaService:
         )
         await self.repo.create(quota)
         await self.session.flush()
+        add_after_commit_hook(
+            self.session, _bump_quota_cache_generation(quota.scope, quota.scope_id)
+        )
         return quota
 
     async def update_quota(
@@ -170,9 +177,39 @@ class QuotaService:
         await self.repo.update(quota, **values)
         await self.session.flush()
         await self.session.refresh(quota)
+        add_after_commit_hook(
+            self.session, _bump_quota_cache_generation(quota.scope, quota.scope_id)
+        )
         return quota
 
     async def delete_quota(self, quota_id: int, *, actor: AuthenticatedUser) -> None:
         quota = await self._require_visible_quota(quota_id, actor)
         quota.updated_by = actor.user_id
         await self.repo.soft_delete(quota)
+        add_after_commit_hook(
+            self.session, _bump_quota_cache_generation(quota.scope, quota.scope_id)
+        )
+
+
+def _bump_quota_cache_generation(
+    scope: str, scope_id: int | None
+) -> Callable[[], Awaitable[None]]:
+    """Return an async callback that bumps the quota generation for a subject.
+
+    Mirrors the grant invalidation hook: a quota rule write makes the gateway's
+    cached quota config (keyed by generation) unaddressable, so a lowered limit
+    or disabled rule takes effect immediately rather than after the cache TTL.
+    """
+
+    async def _hook() -> None:
+        with suppress(Exception):
+            from src.gateway.cache import bump_quota_generation
+
+            if scope == "global":
+                await bump_quota_generation(is_global=True)
+            elif scope == "user":
+                await bump_quota_generation(user_id=scope_id)
+            elif scope == "department":
+                await bump_quota_generation(dept_id=scope_id)
+
+    return _hook

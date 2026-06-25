@@ -22,6 +22,7 @@ from starlette import status
 
 from src.auth.dependencies import CurrentUser
 from src.auth.service import AuthenticatedUser
+from src.config import get_settings
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
 from src.gateway.capabilities import (
@@ -32,23 +33,21 @@ from src.gateway.capabilities import (
 )
 from src.gateway.context import GatewayRequestContext
 from src.gateway.dependencies import get_gateway_service
-from src.gateway.events import enqueue_usage_event
 from src.gateway.finalize import finalize_gateway_request
 from src.gateway.quota import QuotaCheckResult, QuotaReservation
 from src.gateway.rate_limit import (
     ESTIMATED_TOKENS_PER_REQUEST,
     check_rate_limits,
+    estimate_request_tokens,
     release_concurrent,
 )
 from src.gateway.router_manager import RouterManager
 from src.gateway.schemas import GatewayRequestBase
 from src.gateway.service import GatewayService
-from src.gateway.usage import compute_cost
 
 router = APIRouter(tags=["gateway"])
 
 GatewayServiceDep = Annotated[GatewayService, Depends(get_gateway_service)]
-_MAX_BODY_BYTES = 4 * 1_048_576
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +97,7 @@ async def _embeddings_impl(
     request_id = _request_id(request)
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, payload.model)
+    estimated_tokens = estimate_request_tokens(payload.input)
     rate_limit_rules = await _check_rate_limits(
         service=service,
         user=user,
@@ -105,6 +105,7 @@ async def _embeddings_impl(
         request_id=request_id,
         member=rl_member,
         is_stream=False,
+        estimated_tokens=estimated_tokens,
     )
     try:
         quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
@@ -113,7 +114,7 @@ async def _embeddings_impl(
             request_id=request_id,
             member=rl_member,
             rate_limit_rules=rate_limit_rules,
-            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+            estimated_tokens=estimated_tokens,
         )
         raise
     quota_reservations = quota_result.reservations
@@ -140,7 +141,7 @@ async def _embeddings_impl(
             logical_model=logical_model,
             started_at=started_at,
             stream=False,
-            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+            estimated_tokens=estimated_tokens,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
         await finalize_gateway_request(
@@ -161,6 +162,7 @@ async def _embeddings_impl(
         stream=False,
         channel_id=_channel_id_from_metadata(litellm_meta),
         upstream_model=litellm_meta.get("deployment") or _response_model(response),
+        estimated_tokens=estimated_tokens,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
     await finalize_gateway_request(
@@ -226,6 +228,7 @@ async def _responses_impl(
     request_id = _request_id(request)
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, payload.model)
+    estimated_tokens = estimate_request_tokens(payload.input)
     rate_limit_rules = await _check_rate_limits(
         service=service,
         user=user,
@@ -233,6 +236,7 @@ async def _responses_impl(
         request_id=request_id,
         member=rl_member,
         is_stream=payload.stream,
+        estimated_tokens=estimated_tokens,
     )
     try:
         quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
@@ -241,7 +245,7 @@ async def _responses_impl(
             request_id=request_id,
             member=rl_member,
             rate_limit_rules=rate_limit_rules,
-            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+            estimated_tokens=estimated_tokens,
         )
         raise
     quota_reservations = quota_result.reservations
@@ -271,7 +275,7 @@ async def _responses_impl(
             logical_model=logical_model,
             started_at=started_at,
             stream=payload.stream,
-            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+            estimated_tokens=estimated_tokens,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
         await finalize_gateway_request(
@@ -303,7 +307,7 @@ async def _responses_impl(
                 channel_id=channel_id,
                 upstream_model=upstream_model,
                 downgraded_features=downgraded_features,
-                estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+                estimated_tokens=estimated_tokens,
                 rate_limit_rules=rate_limit_rules,
                 quota_reservations=quota_reservations,
             ),
@@ -330,7 +334,7 @@ async def _responses_impl(
         channel_id=_channel_id_from_metadata(litellm_meta),
         upstream_model=upstream_model,
         downgraded_features=downgraded_features,
-        estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+        estimated_tokens=estimated_tokens,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
     await finalize_gateway_request(
@@ -424,11 +428,12 @@ async def _stream_responses(
 
 
 async def _parse_body(request: Request, schema: type[GatewayRequestBase]) -> Any:
+    max_body_bytes = get_settings().gateway_max_body_bytes
     chunks: list[bytes] = []
     total = 0
     async for chunk in request.stream():
         total += len(chunk)
-        if total > _MAX_BODY_BYTES:
+        if total > max_body_bytes:
             raise AppError(
                 ErrorCode.request_invalid,
                 status.HTTP_413_CONTENT_TOO_LARGE,
@@ -491,6 +496,7 @@ async def _check_rate_limits(
     request_id: str,
     member: str,
     is_stream: bool,
+    estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
 ) -> list[dict[str, Any]]:
     rules = await service.get_rate_limit_rules(
         user.user_id,
@@ -503,7 +509,7 @@ async def _check_rate_limits(
             request_id=request_id,
             member=member,
             rules=rules,
-            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+            estimated_tokens=estimated_tokens,
             is_stream=is_stream,
         )
         if not rl_result.allowed:
@@ -635,46 +641,6 @@ def _quota_headers(quota_result: QuotaCheckResult) -> dict[str, str]:
     return {"X-Gateway-Quota-Warnings": str(len(quota_result.warnings))}
 
 
-async def _fire_usage(
-    *,
-    user: AuthenticatedUser,
-    logical_model: Any,
-    status_value: str,
-    latency_ms: int | None,
-    request_id: str,
-    prompt_tokens: int = 0,
-    completion_tokens: int = 0,
-    total_tokens: int = 0,
-) -> None:
-    """Enqueue usage to the durable Redis queue (single write path, GC-safe).
-
-    Awaits a single Redis RPUSH (sub-millisecond, non-blocking); the batch
-    worker drains the queue into ``usage_record``.  This replaces the
-    fire-and-forget ``asyncio.create_task`` pattern, which could drop writes
-    when the task was garbage-collected before completion.
-    """
-    cost = compute_cost(logical_model, prompt_tokens, completion_tokens)
-    await enqueue_usage_event(
-        {
-            "request_id": request_id,
-            "user_id": user.user_id,
-            "api_key_id": user.api_key_id,
-            "logical_model_id": logical_model.id,
-            "logical_model_name": getattr(logical_model, "name", None),
-            "channel_id": None,
-            "upstream_model": None,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "cost": str(cost) if cost is not None else None,
-            "status": status_value,
-            "latency_ms": latency_ms,
-            "cache_hit": False,
-            "downgraded_features": None,
-        }
-    )
-
-
 def _upstream_error(exc: Exception) -> AppError:
     if hasattr(litellm, "RateLimitError") and isinstance(exc, litellm.RateLimitError):
         return AppError(ErrorCode.upstream_rate_limited, status.HTTP_429_TOO_MANY_REQUESTS)
@@ -687,10 +653,6 @@ def _usage_status_for_exception(exc: Exception) -> str:
     if hasattr(litellm, "Timeout") and isinstance(exc, litellm.Timeout):
         return UsageStatus.timeout.value
     return UsageStatus.error.value
-
-
-def _latency_ms(started_at: float) -> int:
-    return int((monotonic() - started_at) * 1000)
 
 
 def _request_id(request: Request) -> str:

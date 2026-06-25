@@ -138,6 +138,12 @@ class Settings(BaseSettings):
     response_cache_enabled: bool = False  # 响应缓存总开关;默认关,需显式开启
     response_cache_ttl_seconds: int = 300  # 缓存 TTL(秒,默认 5min);命中后此时长内复用
 
+    # --- Gateway request limits ---
+    # 客户端请求体大小上限。LLM 请求体由消息历史 + 多模态内容(base64 图片/文件)构成,
+    # 多图 vision 或长上下文可轻易超过保守的 4MiB。过小会误拒合法请求,过大则放大内存/DoS
+    # 面。默认 8MiB 兼顾常见多模态;按上游模型上下文窗口与部署内存调整。超限返回 413。
+    gateway_max_body_bytes: int = 8 * 1_048_576  # 网关请求体上限(字节,默认 8MiB);超限 413
+
     log_level: str = "INFO"  # 根 logger 级别（DEBUG/INFO/WARNING/ERROR）
     log_json: bool = True  # True=JSON 行（生产/采集）；False=彩色控制台（本地开发）
 
