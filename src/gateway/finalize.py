@@ -158,7 +158,7 @@ async def _enqueue_usage(
             "status": ctx.status,
             "latency_ms": ctx.latency_ms,
             "cache_hit": ctx.cache_hit,
-            "downgraded_features": None,
+            "downgraded_features": ctx.downgraded_features,
         }
         await enqueue_usage_event(payload)
 
@@ -248,5 +248,6 @@ async def _settle_tpm(
     with suppress(Exception):
         from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST, settle_tpm
 
-        delta_tokens = ESTIMATED_TOKENS_PER_REQUEST - ctx.total_tokens
+        reserved_tokens = ctx.tpm_estimated_tokens or ESTIMATED_TOKENS_PER_REQUEST
+        delta_tokens = reserved_tokens - ctx.total_tokens
         await settle_tpm(ctx.request_id, rate_limit_rules, delta_tokens)

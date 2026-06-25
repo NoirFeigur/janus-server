@@ -6,7 +6,9 @@ but target different litellm capabilities.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from time import monotonic
 from typing import Annotated, Any
 from uuid import uuid4
@@ -15,13 +17,19 @@ import litellm
 from fastapi import APIRouter, Depends, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import ValidationError
 from starlette import status
 
 from src.auth.dependencies import CurrentUser
 from src.auth.service import AuthenticatedUser
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
+from src.gateway.capabilities import (
+    detect_downgraded_features,
+    downgraded_header,
+    merge_headers,
+    requested_features_from_params,
+)
 from src.gateway.context import GatewayRequestContext
 from src.gateway.dependencies import get_gateway_service
 from src.gateway.events import enqueue_usage_event
@@ -33,12 +41,14 @@ from src.gateway.rate_limit import (
     release_concurrent,
 )
 from src.gateway.router_manager import RouterManager
+from src.gateway.schemas import GatewayRequestBase
 from src.gateway.service import GatewayService
 from src.gateway.usage import compute_cost
 
 router = APIRouter(tags=["gateway"])
 
 GatewayServiceDep = Annotated[GatewayService, Depends(get_gateway_service)]
+_MAX_BODY_BYTES = 4 * 1_048_576
 
 
 # ---------------------------------------------------------------------------
@@ -46,14 +56,14 @@ GatewayServiceDep = Annotated[GatewayService, Depends(get_gateway_service)]
 # ---------------------------------------------------------------------------
 
 
-class EmbeddingsRequest(BaseModel):
+class EmbeddingsRequest(GatewayRequestBase):
     model: str
     input: str | list[str]  # noqa: A003
     encoding_format: str | None = None
     dimensions: int | None = None
 
 
-class ResponsesRequest(BaseModel):
+class ResponsesRequest(GatewayRequestBase):
     model: str
     input: str | list[Any]  # noqa: A003
     stream: bool = False
@@ -72,9 +82,19 @@ async def embeddings(
     request: Request,
     user: CurrentUser,
     service: GatewayServiceDep,
-    payload: EmbeddingsRequest,
 ) -> JSONResponse:
     """OpenAI-compatible embeddings endpoint."""
+    payload = await _parse_body(request, EmbeddingsRequest)
+    return await _embeddings_impl(request=request, user=user, service=service, payload=payload)
+
+
+async def _embeddings_impl(
+    *,
+    request: Request,
+    user: AuthenticatedUser,
+    service: GatewayService,
+    payload: EmbeddingsRequest,
+) -> JSONResponse:
     request_id = _request_id(request)
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, payload.model)
@@ -86,7 +106,16 @@ async def embeddings(
         member=rl_member,
         is_stream=False,
     )
-    quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    try:
+        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    except Exception:
+        await _rollback_rate_limit_reservations(
+            request_id=request_id,
+            member=rl_member,
+            rate_limit_rules=rate_limit_rules,
+            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+        )
+        raise
     quota_reservations = quota_result.reservations
 
     started_at = monotonic()
@@ -111,6 +140,7 @@ async def embeddings(
             logical_model=logical_model,
             started_at=started_at,
             stream=False,
+            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
         await finalize_gateway_request(
@@ -180,9 +210,19 @@ async def responses(
     request: Request,
     user: CurrentUser,
     service: GatewayServiceDep,
-    payload: ResponsesRequest,
 ) -> JSONResponse | StreamingResponse:
     """OpenAI Responses API endpoint (uses litellm.aresponses)."""
+    payload = await _parse_body(request, ResponsesRequest)
+    return await _responses_impl(request=request, user=user, service=service, payload=payload)
+
+
+async def _responses_impl(
+    *,
+    request: Request,
+    user: AuthenticatedUser,
+    service: GatewayService,
+    payload: ResponsesRequest,
+) -> JSONResponse | StreamingResponse:
     request_id = _request_id(request)
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, payload.model)
@@ -194,22 +234,31 @@ async def responses(
         member=rl_member,
         is_stream=payload.stream,
     )
-    quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    try:
+        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    except Exception:
+        await _rollback_rate_limit_reservations(
+            request_id=request_id,
+            member=rl_member,
+            rate_limit_rules=rate_limit_rules,
+            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+        )
+        raise
     quota_reservations = quota_result.reservations
 
     started_at = monotonic()
     litellm_meta: dict[str, Any] = {}
+    payload_data = payload.model_dump(exclude={"model", "stream", "input"})
+    requested_features = requested_features_from_params(
+        messages=[{"role": "user", "content": payload.input}],
+        params=payload_data,
+    )
     kwargs: dict[str, Any] = {
         "model": logical_model.name,
         "input": payload.input,
         "litellm_metadata": litellm_meta,
     }
-    if payload.max_output_tokens is not None:
-        kwargs["max_output_tokens"] = payload.max_output_tokens
-    if payload.temperature is not None:
-        kwargs["temperature"] = payload.temperature
-    if payload.instructions is not None:
-        kwargs["instructions"] = payload.instructions
+    kwargs.update({key: value for key, value in payload_data.items() if value is not None})
     if payload.stream:
         kwargs["stream"] = True
 
@@ -222,6 +271,7 @@ async def responses(
             logical_model=logical_model,
             started_at=started_at,
             stream=payload.stream,
+            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
         await finalize_gateway_request(
@@ -236,6 +286,11 @@ async def responses(
     if payload.stream:
         channel_id = _channel_id_from_metadata(litellm_meta)
         upstream_model = litellm_meta.get("deployment")
+        downgraded_features = detect_downgraded_features(
+            requested_features=requested_features,
+            upstream_model=upstream_model,
+            provider=_provider_from_metadata(litellm_meta),
+        )
         return StreamingResponse(
             _stream_responses(
                 response=response,
@@ -247,13 +302,25 @@ async def responses(
                 member=rl_member,
                 channel_id=channel_id,
                 upstream_model=upstream_model,
+                downgraded_features=downgraded_features,
+                estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
                 rate_limit_rules=rate_limit_rules,
                 quota_reservations=quota_reservations,
             ),
             media_type="text/event-stream",
+            headers=merge_headers(
+                _quota_headers(quota_result),
+                downgraded_header(downgraded_features),
+            ),
         )
 
     usage = _extract_responses_usage(response)
+    upstream_model = litellm_meta.get("deployment") or _response_model(response)
+    downgraded_features = detect_downgraded_features(
+        requested_features=requested_features,
+        upstream_model=upstream_model,
+        provider=_provider_from_metadata(litellm_meta),
+    )
     ctx = _base_context(
         request_id=request_id,
         user=user,
@@ -261,7 +328,9 @@ async def responses(
         started_at=started_at,
         stream=False,
         channel_id=_channel_id_from_metadata(litellm_meta),
-        upstream_model=litellm_meta.get("deployment") or _response_model(response),
+        upstream_model=upstream_model,
+        downgraded_features=downgraded_features,
+        estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
     await finalize_gateway_request(
@@ -274,7 +343,7 @@ async def responses(
 
     return JSONResponse(
         content=jsonable_encoder(_dump_model(response)),
-        headers=_quota_headers(quota_result),
+        headers=merge_headers(_quota_headers(quota_result), downgraded_header(downgraded_features)),
     )
 
 
@@ -294,11 +363,12 @@ async def _stream_responses(
     member: str,
     channel_id: int | None,
     upstream_model: str | None,
+    downgraded_features: list[str] | None = None,
+    estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
     rate_limit_rules: list[dict[str, Any]] | None = None,
     quota_reservations: list[QuotaReservation] | None = None,
 ) -> AsyncIterator[str]:
     """Stream events from litellm.aresponses streaming."""
-    import asyncio
     import json
 
     ctx = _base_context(
@@ -309,6 +379,8 @@ async def _stream_responses(
         stream=True,
         channel_id=channel_id,
         upstream_model=upstream_model,
+        downgraded_features=downgraded_features,
+        estimated_tokens=estimated_tokens,
     )
     status_value = UsageStatus.success.value
     prompt_tokens = 0
@@ -333,21 +405,82 @@ async def _stream_responses(
         total_tokens = prompt_tokens + completion_tokens
         ctx.status = status_value
         ctx.set_usage(prompt_tokens, completion_tokens, total_tokens)
-        await finalize_gateway_request(
-            ctx,
-            logical_model=logical_model,
-            service=service,
-            rate_limit_rules=rate_limit_rules,
-            quota_reservations=quota_reservations,
+        await asyncio.shield(
+            _finalize_stream_response(
+                ctx,
+                logical_model=logical_model,
+                service=service,
+                response=response,
+                member=member,
+                rate_limit_rules=rate_limit_rules,
+                quota_reservations=quota_reservations,
+            )
         )
-        if rate_limit_rules:
-            await release_concurrent(member, rate_limit_rules)
-        await _aclose_response(response)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _parse_body(request: Request, schema: type[GatewayRequestBase]) -> Any:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > _MAX_BODY_BYTES:
+            raise AppError(
+                ErrorCode.request_invalid,
+                status.HTTP_413_CONTENT_TOO_LARGE,
+            )
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    try:
+        return schema.model_validate_json(body)
+    except (ValidationError, ValueError) as exc:
+        raise AppError(
+            ErrorCode.request_invalid,
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        ) from exc
+
+
+async def _rollback_rate_limit_reservations(
+    *,
+    request_id: str,
+    member: str,
+    rate_limit_rules: list[dict[str, Any]] | None,
+    estimated_tokens: int,
+) -> None:
+    if not rate_limit_rules:
+        return
+    with suppress(Exception):
+        from src.gateway.rate_limit import settle_tpm
+
+        await settle_tpm(request_id, rate_limit_rules, estimated_tokens)
+    with suppress(Exception):
+        await release_concurrent(member, rate_limit_rules)
+
+
+async def _finalize_stream_response(
+    ctx: GatewayRequestContext,
+    *,
+    logical_model: Any,
+    service: GatewayService,
+    response: Any,
+    member: str,
+    rate_limit_rules: list[dict[str, Any]] | None,
+    quota_reservations: list[QuotaReservation] | None,
+) -> None:
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        rate_limit_rules=rate_limit_rules,
+        quota_reservations=quota_reservations,
+    )
+    if rate_limit_rules:
+        await release_concurrent(member, rate_limit_rules)
+    await _aclose_response(response)
 
 
 async def _check_rate_limits(
@@ -397,6 +530,8 @@ def _base_context(
     stream: bool,
     channel_id: int | None = None,
     upstream_model: str | None = None,
+    downgraded_features: list[str] | None = None,
+    estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
 ) -> GatewayRequestContext:
     return GatewayRequestContext(
         request_id=request_id,
@@ -408,9 +543,11 @@ def _base_context(
         logical_model_name=logical_model.name,
         channel_id=channel_id,
         upstream_model=upstream_model,
+        downgraded_features=downgraded_features,
         started_at=started_at,
         stream=stream,
         quota_reserved=True,
+        tpm_estimated_tokens=estimated_tokens,
     )
 
 
@@ -467,6 +604,18 @@ def _response_model(response: Any) -> str | None:
     if isinstance(response, dict):
         value = response.get("model")
         return value if isinstance(value, str) else None
+    return None
+
+
+def _provider_from_metadata(litellm_meta: dict[str, Any]) -> str | None:
+    model_info = litellm_meta.get("model_info")
+    if isinstance(model_info, dict):
+        provider = model_info.get("provider")
+        if isinstance(provider, str):
+            return provider
+    deployment = litellm_meta.get("deployment")
+    if isinstance(deployment, str) and "/" in deployment:
+        return deployment.split("/", 1)[0]
     return None
 
 

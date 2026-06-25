@@ -21,6 +21,12 @@ from src.config import get_settings
 from src.db.models.model_catalog import LogicalModel
 from src.enums import ErrorCode, UsageStatus
 from src.exceptions import AppError
+from src.gateway.capabilities import (
+    detect_downgraded_features,
+    downgraded_header,
+    merge_headers,
+    requested_features_from_params,
+)
 from src.gateway.context import GatewayRequestContext
 from src.gateway.dependencies import get_gateway_service
 from src.gateway.finalize import finalize_gateway_request
@@ -87,6 +93,24 @@ async def _finalize_stream(
     await _aclose_response(response)
 
 
+async def _rollback_rate_limit_reservations(
+    *,
+    request_id: str,
+    member: str,
+    rate_limit_rules: list[dict[str, Any]] | None,
+    estimated_tokens: int,
+) -> None:
+    """Best-effort rollback after a later gate rejects the request."""
+    if not rate_limit_rules:
+        return
+    with suppress(Exception):
+        from src.gateway.rate_limit import settle_tpm
+
+        await settle_tpm(request_id, rate_limit_rules, estimated_tokens)
+    with suppress(Exception):
+        await release_concurrent(member, rate_limit_rules)
+
+
 # ---------------------------------------------------------------------------
 # OpenAI endpoint (unchanged — acompletion already returns OpenAI format)
 # ---------------------------------------------------------------------------
@@ -127,6 +151,7 @@ async def anthropic_messages(
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, payload.model)
 
+    estimated_tokens = estimate_request_tokens(payload.messages)
     # P2: Rate limiting (before quota reservation)
     rate_limit_rules = await _check_rate_limits(
         service=service,
@@ -135,10 +160,19 @@ async def anthropic_messages(
         request_id=request_id,
         member=rl_member,
         is_stream=payload.stream,
-        estimated_tokens=estimate_request_tokens(payload.messages),
+        estimated_tokens=estimated_tokens,
     )
 
-    quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    try:
+        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    except Exception:
+        await _rollback_rate_limit_reservations(
+            request_id=request_id,
+            member=rl_member,
+            rate_limit_rules=rate_limit_rules,
+            estimated_tokens=estimated_tokens,
+        )
+        raise
     quota_reservations = quota_result.reservations
 
     # Build native Anthropic params (no conversion to OpenAI format)
@@ -176,6 +210,7 @@ async def anthropic_messages(
             started_at=started_at,
             stream=payload.stream,
             quota_reserved=True,
+            tpm_estimated_tokens=estimated_tokens,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
         await finalize_gateway_request(
@@ -203,14 +238,37 @@ async def anthropic_messages(
                 member=rl_member,
                 channel_id=channel_id,
                 upstream_model=upstream_model,
+                requested_features=requested_features_from_params(
+                    messages=payload.messages, params=native_params
+                ),
+                estimated_tokens=estimated_tokens,
                 rate_limit_rules=rate_limit_rules,
                 quota_reservations=quota_reservations,
             ),
             media_type="text/event-stream",
+            headers=merge_headers(
+                _quota_headers(quota_result),
+                downgraded_header(
+                    detect_downgraded_features(
+                        requested_features=requested_features_from_params(
+                            messages=payload.messages, params=native_params
+                        ),
+                        upstream_model=upstream_model,
+                        provider="anthropic",
+                    )
+                ),
+            ),
         )
 
     # Non-streaming: response is AnthropicMessagesResponse (dict-like)
     usage = _extract_anthropic_usage(response)
+    downgraded_features = detect_downgraded_features(
+        requested_features=requested_features_from_params(
+            messages=payload.messages, params=native_params
+        ),
+        upstream_model=upstream_model,
+        provider="anthropic",
+    )
     ctx = GatewayRequestContext(
         request_id=request_id,
         user_id=user.user_id,
@@ -224,6 +282,8 @@ async def anthropic_messages(
         started_at=started_at,
         stream=False,
         quota_reserved=True,
+        tpm_estimated_tokens=estimated_tokens,
+        downgraded_features=downgraded_features,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
     await finalize_gateway_request(
@@ -236,7 +296,7 @@ async def anthropic_messages(
     # Return native Anthropic response directly
     return JSONResponse(
         content=_to_json_serializable(response),
-        headers=_quota_headers(quota_result),
+        headers=merge_headers(_quota_headers(quota_result), downgraded_header(downgraded_features)),
     )
 
 
@@ -260,6 +320,7 @@ async def gemini_generate_content(
 
     stream = request.url.path.endswith(":streamGenerateContent")
 
+    estimated_tokens = estimate_request_tokens(payload.contents)
     # P2: Rate limiting (before quota reservation)
     rate_limit_rules = await _check_rate_limits(
         service=service,
@@ -268,10 +329,19 @@ async def gemini_generate_content(
         request_id=request_id,
         member=rl_member,
         is_stream=stream,
-        estimated_tokens=estimate_request_tokens(payload.contents),
+        estimated_tokens=estimated_tokens,
     )
 
-    quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    try:
+        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    except Exception:
+        await _rollback_rate_limit_reservations(
+            request_id=request_id,
+            member=rl_member,
+            rate_limit_rules=rate_limit_rules,
+            estimated_tokens=estimated_tokens,
+        )
+        raise
     quota_reservations = quota_result.reservations
 
     litellm_meta: dict[str, Any] = {}
@@ -314,6 +384,7 @@ async def gemini_generate_content(
             started_at=started_at,
             stream=stream,
             quota_reserved=True,
+            tpm_estimated_tokens=estimated_tokens,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
         await finalize_gateway_request(
@@ -340,14 +411,37 @@ async def gemini_generate_content(
                 member=rl_member,
                 channel_id=channel_id,
                 upstream_model=upstream_model,
+                requested_features=requested_features_from_params(
+                    messages=payload.contents, params=native_params
+                ),
+                estimated_tokens=estimated_tokens,
                 rate_limit_rules=rate_limit_rules,
                 quota_reservations=quota_reservations,
             ),
             media_type="text/event-stream",
+            headers=merge_headers(
+                _quota_headers(quota_result),
+                downgraded_header(
+                    detect_downgraded_features(
+                        requested_features=requested_features_from_params(
+                            messages=payload.contents, params=native_params
+                        ),
+                        upstream_model=upstream_model,
+                        provider="gemini",
+                    )
+                ),
+            ),
         )
 
     # Non-streaming: return native Gemini response
     usage = _extract_gemini_usage_from_response(response)
+    downgraded_features = detect_downgraded_features(
+        requested_features=requested_features_from_params(
+            messages=payload.contents, params=native_params
+        ),
+        upstream_model=upstream_model,
+        provider="gemini",
+    )
     ctx = GatewayRequestContext(
         request_id=request_id,
         user_id=user.user_id,
@@ -361,6 +455,8 @@ async def gemini_generate_content(
         started_at=started_at,
         stream=False,
         quota_reserved=True,
+        tpm_estimated_tokens=estimated_tokens,
+        downgraded_features=downgraded_features,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
     await finalize_gateway_request(
@@ -372,7 +468,7 @@ async def gemini_generate_content(
     )
     return JSONResponse(
         content=_to_json_serializable(response),
-        headers=_quota_headers(quota_result),
+        headers=merge_headers(_quota_headers(quota_result), downgraded_header(downgraded_features)),
     )
 
 
@@ -466,6 +562,8 @@ async def _execute_completion(
     request_id = _request_id(request)
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, requested_model)
+    estimated_tokens = estimate_request_tokens(messages)
+    requested_features = requested_features_from_params(messages=messages, params=params)
 
     # P2: Rate limiting (before quota reservation)
     rate_limit_rules = await _check_rate_limits(
@@ -475,10 +573,19 @@ async def _execute_completion(
         request_id=request_id,
         member=rl_member,
         is_stream=stream,
-        estimated_tokens=estimate_request_tokens(messages),
+        estimated_tokens=estimated_tokens,
     )
 
-    quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    try:
+        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+    except Exception:
+        await _rollback_rate_limit_reservations(
+            request_id=request_id,
+            member=rl_member,
+            rate_limit_rules=rate_limit_rules,
+            estimated_tokens=estimated_tokens,
+        )
+        raise
     quota_reservations = quota_result.reservations
 
     # P4: Response cache check (non-streaming only)
@@ -510,6 +617,7 @@ async def _execute_completion(
                 stream=False,
                 quota_reserved=True,
                 cache_hit=True,
+                tpm_estimated_tokens=estimated_tokens,
             )
             ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
             await finalize_gateway_request(
@@ -548,6 +656,7 @@ async def _execute_completion(
             started_at=started_at,
             stream=stream,
             quota_reserved=True,
+            tpm_estimated_tokens=estimated_tokens,
         )
         ctx.mark_error(_usage_status_for_exception(exc))
         await finalize_gateway_request(
@@ -569,14 +678,23 @@ async def _execute_completion(
                 started_at=started_at,
                 request_id=request_id,
                 member=rl_member,
+                requested_features=requested_features,
+                estimated_tokens=estimated_tokens,
                 rate_limit_rules=rate_limit_rules,
                 quota_reservations=quota_reservations,
             ),
             media_type="text/event-stream",
+            headers=_quota_headers(quota_result),
         )
 
     usage = _extract_usage(response)
     channel_id, upstream_model = _extract_routing_info(response)
+    provider = _provider_from_response(response)
+    downgraded_features = detect_downgraded_features(
+        requested_features=requested_features,
+        upstream_model=upstream_model,
+        provider=provider,
+    )
     # Build ctx for success finalization
     ctx = GatewayRequestContext(
         request_id=request_id,
@@ -588,9 +706,12 @@ async def _execute_completion(
         logical_model_name=logical_model.name,
         channel_id=channel_id,
         upstream_model=upstream_model,
+        provider=provider,
         started_at=started_at,
         stream=False,
         quota_reserved=True,
+        tpm_estimated_tokens=estimated_tokens,
+        downgraded_features=downgraded_features,
     )
     ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
     await finalize_gateway_request(
@@ -612,7 +733,7 @@ async def _execute_completion(
 
     return JSONResponse(
         content=jsonable_encoder(_dump_model(response)),
-        headers=_quota_headers(quota_result),
+        headers=merge_headers(_quota_headers(quota_result), downgraded_header(downgraded_features)),
     )
 
 
@@ -630,6 +751,8 @@ async def _stream_openai(
     started_at: float,
     request_id: str,
     member: str,
+    requested_features: set[str] | None = None,
+    estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
     rate_limit_rules: list[dict[str, Any]] | None = None,
     quota_reservations: list[QuotaReservation] | None = None,
 ) -> AsyncIterator[str]:
@@ -644,11 +767,13 @@ async def _stream_openai(
         started_at=started_at,
         stream=True,
         quota_reserved=True,
+        tpm_estimated_tokens=estimated_tokens,
     )
     usage = _empty_usage()
     status_value = UsageStatus.success.value
     channel_id: int | None = None
     upstream_model: str | None = None
+    provider: str | None = None
     stream_start = monotonic()
     response_iter = response.__aiter__()
     bytes_yielded = 0
@@ -669,6 +794,7 @@ async def _stream_openai(
             chunk_channel_id, chunk_upstream_model = _extract_routing_info(chunk)
             channel_id = channel_id or chunk_channel_id
             upstream_model = upstream_model or chunk_upstream_model
+            provider = provider or _provider_from_response(chunk)
             chunk_usage = _extract_usage(chunk)
             if chunk_usage["total_tokens"]:
                 usage = chunk_usage
@@ -694,10 +820,17 @@ async def _stream_openai(
         response_channel_id, response_upstream_model = _extract_routing_info(response)
         channel_id = channel_id or response_channel_id
         upstream_model = upstream_model or response_upstream_model
+        provider = provider or _provider_from_response(response)
         # Populate context for finalizer
         ctx.channel_id = channel_id
         ctx.upstream_model = upstream_model
+        ctx.provider = provider
         ctx.status = status_value
+        ctx.downgraded_features = detect_downgraded_features(
+            requested_features=requested_features or set(),
+            upstream_model=upstream_model,
+            provider=provider,
+        )
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
         # Shielded cleanup: settle quota, refund TPM, release concurrent slot,
         # close upstream. Without the shield, a client disconnect cancels these
@@ -731,6 +864,8 @@ async def _stream_anthropic_native(
     member: str,
     channel_id: int | None,
     upstream_model: str | None,
+    requested_features: set[str] | None = None,
+    estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
     rate_limit_rules: list[dict[str, Any]] | None = None,
     quota_reservations: list[QuotaReservation] | None = None,
 ) -> AsyncIterator[bytes]:
@@ -748,6 +883,13 @@ async def _stream_anthropic_native(
         started_at=started_at,
         stream=True,
         quota_reserved=True,
+        provider="anthropic",
+        tpm_estimated_tokens=estimated_tokens,
+        downgraded_features=detect_downgraded_features(
+            requested_features=requested_features or set(),
+            upstream_model=upstream_model,
+            provider="anthropic",
+        ),
     )
     usage = _empty_usage()
     status_value = UsageStatus.success.value
@@ -820,6 +962,8 @@ async def _stream_gemini_native(
     member: str,
     channel_id: int | None,
     upstream_model: str | None,
+    requested_features: set[str] | None = None,
+    estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
     rate_limit_rules: list[dict[str, Any]] | None = None,
     quota_reservations: list[QuotaReservation] | None = None,
 ) -> AsyncIterator[bytes]:
@@ -837,6 +981,13 @@ async def _stream_gemini_native(
         started_at=started_at,
         stream=True,
         quota_reserved=True,
+        provider="gemini",
+        tpm_estimated_tokens=estimated_tokens,
+        downgraded_features=detect_downgraded_features(
+            requested_features=requested_features or set(),
+            upstream_model=upstream_model,
+            provider="gemini",
+        ),
     )
     usage = _empty_usage()
     status_value = UsageStatus.success.value
@@ -1093,7 +1244,32 @@ def _extract_routing_info(response: Any) -> tuple[int | None, str | None]:
             if key_id is not None:
                 with suppress(ValueError, TypeError):
                     channel_id = int(key_id)
+            info_model = model_info.get("upstream_model")
+            info_provider = model_info.get("provider")
+            if isinstance(info_model, str):
+                provider_prefix = f"{info_provider}/"
+                upstream_model = (
+                    f"{provider_prefix}{info_model}"
+                    if isinstance(info_provider, str) and not info_model.startswith(provider_prefix)
+                    else info_model
+                )
     return channel_id, upstream_model
+
+
+def _provider_from_response(response: Any) -> str | None:
+    hidden = getattr(response, "_hidden_params", None)
+    if hidden is None and isinstance(response, Mapping):
+        hidden = response.get("_hidden_params")
+    if isinstance(hidden, dict):
+        model_info = hidden.get("model_info", {})
+        if isinstance(model_info, dict):
+            provider = model_info.get("provider")
+            if isinstance(provider, str):
+                return provider
+    _channel_id, upstream_model = _extract_routing_info(response)
+    if isinstance(upstream_model, str) and "/" in upstream_model:
+        return upstream_model.split("/", 1)[0]
+    return None
 
 
 def _empty_usage() -> dict[str, int]:

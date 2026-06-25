@@ -7,11 +7,13 @@ from litellm.router import Router
 
 from src.config import get_settings
 from src.core.channel_crypto import decrypt_channel_key
+from src.gateway.capabilities import ensure_capability_filter_registered
 from src.gateway.repository import RouterDeploymentRow
 
 
 def build_router(rows: list[RouterDeploymentRow]) -> Router:
     """Build a LiteLLM router from active gateway deployment rows."""
+    ensure_capability_filter_registered()
     settings = get_settings()
     model_list: list[dict[str, Any]] = []
     for row in rows:
@@ -46,6 +48,8 @@ def build_router(rows: list[RouterDeploymentRow]) -> Router:
                 "model_info": {
                     "id": str(row.channel_id),
                     "channel_key_id": str(row.channel_key_id),
+                    "provider": row.provider,
+                    "upstream_model": row.upstream_model,
                 },
                 "weight": row.deployment_weight * row.key_weight,
                 "priority": row.deployment_priority,
@@ -63,6 +67,7 @@ def build_router(rows: list[RouterDeploymentRow]) -> Router:
         cooldown_time=10,
         allowed_fails=3,
         retry_after=5,
+        optional_pre_call_checks=["prompt_caching", "responses_api_deployment_check"],
     )
 
 

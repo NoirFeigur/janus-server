@@ -62,6 +62,7 @@ class GatewayRequestContext:
     cache_hit: bool = False
     retry_count: int = 0
     fallback_used: bool = False
+    downgraded_features: list[str] | None = None
 
     # --- Quota (set after check_quota) ---
     quota_reserved: bool = False
@@ -70,6 +71,9 @@ class GatewayRequestContext:
     # these exact keys (hot-reload + period-rollover safe). Empty => fall back to
     # legacy re-query settle in the finalizer.
     quota_reservations: list[QuotaReservation] = field(default_factory=list)
+    # Token amount reserved by rate_limit.check_rate_limits for TPM. This may be
+    # higher than the historical 100-token floor when the prompt is large.
+    tpm_estimated_tokens: int = 0
 
     def record_latency(self) -> None:
         """Compute and store latency_ms from started_at to now."""

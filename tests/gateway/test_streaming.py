@@ -19,9 +19,13 @@ from src.gateway.router import (
     _empty_usage,
     _extract_anthropic_usage,
     _extract_gemini_usage_from_response,
+    _extract_routing_info,
+    _provider_from_response,
     _stream_anthropic_native,
     _stream_gemini_native,
+    _stream_openai,
 )
+from src.gateway.schemas import OpenAIRequest
 
 # --- helpers ---
 
@@ -186,6 +190,57 @@ class TestChannelIdFromMetadata:
     def test_int_id(self) -> None:
         meta: dict[str, Any] = {"model_info": {"id": 99}}
         assert _channel_id_from_metadata(meta) == 99
+
+
+@pytest.mark.parametrize(
+    "reserved_key",
+    [
+        "base_url",
+        "extra_headers",
+        "aws_access_key_id",
+        "vertex_project",
+        "azure_ad_token",
+        "specific_deployment",
+    ],
+)
+def test_openai_request_rejects_gateway_reserved_params(reserved_key: str) -> None:
+    with pytest.raises(ValueError, match="gateway-reserved"):
+        OpenAIRequest.model_validate(
+            {
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                reserved_key: "bad",
+            }
+        )
+
+
+def test_openai_request_rejects_reserved_headers() -> None:
+    for reserved_key in ("headers", "default_headers"):
+        with pytest.raises(ValueError, match="gateway-reserved"):
+            OpenAIRequest.model_validate(
+                {
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    reserved_key: "bad",
+                }
+            )
+
+
+def test_extract_routing_info_reads_provider_and_upstream_from_model_info() -> None:
+    class Resp:
+        model = "gpt-4o"
+        _hidden_params = {
+            "model_info": {
+                "id": "42",
+                "provider": "openai",
+                "upstream_model": "gpt-4o-2024-08-06",
+            }
+        }
+
+    channel_id, upstream_model = _extract_routing_info(Resp())
+    assert channel_id == 42
+    assert upstream_model == "openai/gpt-4o-2024-08-06"
+    assert _provider_from_response(Resp()) == "openai"
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +702,79 @@ async def test_stream_gemini_no_release_without_rules() -> None:
             pass
 
     mock_release.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stream_openai_records_estimated_tpm_and_downgrade() -> None:
+    """Streaming finalizer carries real TPM reservation + downgrade markers."""
+    chunks = [
+        {
+            "id": "chunk-1",
+            "model": "openai/gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": "hi"}}],
+            "_hidden_params": {
+                "model_info": {
+                    "id": "8",
+                    "provider": "openai",
+                    "upstream_model": "gpt-4o",
+                }
+            },
+        },
+        {
+            "id": "chunk-2",
+            "model": "openai/gpt-4o",
+            "choices": [{"index": 0, "delta": {}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            "_hidden_params": {
+                "model_info": {
+                    "id": "8",
+                    "provider": "openai",
+                    "upstream_model": "gpt-4o",
+                }
+            },
+        },
+    ]
+
+    class Chunk:
+        def __init__(self, data: dict[str, Any]) -> None:
+            self._data = data
+            self.model = data.get("model")
+            self.usage = data.get("usage")
+            self._hidden_params = data.get("_hidden_params")
+
+        def model_dump(self) -> dict[str, Any]:
+            return self._data
+
+    async def response() -> AsyncIterator[Chunk]:
+        for item in chunks:
+            yield Chunk(item)
+
+    with (
+        patch("src.gateway.router.finalize_gateway_request", new_callable=AsyncMock) as finalize,
+        patch(
+            "src.gateway.router.detect_downgraded_features",
+            return_value=["response_schema"],
+        ),
+    ):
+        async for _ in _stream_openai(
+            response=response(),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-openai",
+            member="member-openai",
+            requested_features={"response_schema"},
+            estimated_tokens=1234,
+        ):
+            pass
+
+    finalize.assert_awaited_once()
+    ctx = finalize.await_args.args[0]
+    assert ctx.tpm_estimated_tokens == 1234
+    assert ctx.channel_id == 8
+    assert ctx.provider == "openai"
+    assert ctx.downgraded_features == ["response_schema"]
 
 
 # ---------------------------------------------------------------------------

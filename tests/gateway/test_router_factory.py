@@ -62,3 +62,12 @@ async def test_build_router_omits_api_base_when_none() -> None:
     params = router.model_list[0]["litellm_params"]
 
     assert "api_base" not in params
+
+
+async def test_build_router_model_info_carries_provider_and_upstream_model() -> None:
+    router = build_router([_row()])
+    model_info = router.model_list[0]["model_info"]
+
+    assert model_info["id"] == "20"
+    assert model_info["provider"] == "anthropic"
+    assert model_info["upstream_model"] == "claude-3-5-sonnet"

@@ -12,11 +12,14 @@ from src.enums import ErrorCode, UsageStatus
 from src.gateway.endpoints_v1 import (
     EmbeddingsRequest,
     ResponsesRequest,
+    _embeddings_impl,
     _fire_usage,
     _latency_ms,
+    _parse_body,
     _request_id,
+    _responses_impl,
+    _stream_responses,
     _upstream_error,
-    embeddings,
     list_models,
 )
 from src.gateway.quota import QuotaCheckResult, QuotaReservation
@@ -77,6 +80,37 @@ class TestResponsesRequestSchema:
         assert req.temperature is None
         assert req.instructions is None
 
+    @pytest.mark.parametrize(
+        "reserved_key",
+        [
+            "base_url",
+            "extra_headers",
+            "aws_secret_access_key",
+            "vertex_location",
+            "azure_ad_token_provider",
+            "specific_deployment",
+        ],
+    )
+    def test_rejects_gateway_reserved_params(self, reserved_key: str) -> None:
+        with pytest.raises(ValueError, match="gateway-reserved"):
+            ResponsesRequest.model_validate(
+                {"model": "gpt-4", "input": "hi", reserved_key: "bad"}
+            )
+
+    def test_allows_extra_responses_params(self) -> None:
+        req = ResponsesRequest.model_validate(
+            {
+                "model": "gpt-4",
+                "input": "hi",
+                "tools": [{"type": "function", "function": {"name": "lookup"}}],
+                "response_format": {"type": "json_object"},
+            }
+        )
+
+        dumped = req.model_dump()
+        assert dumped["tools"][0]["type"] == "function"
+        assert dumped["response_format"]["type"] == "json_object"
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -102,6 +136,21 @@ def test_request_id_fallback() -> None:
     request.state = Mock(spec=[])
     rid = _request_id(request)
     assert len(rid) > 0  # UUID fallback
+
+
+@pytest.mark.asyncio
+async def test_parse_body_rejects_oversized_request() -> None:
+    request = Mock()
+
+    async def stream():
+        yield b"x" * (4 * 1_048_576 + 1)
+
+    request.stream = stream
+
+    with pytest.raises(Exception) as exc:
+        await _parse_body(request, ResponsesRequest)
+
+    assert exc.value.status_code == 413
 
 
 def test_upstream_error_rate_limit() -> None:
@@ -189,7 +238,7 @@ async def test_embeddings_uses_rate_limit_quota_reservations_and_finalizer() -> 
         ) as finalize,
     ):
         rl.return_value = Mock(allowed=True)
-        resp = await embeddings(
+        resp = await _embeddings_impl(
             request=_fake_request(),
             user=_fake_user(),
             service=service,
@@ -203,7 +252,142 @@ async def test_embeddings_uses_rate_limit_quota_reservations_and_finalizer() -> 
     assert kwargs["quota_reservations"] == [reservation]
     ctx = finalize.await_args.args[0]
     assert ctx.total_tokens == 7
+    assert ctx.tpm_estimated_tokens == 100
     assert ctx.status == UsageStatus.success.value
+
+
+@pytest.mark.asyncio
+async def test_embeddings_rolls_back_rate_limit_when_quota_rejects() -> None:
+    service = AsyncMock()
+    service.resolve_model.return_value = _fake_logical_model()
+    service.get_rate_limit_rules.return_value = [{"id": 1, "tpm_limit": 1000}]
+    service.check_quota.side_effect = RuntimeError("quota down")
+
+    with (
+        patch("src.gateway.endpoints_v1.check_rate_limits", new_callable=AsyncMock) as rl,
+        patch("src.gateway.rate_limit.settle_tpm", new_callable=AsyncMock) as settle,
+        patch("src.gateway.endpoints_v1.release_concurrent", new_callable=AsyncMock) as release,
+        pytest.raises(RuntimeError, match="quota down"),
+    ):
+        rl.return_value = Mock(allowed=True)
+        await _embeddings_impl(
+            request=_fake_request(),
+            user=_fake_user(),
+            service=service,
+            payload=EmbeddingsRequest(model="gpt-4", input="hi"),
+        )
+
+    settle.assert_awaited_once()
+    assert settle.await_args.args[2] == 100
+    release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_responses_forwards_extra_params_and_records_downgrade() -> None:
+    service = AsyncMock()
+    service.resolve_model.return_value = _fake_logical_model()
+    service.get_rate_limit_rules.return_value = [{"id": 1, "tpm_limit": 1000}]
+    service.check_quota.return_value = QuotaCheckResult(passed=True, reservations=[])
+    router = AsyncMock()
+
+    async def fake_aresponses(**kwargs):
+        meta = kwargs["litellm_metadata"]
+        meta["deployment"] = "openai/no-tools"
+        meta["model_info"] = {"provider": "openai"}
+        return {
+            "id": "resp-1",
+            "model": "openai/no-tools",
+            "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+        }
+
+    router.aresponses.side_effect = fake_aresponses
+
+    with (
+        patch("src.gateway.endpoints_v1.RouterManager.get_router", return_value=router),
+        patch("src.gateway.endpoints_v1.check_rate_limits", new_callable=AsyncMock) as rl,
+        patch(
+            "src.gateway.endpoints_v1.finalize_gateway_request", new_callable=AsyncMock
+        ) as finalize,
+        patch(
+            "src.gateway.endpoints_v1.detect_downgraded_features",
+            return_value=["tools", "response_schema"],
+        ) as detect,
+    ):
+        rl.return_value = Mock(allowed=True)
+        resp = await _responses_impl(
+            request=_fake_request(),
+            user=_fake_user(),
+            service=service,
+            payload=ResponsesRequest.model_validate(
+                {
+                    "model": "gpt-4",
+                    "input": "hi",
+                    "tools": [{"type": "function", "function": {"name": "lookup"}}],
+                    "response_format": {"type": "json_object"},
+                }
+            ),
+        )
+
+    assert resp.status_code == 200
+    assert resp.headers["X-Gateway-Downgraded"] == "tools,response_schema"
+    router.aresponses.assert_awaited_once()
+    forwarded = router.aresponses.await_args.kwargs
+    assert forwarded["tools"][0]["type"] == "function"
+    assert forwarded["response_format"] == {"type": "json_object"}
+    detect.assert_called_once()
+    assert detect.call_args.kwargs["requested_features"] == {"tools", "response_schema"}
+    ctx = finalize.await_args.args[0]
+    assert ctx.downgraded_features == ["tools", "response_schema"]
+    assert ctx.total_tokens == 7
+
+
+class _ClosableEventStream:
+    def __init__(self) -> None:
+        self.aclose_calls = 0
+
+    def __aiter__(self) -> _ClosableEventStream:
+        return self
+
+    async def __anext__(self) -> dict[str, object]:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_cleanup_is_shielded_and_releases_slot() -> None:
+    upstream = _ClosableEventStream()
+    rules = [{"id": 1, "max_concurrent": 1, "subject_type": "user", "subject_id": 100}]
+
+    with (
+        patch(
+            "src.gateway.endpoints_v1.finalize_gateway_request", new_callable=AsyncMock
+        ) as finalize,
+        patch(
+            "src.gateway.endpoints_v1.release_concurrent", new_callable=AsyncMock
+        ) as release,
+    ):
+        async for _ in _stream_responses(
+            response=upstream,
+            user=_fake_user(),
+            logical_model=_fake_logical_model(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-stream",
+            member="member-stream",
+            channel_id=1,
+            upstream_model="openai/gpt-4",
+            estimated_tokens=333,
+            rate_limit_rules=rules,
+        ):
+            pass
+
+    finalize.assert_awaited_once()
+    ctx = finalize.await_args.args[0]
+    assert ctx.tpm_estimated_tokens == 333
+    release.assert_awaited_once_with("member-stream", rules)
+    assert upstream.aclose_calls == 1
 
 
 @pytest.mark.asyncio

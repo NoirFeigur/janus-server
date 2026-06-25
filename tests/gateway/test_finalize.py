@@ -43,6 +43,23 @@ async def test_finalize_enqueues_usage_event(fake_redis: AsyncRedisDouble) -> No
 
 
 @pytest.mark.asyncio
+async def test_finalize_enqueues_downgraded_features(fake_redis: AsyncRedisDouble) -> None:
+    ctx = GatewayRequestContext(
+        user_id=1,
+        logical_model_id=10,
+        logical_model_name="claude-sonnet",
+        downgraded_features=["prompt_caching"],
+    )
+
+    await finalize_gateway_request(ctx)
+
+    raw = await fake_redis.lpop(USAGE_QUEUE_KEY)
+    assert raw is not None
+    payload = json.loads(raw)
+    assert payload["downgraded_features"] == ["prompt_caching"]
+
+
+@pytest.mark.asyncio
 async def test_finalize_enqueues_log_event(fake_redis: AsyncRedisDouble) -> None:
     ctx = GatewayRequestContext(
         user_id=2,
@@ -151,6 +168,26 @@ async def test_finalize_refunds_unused_tpm(fake_redis: AsyncRedisDouble) -> None
     assert call_request_id == "req-tpm"
     assert call_rules == rules
     assert call_delta == ESTIMATED_TOKENS_PER_REQUEST - 30  # positive refund
+
+
+@pytest.mark.asyncio
+async def test_finalize_uses_actual_tpm_reservation(fake_redis: AsyncRedisDouble) -> None:
+    rules = [{"id": 1, "tpm_limit": 10000, "subject_type": "user", "subject_id": 1}]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        request_id="req-tpm-estimated",
+        logical_model_id=10,
+        total_tokens=300,
+        tpm_estimated_tokens=1000,
+    )
+
+    with patch(
+        "src.gateway.rate_limit.settle_tpm", new_callable=AsyncMock
+    ) as mock_settle:
+        await finalize_gateway_request(ctx, rate_limit_rules=rules)
+
+    _request_id, _rules, call_delta = mock_settle.await_args[0]
+    assert call_delta == 700
 
 
 @pytest.mark.asyncio
