@@ -29,15 +29,12 @@ import contextlib
 import secrets
 import signal
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import cast
-
-from redis.asyncio import Redis
 
 from src.config import get_settings
 from src.core.logging import get_logger
-from src.core.redis import get_redis
+from src.core.redis import AsyncRedis, get_redis
 from src.core.snowflake import _MAX_WORKER_ID, set_worker_id
 
 _log = get_logger(__name__)
@@ -95,7 +92,7 @@ class WorkerIdLease:
     """A held worker-id lease with a running heartbeat. Release via ``release()``."""
 
     worker_id: int
-    _redis: Redis
+    _redis: AsyncRedis
     _token: str
     _ttl_seconds: int
     _heartbeat: asyncio.Task[None] | None = None
@@ -128,11 +125,8 @@ class WorkerIdLease:
         while True:
             await asyncio.sleep(interval)
             try:
-                renewed = await cast(
-                    "Awaitable[int]",
-                    self._redis.eval(
-                        _RENEW_LUA, 1, self._key, self._token, str(self._ttl_seconds)
-                    ),
+                renewed = await self._redis.eval(
+                    _RENEW_LUA, 1, self._key, self._token, str(self._ttl_seconds)
                 )
             except Exception:  # noqa: BLE001 — transient Redis blip; retry, but
                 # a *sustained* partition is not transient: once we have been
@@ -177,15 +171,12 @@ class WorkerIdLease:
                 await self._heartbeat
             self._heartbeat = None
         try:
-            await cast(
-                "Awaitable[int]",
-                self._redis.eval(_RELEASE_LUA, 1, self._key, self._token),
-            )
+            await self._redis.eval(_RELEASE_LUA, 1, self._key, self._token)
         except Exception:  # noqa: BLE001 — best-effort; TTL reclaims it anyway.
             _log.warning("worker_id.release_error", worker_id=self.worker_id)
 
 
-async def _try_claim(redis: Redis, worker_id: int, token: str, ttl: int) -> bool:
+async def _try_claim(redis: AsyncRedis, worker_id: int, token: str, ttl: int) -> bool:
     """Atomically claim ``worker_id`` iff its key is unset (SET NX EX)."""
     acquired = await redis.set(
         f"{_KEY_PREFIX}{worker_id}", token, nx=True, ex=ttl

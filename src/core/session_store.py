@@ -27,13 +27,11 @@ Redis key 模式：
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
-from typing import cast
 
-from redis.asyncio import Redis
+from src.core.redis import AsyncRedis
 
 _ACCESS_PREFIX = "sess:access:"
 _USER_PREFIX = "sess:user:"
@@ -82,7 +80,7 @@ class SessionInfo:
 class SessionStore:
     """会话白名单 + refresh 轮换的 Redis 读写封装(注入 Redis client,便于测试)。"""
 
-    def __init__(self, redis: Redis) -> None:
+    def __init__(self, redis: AsyncRedis) -> None:
         self._redis = redis
 
     # ---- key 拼装 -----------------------------------------------------------
@@ -138,9 +136,9 @@ class SessionStore:
             self._refresh_key(refresh_hash), refresh_record, ex=refresh_ttl
         )
         user_key = self._user_key(user_id)
-        await cast("Awaitable[int]", self._redis.sadd(user_key, access_jti))
+        await self._redis.sadd(user_key, access_jti)
         await self._redis.expire(user_key, refresh_ttl)
-        await cast("Awaitable[int]", self._redis.sadd(_USERS_INDEX, str(user_id)))
+        await self._redis.sadd(_USERS_INDEX, str(user_id))
 
     # ---- 读取:每请求吊销校验 -----------------------------------------------
 
@@ -166,9 +164,7 @@ class SessionStore:
         user_id = record.get("user_id")
         refresh_hash = record.get("refresh_hash")
         if isinstance(user_id, int):
-            await cast(
-                "Awaitable[int]", self._redis.srem(self._user_key(user_id), access_jti)
-            )
+            await self._redis.srem(self._user_key(user_id), access_jti)
             await self._prune_user_index(user_id)
         if isinstance(refresh_hash, str):
             await self._redis.delete(self._refresh_key(refresh_hash))
@@ -218,7 +214,7 @@ class SessionStore:
     async def revoke_all_sessions(self, user_id: int) -> None:
         """吊销某用户的全部会话:逐个删 access 记录 + 其绑定 refresh,最后清空索引。"""
         user_key = self._user_key(user_id)
-        jtis = await cast("Awaitable[set[str]]", self._redis.smembers(user_key))
+        jtis = await self._redis.smembers(user_key)
         for jti in jtis:
             raw = await self._redis.get(self._access_key(jti))
             await self._redis.delete(self._access_key(jti))
@@ -231,7 +227,7 @@ class SessionStore:
             if isinstance(refresh_hash, str):
                 await self._redis.delete(self._refresh_key(refresh_hash))
         await self._redis.delete(user_key)
-        await cast("Awaitable[int]", self._redis.srem(_USERS_INDEX, str(user_id)))
+        await self._redis.srem(_USERS_INDEX, str(user_id))
 
     # ---- 在线会话枚举(B5)-------------------------------------------------
 
@@ -242,12 +238,12 @@ class SessionStore:
         滞留索引中——逐个取记录,缺失者顺手 ``SREM`` 清理,返回仍存活的会话元数据。
         """
         user_key = self._user_key(user_id)
-        jtis = await cast("Awaitable[set[str]]", self._redis.smembers(user_key))
+        jtis = await self._redis.smembers(user_key)
         sessions: list[SessionInfo] = []
         for jti in jtis:
             raw = await self._redis.get(self._access_key(jti))
             if raw is None:
-                await cast("Awaitable[int]", self._redis.srem(user_key, jti))
+                await self._redis.srem(user_key, jti)
                 continue
             record = self._parse_record(raw)
             if record is None:
@@ -262,17 +258,17 @@ class SessionStore:
         遍历 ``sess:users`` 全局索引,对每个用户调 :meth:`list_user_sessions`;某用户已无
         存活会话时,从全局索引中 ``SREM`` 该用户,避免索引无界增长。
         """
-        user_ids = await cast("Awaitable[set[str]]", self._redis.smembers(_USERS_INDEX))
+        user_ids = await self._redis.smembers(_USERS_INDEX)
         sessions: list[SessionInfo] = []
         for raw_uid in user_ids:
             try:
                 uid = int(raw_uid)
             except ValueError:
-                await cast("Awaitable[int]", self._redis.srem(_USERS_INDEX, raw_uid))
+                await self._redis.srem(_USERS_INDEX, raw_uid)
                 continue
             user_sessions = await self.list_user_sessions(uid)
             if not user_sessions:
-                await cast("Awaitable[int]", self._redis.srem(_USERS_INDEX, raw_uid))
+                await self._redis.srem(_USERS_INDEX, raw_uid)
                 continue
             sessions.extend(user_sessions)
         return sessions
@@ -281,7 +277,7 @@ class SessionStore:
         """该用户已无活跃会话时,从 ``sess:users`` 全局索引中移除(否则保留)。"""
         remaining = await self._redis.exists(self._user_key(user_id))
         if not remaining:
-            await cast("Awaitable[int]", self._redis.srem(_USERS_INDEX, str(user_id)))
+            await self._redis.srem(_USERS_INDEX, str(user_id))
 
     @staticmethod
     def _to_session_info(

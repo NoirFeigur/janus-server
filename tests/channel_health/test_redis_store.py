@@ -19,7 +19,6 @@ from src.channel_health.redis_store import (
 )
 from tests._async_redis_double import AsyncRedisDouble
 
-
 # ---------------------------------------------------------------------------
 # Health recording
 # ---------------------------------------------------------------------------

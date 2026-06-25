@@ -45,7 +45,6 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import cast
 
 from redis.exceptions import RedisError
 
@@ -113,10 +112,7 @@ async def _read_generations(user_id: int) -> tuple[str, str]:
     persistent (no TTL) and only ever ``INCR`` from there, the gen a reader sees
     is monotonic; a missing counter can never resurrect an old keyed snapshot.
     """
-    raw = await cast(
-        "Awaitable[list[str | None]]",
-        get_redis().mget(_GLOBAL_GEN_KEY, _user_gen_key(user_id)),
-    )
+    raw = await get_redis().mget(_GLOBAL_GEN_KEY, _user_gen_key(user_id))
     global_gen = raw[0] if raw[0] is not None else "0"
     user_gen = raw[1] if raw[1] is not None else "0"
     return global_gen, user_gen
@@ -159,7 +155,7 @@ async def invalidate_user(user_id: int) -> None:
     backstop bounds staleness to one snapshot window).
     """
     try:
-        await cast("Awaitable[int]", get_redis().incr(_user_gen_key(user_id)))
+        await get_redis().incr(_user_gen_key(user_id))
     except RedisError as exc:
         _log.warning("perm_cache_invalidate_user_failed", user_id=user_id, error=str(exc))
 
@@ -174,6 +170,6 @@ async def invalidate_all() -> None:
     Fail-open: a Redis error is logged, not raised.
     """
     try:
-        await cast("Awaitable[int]", get_redis().incr(_GLOBAL_GEN_KEY))
+        await get_redis().incr(_GLOBAL_GEN_KEY)
     except RedisError as exc:
         _log.warning("perm_cache_invalidate_all_failed", error=str(exc))

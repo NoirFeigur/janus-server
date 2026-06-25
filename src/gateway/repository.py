@@ -149,7 +149,8 @@ class GatewayRepository:
             .order_by(scope_rank)
             .limit(1)
         )
-        return await self.session.scalar(stmt)
+        result: int | None = await self.session.scalar(stmt)
+        return result
 
     async def get_logical_model_by_name(self, name: str) -> LogicalModel | None:
         stmt = select(LogicalModel).where(
@@ -157,7 +158,8 @@ class GatewayRepository:
             LogicalModel.status == ActiveStatus.active.value,
             LogicalModel.name == name,
         )
-        return await self.session.scalar(stmt)
+        result: LogicalModel | None = await self.session.scalar(stmt)
+        return result
 
     async def get_logical_model_by_id(self, logical_model_id: int) -> LogicalModel | None:
         stmt = select(LogicalModel).where(
@@ -165,7 +167,8 @@ class GatewayRepository:
             LogicalModel.status == ActiveStatus.active.value,
             LogicalModel.id == logical_model_id,
         )
-        return await self.session.scalar(stmt)
+        result: LogicalModel | None = await self.session.scalar(stmt)
+        return result
 
     async def get_logical_models_by_ids(
         self, logical_model_ids: Sequence[int]

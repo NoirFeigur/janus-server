@@ -7,9 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, cast
 
-from redis.asyncio import Redis
-
-from src.core.redis import get_redis
+from src.core.redis import AsyncRedis, get_redis
 from src.db.models.quota import Quota
 from src.enums import QuotaMetric, QuotaPeriod, QuotaScope
 
@@ -105,8 +103,13 @@ class QuotaEnforcer:
         legacy_key_format = quotas is None
         if quotas is None:
             quotas = cast("Sequence[Quota]", logical_model_id)
-            logical_model_id = int(department_id or 0)
+            model_id = int(department_id or 0)
             department_id = None
+        else:
+            # mypy: narrow the int | Sequence[Quota] union now that we know the
+            # caller used the modern (logical_model_id, quotas=...) form.
+            assert isinstance(logical_model_id, int)
+            model_id = logical_model_id
         if not quotas:
             return QuotaCheckResult(passed=True)
         redis = get_redis()
@@ -114,7 +117,7 @@ class QuotaEnforcer:
             self._key_for_quota(
                 user_id,
                 department_id,
-                int(logical_model_id),
+                model_id,
                 quota,
                 legacy_key_format=legacy_key_format,
             )
@@ -186,15 +189,18 @@ class QuotaEnforcer:
         legacy_key_format = quotas is None
         if quotas is None:
             quotas = cast("Sequence[Quota]", logical_model_id)
-            logical_model_id = int(department_id or 0)
+            model_id = int(department_id or 0)
             department_id = None
+        else:
+            assert isinstance(logical_model_id, int)
+            model_id = logical_model_id
         redis = get_redis()
         for quota in quotas:
             await redis.decr(
                 self._key_for_quota(
                     user_id,
                     department_id,
-                    int(logical_model_id),
+                    model_id,
                     quota,
                     legacy_key_format=legacy_key_format,
                 )
@@ -346,7 +352,7 @@ class QuotaEnforcer:
         )
 
     async def _run_check(
-        self, redis: Redis, keys: Sequence[str], argv: Sequence[str | int]
+        self, redis: AsyncRedis, keys: Sequence[str], argv: Sequence[str | int]
     ) -> list[int]:
         if hasattr(redis, "register_script"):
             return await cast(
@@ -356,7 +362,7 @@ class QuotaEnforcer:
         return await self._run_check_fallback(redis, keys, argv)
 
     async def _run_check_fallback(
-        self, redis: Redis, keys: Sequence[str], argv: Sequence[str | int]
+        self, redis: AsyncRedis, keys: Sequence[str], argv: Sequence[str | int]
     ) -> list[int]:
         incremented: list[str] = []
         quota_count = int(argv[0])
@@ -365,7 +371,7 @@ class QuotaEnforcer:
             ttl = int(argv[base])
             limit = int(argv[base + 1])
             enforce = int(argv[base + 2])
-            count = int(await cast("Awaitable[int]", redis.incr(keys[index])))
+            count = int(await redis.incr(keys[index]))
             if count == 1 and ttl > 0:
                 await redis.expire(keys[index], ttl)
             incremented.append(keys[index])
@@ -375,13 +381,13 @@ class QuotaEnforcer:
                 return [1, index, count]
         return [0, -1, -1]
 
-    async def _count(self, redis: Redis, key: str) -> int:
+    async def _count(self, redis: AsyncRedis, key: str) -> int:
         if hasattr(redis, "get"):
-            return int(await cast("Awaitable[int | str | None]", redis.get(key)) or 0)
+            return int(await redis.get(key) or 0)
         data = getattr(redis, "_data", {})
         return int(data.get(key, 0))
 
-    def _script(self, redis: Redis) -> Any:
+    def _script(self, redis: AsyncRedis) -> Any:
         if self._check_script is None:
             self._check_script = redis.register_script(_QUOTA_CHECK_LUA)
         return self._check_script

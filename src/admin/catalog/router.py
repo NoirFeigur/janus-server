@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -432,7 +432,7 @@ async def recover_channel(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/changelog", response_model=SuccessEnvelope[Page[dict]])
+@router.get("/changelog", response_model=SuccessEnvelope[Page[dict[str, Any]]])
 async def list_changelog(
     service: ServiceDep,
     trace_id: TraceId,
@@ -443,7 +443,7 @@ async def list_changelog(
     sort_order: Literal["asc", "desc"] = "desc",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> SuccessEnvelope[Page[dict]]:
+) -> SuccessEnvelope[Page[dict[str, Any]]]:
     """List catalog change log entries."""
     from sqlalchemy import desc as sa_desc
     from sqlalchemy import func, select

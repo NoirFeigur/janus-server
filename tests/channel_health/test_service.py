@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
-
 import pytest
 
 from src.channel_health.redis_store import (
     add_to_degraded,
     get_channel_state,
-    get_degraded_channel_ids,
     is_degraded,
-    record_request_outcome,
 )
 from src.channel_health.service import ChannelHealthService
 from tests._async_redis_double import AsyncRedisDouble

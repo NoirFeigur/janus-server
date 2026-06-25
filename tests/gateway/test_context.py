@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from src.enums import UsageStatus
 from src.gateway.context import GatewayRequestContext
 

@@ -130,7 +130,8 @@ async def get_cached_resolution(
         raw = await redis.get(key)
         if raw is None:
             return None
-        return json.loads(raw)
+        result: dict[str, Any] = json.loads(raw)
+        return result
     except (RedisError, json.JSONDecodeError, ValueError):
         return None
 
@@ -179,7 +180,8 @@ async def get_cached_quota_config(
         raw = await redis.get(key)
         if raw is None:
             return None
-        return json.loads(raw)
+        result: list[dict[str, Any]] = json.loads(raw)
+        return result
     except (RedisError, json.JSONDecodeError, ValueError):
         return None
 

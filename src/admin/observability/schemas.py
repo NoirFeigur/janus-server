@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, field_serializer
 
 
@@ -52,4 +54,4 @@ class QueueHealthRead(BaseModel):
 class DlqItemRead(BaseModel):
     """Single dead-letter queue item (raw JSON payload)."""
 
-    data: dict
+    data: dict[str, Any]

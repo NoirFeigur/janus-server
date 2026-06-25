@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -195,7 +196,9 @@ class GrantService:
         add_after_commit_hook(self.session, hook)
 
 
-def _bump_grant_cache_generation(scope: str, scope_id: int):  # noqa: ANN202
+def _bump_grant_cache_generation(
+    scope: str, scope_id: int
+) -> Callable[[], Awaitable[None]]:
     """Return an async callback that bumps the grant generation for a specific subject."""
 
     async def _hook() -> None:

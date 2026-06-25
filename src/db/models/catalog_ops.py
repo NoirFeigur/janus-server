@@ -9,6 +9,8 @@ with before/after JSON diffs for audit trail and rollback support.
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import BigInteger, Boolean, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -34,13 +36,13 @@ class CatalogChangeLog(LogEntity):
     action: Mapped[str] = mapped_column(
         String(32), index=True, comment="操作：create | update | delete | rotate | auto_disable"
     )
-    before_value: Mapped[dict | None] = mapped_column(
+    before_value: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True, comment="变更前值（脱敏）"
     )
-    after_value: Mapped[dict | None] = mapped_column(
+    after_value: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True, comment="变更后值（脱敏）"
     )
-    diff: Mapped[dict | None] = mapped_column(
+    diff: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True, comment="差异摘要（field→{old,new}）"
     )
     snapshot_id: Mapped[int | None] = mapped_column(
@@ -70,7 +72,7 @@ class CatalogConfigSnapshot(LogEntity):
     is_known_good: Mapped[bool] = mapped_column(
         Boolean, default=False, comment="是否为最近一次验证通过的已知良好配置"
     )
-    config: Mapped[dict] = mapped_column(
+    config: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         comment="完整配置 JSON：channels/keys/models/deployments（密钥字段保留加密形式）",
     )

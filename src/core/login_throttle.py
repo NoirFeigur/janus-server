@@ -21,11 +21,9 @@ key 模式:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import cast
 
-from redis.asyncio import Redis
+from src.core.redis import AsyncRedis
 
 _FAIL_PREFIX = "login:fail:"
 _LOCK_PREFIX = "login:lock:"
@@ -46,7 +44,7 @@ class ThrottlePolicy:
 class LoginThrottle:
     """登录防爆破的 Redis 读写封装（注入 Redis client + 策略,便于测试）。"""
 
-    def __init__(self, redis: Redis, policy: ThrottlePolicy) -> None:
+    def __init__(self, redis: AsyncRedis, policy: ThrottlePolicy) -> None:
         self._redis = redis
         self._policy = policy
 
@@ -90,7 +88,7 @@ class LoginThrottle:
         首次设 TTL = IP 滑窗。
         """
         fail_key = self._fail_key(username)
-        count = await cast("Awaitable[int]", self._redis.incr(fail_key))
+        count = await self._redis.incr(fail_key)
         if count == 1:
             await self._redis.expire(fail_key, self._policy.failure_window_seconds)
         if count >= self._policy.max_failures:
@@ -99,7 +97,7 @@ class LoginThrottle:
             )
         if ip is not None:
             ip_key = self._ip_key(ip)
-            ip_count = await cast("Awaitable[int]", self._redis.incr(ip_key))
+            ip_count = await self._redis.incr(ip_key)
             if ip_count == 1:
                 await self._redis.expire(ip_key, self._policy.ip_window_seconds)
 
