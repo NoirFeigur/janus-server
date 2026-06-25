@@ -80,7 +80,7 @@ async def _get_probe_info(channel_id: int) -> dict[str, Any] | None:
     Returns None if channel has no active keys/deployments to probe.
     """
     with suppress(Exception):
-        from src.core.channel_crypto import decrypt_key
+        from src.core.channel_crypto import decrypt_channel_key
         from src.db.session import async_session_factory
 
         async with async_session_factory() as session:
@@ -121,8 +121,8 @@ async def _get_probe_info(channel_id: int) -> dict[str, Any] | None:
             return {
                 "provider": channel.provider,
                 "upstream_model": deployment.upstream_model,
-                "api_key": decrypt_key(key_row.api_key_encrypted),
-                "api_base": channel.base_url,
+                "api_key": decrypt_channel_key(key_row.api_key_encrypted),
+                "api_base": channel.api_base,
             }
     return None
 
