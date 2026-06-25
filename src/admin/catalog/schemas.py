@@ -120,7 +120,7 @@ class LogicalModelCreate(BaseModel):
     context_length: int | None = None
     price_input: Decimal | None = None
     price_output: Decimal | None = None
-    status: str = Field(default="active", max_length=16)
+    status: Literal["active", "disabled"] = "active"
     remark: str | None = Field(default=None, max_length=255)
 
 
@@ -134,7 +134,7 @@ class LogicalModelUpdate(BaseModel):
     context_length: int | None = None
     price_input: Decimal | None = None
     price_output: Decimal | None = None
-    status: str | None = Field(default=None, max_length=16)
+    status: Literal["active", "disabled"] | None = None
     remark: str | None = Field(default=None, max_length=255)
 
 

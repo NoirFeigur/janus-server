@@ -63,6 +63,15 @@ class AsyncRedisDouble:
             return True
         return False
 
+    def _key_exists(self, key: str) -> bool:
+        return (
+            key in self._data
+            or key in self._sets
+            or key in self._lists
+            or key in self._hashes
+            or key in self._zsets
+        )
+
     async def get(self, key: str) -> str | None:
         if self._evict_if_expired(key):
             return None
@@ -73,10 +82,11 @@ class AsyncRedisDouble:
         # (matching the production client used by perm_cache's generation read).
         return [await self.get(key) for key in keys]
 
-    async def set(self, key: str, value: str, ex: int | None = None, *, nx: bool = False) -> bool | None:
-        if nx:
-            if not self._evict_if_expired(key) and key in self._data:
-                return None
+    async def set(
+        self, key: str, value: str, ex: int | None = None, *, nx: bool = False
+    ) -> bool | None:
+        if nx and not self._evict_if_expired(key) and key in self._data:
+            return None
         self._data[key] = value
         if ex is not None:
             self._expiry[key] = time.monotonic() + ex
@@ -103,7 +113,7 @@ class AsyncRedisDouble:
         for key in keys:
             if self._evict_if_expired(key):
                 continue
-            if key in self._data or key in self._sets or key in self._lists or key in self._hashes or key in self._zsets:
+            if self._key_exists(key):
                 count += 1
         return count
 
@@ -160,16 +170,14 @@ class AsyncRedisDouble:
     async def expire(self, key: str, seconds: int) -> bool:
         if self._evict_if_expired(key):
             return False
-        if key not in self._data and key not in self._sets and key not in self._lists and key not in self._hashes and key not in self._zsets:
+        if not self._key_exists(key):
             return False
         self._expiry[key] = time.monotonic() + seconds
         return True
 
     async def ttl(self, key: str) -> int:
         # Redis semantics: -2 = no key, -1 = key without expiry, else seconds left.
-        if self._evict_if_expired(key) or (
-            key not in self._data and key not in self._sets and key not in self._lists and key not in self._hashes and key not in self._zsets
-        ):
+        if self._evict_if_expired(key) or not self._key_exists(key):
             return -2
         deadline = self._expiry.get(key)
         if deadline is None:
@@ -186,8 +194,16 @@ class AsyncRedisDouble:
         return 0
 
     # ------------------------------------------------------------------
-    # List operations (RPUSH / LPOP / LLEN / LRANGE)
+    # List operations (LPUSH / RPUSH / LPOP / LREM / LLEN / LRANGE)
     # ------------------------------------------------------------------
+
+    async def lpush(self, key: str, *values: str) -> int:
+        if self._evict_if_expired(key):
+            pass
+        lst = self._lists.setdefault(key, [])
+        for v in values:
+            lst.insert(0, v)
+        return len(lst)
 
     async def rpush(self, key: str, *values: str) -> int:
         if self._evict_if_expired(key):
@@ -211,6 +227,33 @@ class AsyncRedisDouble:
             self._lists.pop(key, None)
         return result
 
+    async def lrem(self, key: str, count: int, value: str) -> int:
+        if self._evict_if_expired(key):
+            return 0
+        lst = self._lists.get(key)
+        if not lst:
+            return 0
+        removed = 0
+        if count >= 0:
+            index = 0
+            while index < len(lst):
+                if lst[index] == value and (count == 0 or removed < count):
+                    del lst[index]
+                    removed += 1
+                    continue
+                index += 1
+        else:
+            index = len(lst) - 1
+            limit = abs(count)
+            while index >= 0:
+                if lst[index] == value and removed < limit:
+                    del lst[index]
+                    removed += 1
+                index -= 1
+        if not lst:
+            self._lists.pop(key, None)
+        return removed
+
     async def llen(self, key: str) -> int:
         if self._evict_if_expired(key):
             return 0
@@ -227,7 +270,13 @@ class AsyncRedisDouble:
     # Hash operations (HSET / HGET / HGETALL / HINCRBY / HMGET)
     # ------------------------------------------------------------------
 
-    async def hset(self, key: str, field: str | None = None, value: str | None = None, mapping: dict[str, str] | None = None) -> int:
+    async def hset(
+        self,
+        key: str,
+        field: str | None = None,
+        value: str | None = None,
+        mapping: dict[str, str] | None = None,
+    ) -> int:
         if self._evict_if_expired(key):
             pass
         h = self._hashes.setdefault(key, {})
@@ -276,7 +325,12 @@ class AsyncRedisDouble:
     # Sorted set operations (ZADD / ZREM / ZCARD / ZREMRANGEBYSCORE)
     # ------------------------------------------------------------------
 
-    async def zadd(self, key: str, score_member: dict[str, float] | None = None, **kwargs: float) -> int:
+    async def zadd(
+        self,
+        key: str,
+        score_member: dict[str, float] | None = None,
+        **kwargs: float,
+    ) -> int:
         """Simplified ZADD: zadd(key, {member: score})."""
         if self._evict_if_expired(key):
             pass
@@ -309,7 +363,9 @@ class AsyncRedisDouble:
             return 0
         return len(self._zsets.get(key, {}))
 
-    async def zremrangebyscore(self, key: str, min_score: float | str, max_score: float | str) -> int:
+    async def zremrangebyscore(
+        self, key: str, min_score: float | str, max_score: float | str
+    ) -> int:
         if self._evict_if_expired(key):
             return 0
         zs = self._zsets.get(key)
@@ -334,30 +390,10 @@ class AsyncRedisDouble:
         bucket = self._sets.get(key)
         return member in bucket if bucket else False
 
-    # ------------------------------------------------------------------
-    # SET with NX (conditional set)
-    # ------------------------------------------------------------------
-
-    async def set(self, key: str, value: str, ex: int | None = None, *, nx: bool = False) -> bool | None:  # type: ignore[override]
-        if nx:
-            if not self._evict_if_expired(key) and key in self._data:
-                return None
-        self._data[key] = value
-        if ex is not None:
-            self._expiry[key] = time.monotonic() + ex
-        else:
-            self._expiry.pop(key, None)
-        return True
-
-    # ------------------------------------------------------------------
-    # PEXPIRE
-    # ------------------------------------------------------------------
-
     async def pexpire(self, key: str, milliseconds: int) -> bool:
         if self._evict_if_expired(key):
             return False
-        present = key in self._data or key in self._sets or key in self._hashes or key in self._zsets or key in self._lists
-        if not present:
+        if not self._key_exists(key):
             return False
         self._expiry[key] = time.monotonic() + (milliseconds / 1000.0)
         return True
@@ -375,6 +411,18 @@ class AsyncRedisDouble:
         # Parse key and args
         keys = [str(args[i]) for i in range(numkeys)]
         argv = [str(args[i]) for i in range(numkeys, len(args))]
+
+        if "CLAIM_EVENT_QUEUE" in script:
+            import json
+
+            pending_key = keys[0]
+            inflight_key = keys[1]
+            payload = await self.lpop(pending_key)
+            if payload is None:
+                return None  # type: ignore[return-value]
+            envelope = json.dumps({"payload": payload, "claimed_at_ms": argv[0]})
+            await self.rpush(inflight_key, envelope)
+            return envelope  # type: ignore[return-value]
 
         # Concurrent script: uses "timeout_ms" variable (unique marker)
         if "timeout_ms" in script:

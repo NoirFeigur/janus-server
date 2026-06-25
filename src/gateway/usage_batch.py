@@ -1,9 +1,9 @@
 """Durable batch writer for usage events (P3).
 
-Runs as an ARQ cron job (every 5 seconds).  Pops pending usage events from the
-Redis queue, bulk-inserts them into ``usage_record``, and moves failures to DLQ
-after max retries.  Idempotent: events carry ``request_id`` but inserts are
-append-only (no upsert needed — duplicates are harmless at accounting scale).
+Runs as an ARQ cron job (every 5 seconds).  Claims pending usage events into an
+inflight Redis list, bulk-inserts them into ``usage_record``, and ACKs only after
+the DB transaction succeeds.  Failed writes are requeued with bounded retry
+metadata and moved to DLQ after max retries.
 """
 
 from __future__ import annotations
@@ -13,71 +13,112 @@ from contextlib import suppress
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import select
+
 from src.core.logging import get_logger
 from src.gateway.events import (
     DEFAULT_BATCH_SIZE,
     USAGE_DLQ_KEY,
+    USAGE_INFLIGHT_KEY,
     USAGE_QUEUE_KEY,
-    pop_batch,
-    send_to_dlq,
+    ClaimedEvent,
+    ack_claimed,
+    claim_batch,
+    dlq_claimed,
+    recover_stale_claims,
+    retry_or_dlq_claimed,
 )
 
 _log = get_logger(__name__)
 
 
 async def flush_usage_records(ctx: dict[str, Any]) -> int:
-    """ARQ task: pop usage events from Redis queue and bulk-insert to DB.
+    """ARQ task: claim usage events from Redis queue and bulk-insert to DB.
 
     Returns the number of records successfully written.
     """
-    items = await pop_batch(USAGE_QUEUE_KEY, DEFAULT_BATCH_SIZE)
-    if not items:
+    await recover_stale_claims(
+        queue_key=USAGE_QUEUE_KEY,
+        inflight_key=USAGE_INFLIGHT_KEY,
+        dlq_key=USAGE_DLQ_KEY,
+    )
+    claimed = await claim_batch(USAGE_QUEUE_KEY, USAGE_INFLIGHT_KEY, DEFAULT_BATCH_SIZE)
+    if not claimed:
         return 0
 
     records: list[dict[str, Any]] = []
-    unparseable: list[str] = []
-    for raw in items:
+    valid_claims: list[ClaimedEvent] = []
+    unparseable: list[ClaimedEvent] = []
+    for item in claimed:
         try:
-            records.append(json.loads(raw))
+            record = json.loads(item.raw)
+            if not isinstance(record, dict):
+                raise TypeError("usage event must be a JSON object")
+            records.append(record)
+            valid_claims.append(item)
         except (json.JSONDecodeError, TypeError):
-            unparseable.append(raw)
+            unparseable.append(item)
 
     if unparseable:
-        await send_to_dlq(USAGE_DLQ_KEY, unparseable)
+        await dlq_claimed(USAGE_INFLIGHT_KEY, USAGE_DLQ_KEY, unparseable)
         _log.warning("gateway.usage_batch.unparseable", count=len(unparseable))
 
     if not records:
         return 0
 
-    written = await _bulk_insert_usage(records)
-    if written < len(records):
-        # Some failed — the ones that weren't written go to DLQ
-        # Since bulk insert is all-or-nothing, either all succeed or all fail
-        pass
+    try:
+        written = await _bulk_insert_usage(records)
+    except Exception:
+        _log.exception("gateway.usage_batch.db_write_failed", count=len(records))
+        await retry_or_dlq_claimed(
+            queue_key=USAGE_QUEUE_KEY,
+            inflight_key=USAGE_INFLIGHT_KEY,
+            dlq_key=USAGE_DLQ_KEY,
+            items=valid_claims,
+        )
+        return 0
+
+    await ack_claimed(USAGE_INFLIGHT_KEY, valid_claims)
     return written
 
 
 async def _bulk_insert_usage(records: list[dict[str, Any]]) -> int:
-    """Bulk-insert usage records into the database.
+    """Bulk-insert usage records into the database."""
+    from src.db.models.usage import UsageRecord
+    from src.db.session import unit_of_work
 
-    On failure, moves ALL items to DLQ and returns 0.
-    """
-    try:
-        from src.db.session import unit_of_work
+    async with unit_of_work() as session:
+        existing_request_ids: set[str] = set()
+        request_ids = [str(r["request_id"]) for r in records if r.get("request_id")]
+        if request_ids:
+            result = await session.execute(
+                select(UsageRecord.request_id).where(UsageRecord.request_id.in_(request_ids))
+            )
+            existing_request_ids = {str(value) for value in result.scalars().all() if value}
 
-        async with unit_of_work() as session:
-            orm_records = [_to_usage_record(r) for r in records]
-            session.add_all(orm_records)
+        seen_request_ids: set[str] = set()
+        new_records: list[dict[str, Any]] = []
+        for record in records:
+            request_id = record.get("request_id")
+            if not request_id:
+                new_records.append(record)
+                continue
+            request_id = str(request_id)
+            if request_id in existing_request_ids or request_id in seen_request_ids:
+                continue
+            seen_request_ids.add(request_id)
+            new_records.append(record)
+        orm_records = [_to_usage_record(r) for r in new_records]
+        session.add_all(orm_records)
 
-        _log.debug("gateway.usage_batch.flushed", count=len(records))
-        return len(records)
-    except Exception:
-        _log.exception("gateway.usage_batch.db_write_failed", count=len(records))
-        # Attempt retry tracking: for simplicity, send to DLQ immediately
-        # (ARQ cron re-invocation handles "retry" semantics at the batch level)
-        failed_items = [json.dumps(r, default=str) for r in records]
-        await send_to_dlq(USAGE_DLQ_KEY, failed_items)
-        return 0
+    skipped = len(records) - len(new_records)
+    if skipped:
+        _log.info(
+            "gateway.usage_batch.duplicates_skipped",
+            count=skipped,
+        )
+    _log.debug("gateway.usage_batch.flushed", count=len(new_records))
+    return len(new_records)
 
 
 def _to_usage_record(data: dict[str, Any]) -> Any:

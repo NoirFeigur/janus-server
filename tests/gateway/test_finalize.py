@@ -333,10 +333,10 @@ async def test_finalize_settles_partial_usage_even_when_stream_errors(
 
 
 @pytest.mark.asyncio
-async def test_finalize_falls_back_to_legacy_settle_without_reservations(
+async def test_finalize_does_not_requery_quota_without_reservations(
     fake_redis: AsyncRedisDouble,
 ) -> None:
-    """No reservations (e.g. cache-hit synthetic ctx) uses the legacy re-query path."""
+    """No reservations must not fall back to hot-reloading quota rules."""
     ctx = GatewayRequestContext(
         user_id=1,
         logical_model_id=10,
@@ -358,6 +358,7 @@ async def test_finalize_falls_back_to_legacy_settle_without_reservations(
         service=service,
     )
 
-    # Legacy re-query settle used; reservation-based NOT used.
-    service.settle_quota.assert_awaited_once()
+    service.repo.get_active_quotas.assert_not_called()
     service.quota.settle_reservations.assert_not_called()
+    service.quota.compensate_reservations.assert_not_called()
+    assert ctx.quota_settled is False

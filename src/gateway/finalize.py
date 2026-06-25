@@ -102,25 +102,13 @@ async def _settle_quota(
             ctx.quota_settled = True
             return
 
-        # Legacy fallback: re-query active quotas (used where reservations were
-        # not captured, e.g. cache-hit synthetic contexts).
-        if should_compensate:
-            quotas = await service.repo.get_active_quotas(
-                ctx.user_id, ctx.department_id, logical_model.id
-            )
-            await service.quota.compensate(
-                ctx.user_id, ctx.department_id, logical_model.id, quotas
-            )
-        else:
-            cost = _compute_cost(ctx, logical_model)
-            await service.settle_quota(
-                ctx.user_id,
-                ctx.department_id,
-                logical_model.id,
-                ctx.total_tokens,
-                cost,
-            )
-        ctx.quota_settled = True
+        _log.warning(
+            "gateway.quota.reservations_missing",
+            request_id=ctx.request_id,
+            user_id=ctx.user_id,
+            logical_model_id=logical_model.id,
+            total_tokens=ctx.total_tokens,
+        )
 
 
 def _compute_cost(

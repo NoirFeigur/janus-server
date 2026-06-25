@@ -6,6 +6,7 @@ import os
 
 import pytest
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.catalog.schemas import (
@@ -141,6 +142,18 @@ async def test_create_model_duplicate_name_rejected(
         await svc.create_model(_model_payload(display_name="Duplicate"), actor=ACTOR)
 
     assert exc.value.status_code == 400
+
+
+async def test_logical_model_status_rejects_invalid_values() -> None:
+    with pytest.raises(ValidationError):
+        LogicalModelCreate(
+            name="bad-model",
+            display_name="Bad Model",
+            status="paused",
+        )
+
+    with pytest.raises(ValidationError):
+        LogicalModelUpdate(status="paused")
 
 
 async def test_create_deployment_requires_active_model_and_channel(

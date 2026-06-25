@@ -15,6 +15,12 @@ from src.gateway.router_manager import RouterManager
 _DUMMY_FACTORY = cast("async_sessionmaker[AsyncSession]", object())
 
 
+def test_router_close_grace_matches_stream_max_duration() -> None:
+    from src.gateway.router import _STREAM_MAX_DURATION_SECONDS
+
+    assert RouterManager._router_close_grace_seconds == _STREAM_MAX_DURATION_SECONDS
+
+
 @pytest.mark.asyncio
 async def test_invalidate_burst_coalesces_into_single_rebuild(
     monkeypatch: pytest.MonkeyPatch,

@@ -14,6 +14,7 @@ from sqlalchemy.ext.compiler import compiles
 from src.config import get_settings
 from src.core.channel_crypto import encrypt_channel_key
 from src.db.base import Base
+from src.db.models.gateway_observability import GatewayRequestLog
 from src.db.models.grant import UserModelGrant
 from src.db.models.model_catalog import (
     ChannelKey,
@@ -48,6 +49,7 @@ _TABLES = [
         Quota,
         RateLimitRule,
         UsageRecord,
+        GatewayRequestLog,
     )
 ]
 

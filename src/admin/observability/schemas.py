@@ -42,7 +42,9 @@ class GatewayLogRead(BaseModel):
 
 class QueueHealthRead(BaseModel):
     usage_pending: int = 0
+    usage_inflight: int = 0
     log_pending: int = 0
+    log_inflight: int = 0
     usage_dlq: int = 0
     log_dlq: int = 0
 

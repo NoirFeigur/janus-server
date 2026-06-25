@@ -33,10 +33,10 @@ class RouterManager:
     # reference atomically, but requests that already obtained the old Router via
     # get_router() are still streaming through its aiohttp/Redis sessions. Closing
     # inline tore those sessions down mid-flight (connection-reset errors). We
-    # defer the close so in-flight requests drain first. (Very long streams beyond
-    # this window are an accepted edge for a config hot-reload; the next rebuild
-    # will not affect already-started streams that completed within the grace.)
-    _router_close_grace_seconds: float = 60.0
+    # defer the close so in-flight requests drain first.  Match the gateway's
+    # stream max-duration cap (30 minutes), otherwise hot-reload can close the
+    # superseded Router while a still-valid long stream is active.
+    _router_close_grace_seconds: float = 1800.0
     _invalidate_event: asyncio.Event = asyncio.Event()
     _poll_task: asyncio.Task[None] | None = None
     _sub_task: asyncio.Task[None] | None = None

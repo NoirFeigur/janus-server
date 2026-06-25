@@ -15,8 +15,10 @@ from src.db.models.gateway_observability import GatewayRequestLog
 from src.db.models.identity import User
 from src.gateway.events import (
     LOG_DLQ_KEY,
+    LOG_INFLIGHT_KEY,
     LOG_QUEUE_KEY,
     USAGE_DLQ_KEY,
+    USAGE_INFLIGHT_KEY,
     USAGE_QUEUE_KEY,
     flush_dlq,
     get_queue_length,
@@ -132,7 +134,9 @@ class ObservabilityService:
     async def get_queue_health(self) -> dict[str, int]:
         return {
             "usage_pending": await get_queue_length(USAGE_QUEUE_KEY),
+            "usage_inflight": await get_queue_length(USAGE_INFLIGHT_KEY),
             "log_pending": await get_queue_length(LOG_QUEUE_KEY),
+            "log_inflight": await get_queue_length(LOG_INFLIGHT_KEY),
             "usage_dlq": await get_queue_length(USAGE_DLQ_KEY),
             "log_dlq": await get_queue_length(LOG_DLQ_KEY),
         }
