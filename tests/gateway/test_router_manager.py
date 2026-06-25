@@ -15,10 +15,14 @@ from src.gateway.router_manager import RouterManager
 _DUMMY_FACTORY = cast("async_sessionmaker[AsyncSession]", object())
 
 
-def test_router_close_grace_matches_stream_max_duration() -> None:
+def test_router_close_grace_exceeds_stream_max_duration() -> None:
+    """Grace must sit STRICTLY ABOVE the stream cap so a stream that hits the cap
+    at the same instant a rebuild lands does not race the superseded Router's
+    close. Exact equality (the previous contract) leaves no slack for finalize
+    latency."""
     from src.gateway.router import _STREAM_MAX_DURATION_SECONDS
 
-    assert RouterManager._router_close_grace_seconds == _STREAM_MAX_DURATION_SECONDS
+    assert RouterManager._router_close_grace_seconds > _STREAM_MAX_DURATION_SECONDS
 
 
 @pytest.mark.asyncio

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from contextlib import suppress
 from typing import NoReturn
 
-from litellm import Router
+from litellm.router import Router
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette import status
 
 from src.core.logging import get_logger
 from src.enums import ErrorCode
 from src.exceptions import AppError
-from src.gateway.repository import GatewayRepository
+from src.gateway.repository import GatewayRepository, RouterDeploymentRow
 from src.gateway.router_factory import build_router
 
 _log = get_logger(__name__)
@@ -33,10 +34,11 @@ class RouterManager:
     # reference atomically, but requests that already obtained the old Router via
     # get_router() are still streaming through its aiohttp/Redis sessions. Closing
     # inline tore those sessions down mid-flight (connection-reset errors). We
-    # defer the close so in-flight requests drain first.  Match the gateway's
-    # stream max-duration cap (30 minutes), otherwise hot-reload can close the
-    # superseded Router while a still-valid long stream is active.
-    _router_close_grace_seconds: float = 1800.0
+    # defer the close so in-flight requests drain first.  Sit STRICTLY ABOVE the
+    # gateway's stream max-duration cap (30 minutes) — an exact equality lets a
+    # superseded Router race with a stream that hits the cap at the same instant.
+    # The 60s cushion absorbs scheduling + finalize latency.
+    _router_close_grace_seconds: float = 1860.0
     _invalidate_event: asyncio.Event = asyncio.Event()
     _poll_task: asyncio.Task[None] | None = None
     _sub_task: asyncio.Task[None] | None = None
@@ -106,7 +108,7 @@ class RouterManager:
             )
 
     @classmethod
-    def _fingerprint(cls, rows: object) -> tuple[object, ...]:
+    def _fingerprint(cls, rows: Sequence[RouterDeploymentRow]) -> tuple[object, ...]:
         """Return a stable config fingerprint for the Router inputs."""
         return tuple(
             (
@@ -138,16 +140,23 @@ class RouterManager:
 
     @classmethod
     async def _close_router_after_grace(cls, router: Router) -> None:
-        """Wait the grace window, then close the Router.
+        """Wait the grace window, then release the superseded Router.
 
-        The close runs in ``finally`` so a shutdown-time cancellation still
-        releases the Router's aiohttp/Redis sessions instead of leaking them.
+        litellm's ``Router`` does not expose an explicit ``close``/``aclose``;
+        its underlying aiohttp/Redis sessions are released by garbage collection
+        once no in-flight request still holds a reference. The grace sleep gives
+        those requests time to drain so GC actually has nothing pinned. We probe
+        for ``close`` defensively in case a future litellm release adds it.
         """
         try:
             await asyncio.sleep(cls._router_close_grace_seconds)
         finally:
-            with suppress(Exception):
-                await router.close()  # type-safe: litellm Router exposes close()
+            close = getattr(router, "close", None)
+            if callable(close):
+                with suppress(Exception):
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
 
     @classmethod
     def get_router(cls) -> Router:

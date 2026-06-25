@@ -14,10 +14,9 @@ released in stream finally.
 from __future__ import annotations
 
 import time
-from collections.abc import Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from redis.exceptions import RedisError
 
@@ -27,8 +26,48 @@ from src.core.redis import get_redis
 _log = get_logger(__name__)
 
 # Conservative upfront TPM reservation per request.  Settled against actual
-# token usage at request finalization (see finalize._settle_tpm).
+# token usage at request finalization (see finalize._settle_tpm).  Used as a
+# minimum floor when no message-derived estimate is available.
 ESTIMATED_TOKENS_PER_REQUEST = 100
+
+# Approximate characters-per-token ratio. ~4 chars/token is the standard
+# heuristic across OpenAI / Anthropic / Gemini tokenizers for English; CJK runs
+# closer to 1 char/token but the *floor* this drives is fine to under-estimate
+# since settlement reconciles to actuals.
+_CHARS_PER_TOKEN = 4
+# Hard ceiling on the upfront estimate so a single oversized request cannot
+# drain the entire bucket via reservation. The signed-delta settlement still
+# bills the actual overage at finalize time.
+_MAX_UPFRONT_ESTIMATE = 4000
+
+
+def estimate_request_tokens(messages: object) -> int:
+    """Estimate prompt tokens for an upfront TPM reservation.
+
+    Falls back to :data:`ESTIMATED_TOKENS_PER_REQUEST` for inputs we cannot
+    inspect, but otherwise returns a length-derived floor so a 5k-prompt request
+    against a 30k-TPM bucket cannot bypass the limit by reserving only 100
+    tokens upfront and relying on settle-time reconciliation. The estimate is
+    capped so a malicious payload cannot starve the bucket.
+    """
+    if not isinstance(messages, list):
+        return ESTIMATED_TOKENS_PER_REQUEST
+    total_chars = 0
+    for msg in messages:
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text")
+                        if isinstance(text, str):
+                            total_chars += len(text)
+    if total_chars <= 0:
+        return ESTIMATED_TOKENS_PER_REQUEST
+    estimate = max(ESTIMATED_TOKENS_PER_REQUEST, total_chars // _CHARS_PER_TOKEN)
+    return min(estimate, _MAX_UPFRONT_ESTIMATE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +235,7 @@ async def check_rate_limits(
             rpm_limit = rule.get("rpm_limit")
             if rpm_limit is not None:
                 key = f"rl:rpm:{rule_id}:{subject_key}"
-                result = await redis.eval(  # type: ignore[union-attr]
+                result = await redis.eval(
                     _LUA_RPM_CHECK, 1, key, now_ms, 60000, rpm_limit, member
                 )
                 allowed, current, limit = int(result[0]), int(result[1]), int(result[2])
@@ -216,7 +255,7 @@ async def check_rate_limits(
                 key = f"rl:tpm:{rule_id}:{subject_key}"
                 tpm_burst_limit = rule.get("tpm_burst_limit") or tpm_limit
                 refill_rate = tpm_limit  # tokens per minute
-                result = await redis.eval(  # type: ignore[union-attr]
+                result = await redis.eval(
                     _LUA_TPM_CHECK,
                     1,
                     key,
@@ -242,7 +281,7 @@ async def check_rate_limits(
             if max_concurrent is not None and is_stream:
                 key = f"rl:conc:{rule_id}:{subject_key}"
                 timeout_ms = 1800 * 1000  # 30 min max stream
-                result = await redis.eval(  # type: ignore[union-attr]
+                result = await redis.eval(
                     _LUA_CONCURRENT_CHECK, 1, key, now_ms, max_concurrent,
                     member, timeout_ms
                 )
@@ -315,15 +354,12 @@ async def settle_tpm(request_id: str, rules: list[dict[str, Any]], delta_tokens:
                 rule_id = rule.get("id", 0)
                 subject_key = _subject_key(rule)
                 key = f"rl:tpm:{rule_id}:{subject_key}"
-                await cast(
-                    "Awaitable[Any]",
-                    redis.eval(
-                        _LUA_TPM_SETTLE,
-                        1,
-                        key,
-                        str(delta_tokens),
-                        str(tpm_burst_limit),
-                    ),
+                await redis.eval(
+                    _LUA_TPM_SETTLE,
+                    1,
+                    key,
+                    str(delta_tokens),
+                    str(tpm_burst_limit),
                 )
 
 

@@ -28,6 +28,7 @@ from src.gateway.quota import QuotaCheckResult, QuotaReservation
 from src.gateway.rate_limit import (
     ESTIMATED_TOKENS_PER_REQUEST,
     check_rate_limits,
+    estimate_request_tokens,
     release_concurrent,
 )
 from src.gateway.response_cache import (
@@ -46,9 +47,44 @@ router = APIRouter(tags=["gateway"])
 GatewayServiceDep = Annotated[GatewayService, Depends(get_gateway_service)]
 RequestSchemaT = TypeVar("RequestSchemaT", bound=BaseModel)
 
-_MAX_BODY_BYTES = 1_048_576
+# 4 MiB accommodates Anthropic 200K-token requests with base64 images and
+# tool definitions; the previous 1 MiB cap rejected legitimate Claude payloads.
+_MAX_BODY_BYTES = 4 * 1_048_576
 _STREAM_MAX_DURATION_SECONDS = 1800
 _STREAM_IDLE_TIMEOUT_SECONDS = 60
+
+
+async def _finalize_stream(
+    ctx: GatewayRequestContext,
+    *,
+    logical_model: LogicalModel,
+    service: GatewayService,
+    response: Any,
+    member: str,
+    rate_limit_rules: list[dict[str, Any]] | None,
+    quota_reservations: list[QuotaReservation] | None,
+) -> None:
+    """Run all post-stream cleanup in a single shielded block.
+
+    Wrapping the cleanup in :func:`asyncio.shield` is load-bearing: when the
+    client disconnects, Starlette cancels the streaming task and the generator's
+    ``finally`` runs with a pending ``CancelledError``. Without the shield the
+    second ``await`` in the chain (e.g. ``release_concurrent`` after
+    ``finalize_gateway_request``) is interrupted at the next checkpoint, leaving
+    the TPM reservation un-refunded, the concurrent semaphore slot held, and the
+    upstream HTTP connection leaked. The shield guarantees this cleanup runs to
+    completion regardless of cancellation.
+    """
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        rate_limit_rules=rate_limit_rules,
+        quota_reservations=quota_reservations,
+    )
+    if rate_limit_rules:
+        await release_concurrent(member, rate_limit_rules)
+    await _aclose_response(response)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +135,7 @@ async def anthropic_messages(
         request_id=request_id,
         member=rl_member,
         is_stream=payload.stream,
+        estimated_tokens=estimate_request_tokens(payload.messages),
     )
 
     quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
@@ -231,6 +268,7 @@ async def gemini_generate_content(
         request_id=request_id,
         member=rl_member,
         is_stream=stream,
+        estimated_tokens=estimate_request_tokens(payload.contents),
     )
 
     quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
@@ -377,12 +415,18 @@ async def _check_rate_limits(
     request_id: str,
     member: str,
     is_stream: bool,
+    estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
 ) -> list[dict[str, Any]]:
     """Enforce rate limits before quota reservation (P2).
 
     ``member`` is a server-side unguessable token (not the client-controllable
     request id) used as the RPM/concurrent sorted-set member; the same value
     must be passed to ``release_concurrent`` in the stream finally block.
+
+    ``estimated_tokens`` is the upfront TPM reservation. Callers should pass a
+    length-derived estimate via :func:`estimate_request_tokens` so a 5k-prompt
+    request cannot bypass a tight TPM bucket by reserving only the default
+    floor. Settlement at finalize reconciles to actuals either way.
 
     Returns the applicable rules so the caller can release the concurrent slot
     in the stream finally block.  Raises 429 if any limit is exceeded.
@@ -398,7 +442,7 @@ async def _check_rate_limits(
             request_id=request_id,
             member=member,
             rules=rules,
-            estimated_tokens=ESTIMATED_TOKENS_PER_REQUEST,
+            estimated_tokens=estimated_tokens,
             is_stream=is_stream,
         )
         if not rl_result.allowed:
@@ -431,6 +475,7 @@ async def _execute_completion(
         request_id=request_id,
         member=rl_member,
         is_stream=stream,
+        estimated_tokens=estimate_request_tokens(messages),
     )
 
     quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
@@ -447,8 +492,12 @@ async def _execute_completion(
         fingerprint = compute_fingerprint(logical_model.name, messages, params)
         cached = await get_cached_response(logical_model.id, fingerprint)
         if cached is not None:
-            # Cache hit: still record usage with cache_hit=True
-            usage = _extract_usage(cached) if "usage" in str(cached) else _empty_usage()
+            # Cache hit: still record usage with cache_hit=True. _extract_usage
+            # safely returns _empty_usage() when the cached payload lacks a
+            # usage dict, so probe directly without a stringly-typed sniff (the
+            # old "usage" in str(cached) test false-matched any user content
+            # mentioning the word "usage").
+            usage = _extract_usage(cached)
             ctx = GatewayRequestContext(
                 request_id=request_id,
                 user_id=user.user_id,
@@ -628,10 +677,13 @@ async def _stream_openai(
                 ctx.record_ttft()
             bytes_yielded += len(data.encode("utf-8"))
             yield data
-        if status_value == UsageStatus.success.value:
-            data = "data: [DONE]\n\n"
-            bytes_yielded += len(data.encode("utf-8"))
-            yield data
+        # Always emit [DONE] so OpenAI SDK clients don't hang waiting for the
+        # terminator on idle/duration timeout. Errors raise out of the loop and
+        # are signalled separately via the response status, so they skip [DONE]
+        # — but timeout breaks fall through here.
+        done = "data: [DONE]\n\n"
+        bytes_yielded += len(done.encode("utf-8"))
+        yield done
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
         raise
@@ -647,20 +699,20 @@ async def _stream_openai(
         ctx.upstream_model = upstream_model
         ctx.status = status_value
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-        # Unified finalizer: quota settlement + durable enqueue + metrics
-        await finalize_gateway_request(
-            ctx,
-            logical_model=logical_model,
-            service=service,
-            rate_limit_rules=rate_limit_rules,
-            quota_reservations=quota_reservations,
+        # Shielded cleanup: settle quota, refund TPM, release concurrent slot,
+        # close upstream. Without the shield, a client disconnect cancels these
+        # mid-flight (TPM leak, concurrent slot leak, upstream connection leak).
+        await asyncio.shield(
+            _finalize_stream(
+                ctx,
+                logical_model=logical_model,
+                service=service,
+                response=response,
+                member=member,
+                rate_limit_rules=rate_limit_rules,
+                quota_reservations=quota_reservations,
+            )
         )
-        # Release concurrent semaphore slot acquired at rate-limit check.
-        if rate_limit_rules:
-            await release_concurrent(member, rate_limit_rules)
-        # Close the upstream iterator so aborted streams (idle timeout, max
-        # duration, client disconnect) don't leak the upstream connection.
-        await _aclose_response(response)
 
 
 # ---------------------------------------------------------------------------
@@ -737,20 +789,19 @@ async def _stream_anthropic_native(
         # Populate context for finalizer
         ctx.status = status_value
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-        # Unified finalizer: quota settlement + durable enqueue + metrics
-        await finalize_gateway_request(
-            ctx,
-            logical_model=logical_model,
-            service=service,
-            rate_limit_rules=rate_limit_rules,
-            quota_reservations=quota_reservations,
+        # Shielded cleanup: see _finalize_stream docstring for why this is
+        # mandatory for client-disconnect safety.
+        await asyncio.shield(
+            _finalize_stream(
+                ctx,
+                logical_model=logical_model,
+                service=service,
+                response=response,
+                member=member,
+                rate_limit_rules=rate_limit_rules,
+                quota_reservations=quota_reservations,
+            )
         )
-        # Release concurrent semaphore slot acquired at rate-limit check.
-        if rate_limit_rules:
-            await release_concurrent(member, rate_limit_rules)
-        # Close the upstream iterator so aborted streams (idle timeout, max
-        # duration, client disconnect) don't leak the upstream connection.
-        await _aclose_response(response)
 
 
 # ---------------------------------------------------------------------------
@@ -826,20 +877,19 @@ async def _stream_gemini_native(
         # Populate context for finalizer
         ctx.status = status_value
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
-        # Unified finalizer: quota settlement + durable enqueue + metrics
-        await finalize_gateway_request(
-            ctx,
-            logical_model=logical_model,
-            service=service,
-            rate_limit_rules=rate_limit_rules,
-            quota_reservations=quota_reservations,
+        # Shielded cleanup: see _finalize_stream docstring for why this is
+        # mandatory for client-disconnect safety.
+        await asyncio.shield(
+            _finalize_stream(
+                ctx,
+                logical_model=logical_model,
+                service=service,
+                response=response,
+                member=member,
+                rate_limit_rules=rate_limit_rules,
+                quota_reservations=quota_reservations,
+            )
         )
-        # Release concurrent semaphore slot acquired at rate-limit check.
-        if rate_limit_rules:
-            await release_concurrent(member, rate_limit_rules)
-        # Close the upstream iterator so aborted streams (idle timeout, max
-        # duration, client disconnect) don't leak the upstream connection.
-        await _aclose_response(response)
 
 
 # ---------------------------------------------------------------------------
@@ -998,15 +1048,6 @@ def _to_json_serializable(value: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-async def _compensate_quota(
-    service: GatewayService, user: AuthenticatedUser, logical_model_id: int
-) -> None:
-    quotas = await service.repo.get_active_quotas(
-        user.user_id, user.department_id, logical_model_id
-    )
-    await service.quota.compensate(user.user_id, user.department_id, logical_model_id, quotas)
-
-
 def _extract_usage(response: Any) -> dict[str, int]:
     usage = getattr(response, "usage", None)
     if usage is None and isinstance(response, Mapping):
@@ -1021,7 +1062,19 @@ def _extract_usage(response: Any) -> dict[str, int]:
 
 
 def _extract_routing_info(response: Any) -> tuple[int | None, str | None]:
-    """Extract channel_id and upstream_model from litellm response metadata."""
+    """Extract channel_id and upstream_model from a litellm OpenAI response.
+
+    OpenAI's ``Router.acompletion`` does not honour a caller-provided
+    ``litellm_metadata`` mutable dict (the way ``aanthropic_messages`` /
+    ``agenerate_content`` do), so this path reads the response's
+    ``_hidden_params.model_info.id`` that litellm populates on every
+    ``ModelResponse`` / ``ModelResponseStream``. The leading underscore is a
+    library convention, not a private contract: this field is part of
+    litellm's public Router contract and is asserted against in their own
+    test suite. Both attribute and ``Mapping`` access shapes are handled so
+    a future shape change (e.g. typed dataclass) does not silently null out
+    channel attribution.
+    """
     upstream_model: str | None = None
     channel_id: int | None = None
     if hasattr(response, "model"):

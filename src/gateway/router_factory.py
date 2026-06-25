@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
-from litellm import Router
+from litellm.router import Router
 
 from src.config import get_settings
 from src.core.channel_crypto import decrypt_channel_key

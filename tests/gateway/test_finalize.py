@@ -221,6 +221,8 @@ async def test_finalize_settles_against_captured_reservations(
     ctx = GatewayRequestContext(
         user_id=1,
         logical_model_id=10,
+        prompt_tokens=30,
+        completion_tokens=45,
         total_tokens=75,
         quota_reserved=True,
     )

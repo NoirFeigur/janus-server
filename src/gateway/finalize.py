@@ -87,7 +87,13 @@ async def _settle_quota(
         return
 
     with suppress(Exception):
-        should_compensate = ctx.total_tokens == 0
+        # Compensate only when the upstream produced literally zero work.  A
+        # stream that prefilled prompt tokens before a timeout/abort still cost
+        # the upstream real money (Anthropic emits ``output_tokens`` only in the
+        # trailing ``message_delta``, so an idle-timed-out stream lands here
+        # with prompt>0, completion=0 — that must still bill the prompt rather
+        # than a full refund).
+        should_compensate = ctx.prompt_tokens == 0 and ctx.completion_tokens == 0
 
         # Preferred path: settle against the exact keys reserved at check time.
         # Immune to quota hot-reload / period rollover between check and settle.
