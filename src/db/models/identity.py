@@ -56,7 +56,7 @@ class User(BaseEntity):
     employee_no: Mapped[str] = mapped_column(
         String(64),
         index=True,
-        comment="新工号：HR 权威主键（非空）",
+        comment="新工号（HR 权威主键）",
     )
     legacy_employee_no: Mapped[str | None] = mapped_column(
         String(64),
@@ -67,13 +67,13 @@ class User(BaseEntity):
 
     username: Mapped[str] = mapped_column(
         String(64),
-        comment="登录名（账密登录用）：非空，业务唯一",
+        comment="登录名（账密登录用）",
     )
     real_name: Mapped[str | None] = mapped_column(
         String(64), nullable=True, comment="真实姓名"
     )
     email: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, index=True, comment="邮箱"
+        String(255), nullable=True, index=True
     )
     mobile: Mapped[str | None] = mapped_column(
         String(32), nullable=True, index=True, comment="手机号"
@@ -84,27 +84,27 @@ class User(BaseEntity):
     password: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
-        comment="密码哈希（argon2，绝不存明文）；仅管理员有，SSO 用户为空",
+        comment="密码哈希（argon2，绝不存明文）；SSO 用户为空",
     )
 
     department_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
         index=True,
-        comment="所属部门 sys_department.id（逻辑引用，无物理外键）",
+        comment="所属部门 sys_department.id",
     )
 
     avatar: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
-        comment="头像附件 sys_attach.id（逻辑引用，无物理外键）；读取时现算预签名 URL",
+        comment="头像附件 sys_attach.id",
     )
 
     status: Mapped[str] = mapped_column(
         String(16),
         default="active",
         index=True,
-        comment="状态 UserStatus：active=在职 | disabled=停用/离职",
+        comment="状态 UserStatus",
     )
 
     # Locale preference (G16): outbound-message rendering + frontend default seed.
@@ -112,12 +112,10 @@ class User(BaseEntity):
         String(16),
         nullable=False,
         server_default="zh-CN",
-        comment="语言偏好（G16）：外发消息渲染 + 前端默认 locale 种子",
+        comment="语言偏好（外发消息渲染 + 前端默认 locale）",
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Department(BaseEntity):
@@ -139,18 +137,16 @@ class Department(BaseEntity):
         BigInteger,
         nullable=True,
         index=True,
-        comment="父部门 id（指向自身）；顶级为空",
+        comment="父部门 id；顶级为空",
     )
     external_id: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
         index=True,
-        comment="HR/企微 部门 id，用于同步映射",
+        comment="HR/企微 部门 id（同步映射用）",
     )
     sort_order: Mapped[int] = mapped_column(default=0, comment="同级排序")
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class UserOAuth(BaseEntity):
@@ -178,12 +174,12 @@ class UserOAuth(BaseEntity):
     user_id: Mapped[int] = mapped_column(
         BigInteger,
         index=True,
-        comment="用户 sys_user.id（非空，仅硬匹配命中时落库）",
+        comment="用户 sys_user.id（仅硬匹配命中时落库）",
     )
     source: Mapped[str] = mapped_column(
         String(32),
         index=True,
-        comment="身份来源 OAuthSource：wecom | ...",
+        comment="身份来源 OAuthSource",
     )
     uuid: Mapped[str] = mapped_column(
         String(64),
@@ -193,16 +189,16 @@ class UserOAuth(BaseEntity):
 
     # Non-authoritative profile snapshot returned by the provider.
     nickname: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, comment="昵称（第三方返回快照，非权威）"
+        String(64), nullable=True, comment="昵称（第三方快照，非权威）"
     )
     avatar: Mapped[str | None] = mapped_column(
-        String(1000), nullable=True, comment="头像 URL（第三方返回快照）"
+        String(1000), nullable=True, comment="头像 URL（第三方快照）"
     )
     email: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="邮箱（第三方返回快照）"
+        String(255), nullable=True, comment="邮箱（第三方快照）"
     )
     gender: Mapped[str | None] = mapped_column(
-        String(16), nullable=True, comment="性别（第三方返回快照）"
+        String(16), nullable=True, comment="性别（第三方快照）"
     )
 
     raw: Mapped[dict[str, Any] | None] = mapped_column(
@@ -238,31 +234,25 @@ class Role(BaseEntity):
     status: Mapped[str] = mapped_column(
         String(16),
         default="active",
-        comment="状态 ActiveStatus：active | disabled",
+        comment="状态 ActiveStatus",
     )
 
     # Data-permission scope (orthogonal axis) — RuoYi 6-tier.
     data_scope: Mapped[str] = mapped_column(
         String(16),
         default="self",
-        comment=(
-            "数据权限范围 DataScope：all=全部 | custom=自定义(关联 sys_role_dept) "
-            "| dept=本部门 | dept_and_child=本部门及子 | self=仅本人 "
-            "| dept_and_child_or_self=部门子树+本人"
-        ),
+        comment="数据权限范围 DataScope",
     )
 
     # Frontend tree-checkbox linkage toggles (pure UI behavior).
     menu_check_strictly: Mapped[bool] = mapped_column(
-        default=True, comment="菜单树父子勾选是否严格关联（纯前端 UI 行为）"
+        default=True, comment="菜单树父子勾选是否严格关联"
     )
     dept_check_strictly: Mapped[bool] = mapped_column(
-        default=True, comment="部门树父子勾选是否严格关联（纯前端 UI 行为）"
+        default=True, comment="部门树父子勾选是否严格关联"
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Menu(BaseEntity):
@@ -273,36 +263,34 @@ class Menu(BaseEntity):
 
     name: Mapped[str] = mapped_column(
         String(64),
-        comment="i18n key（如 menu.system.user），前端翻译，非展示文本（G16）",
+        comment="i18n key（如 menu.system.user），前端翻译",
     )
     parent_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
         index=True,
-        comment="父节点 id（指向自身）；顶级为空",
+        comment="父节点 id；顶级为空",
     )
     menu_type: Mapped[str] = mapped_column(
         String(8),
-        comment="菜单类型 MenuType：catalog=目录 | menu=页面 | button=按钮/权限点",
+        comment="菜单类型 MenuType",
     )
     perms: Mapped[str | None] = mapped_column(
         String(128),
         nullable=True,
         index=True,
-        comment="权限码，如 pool:key:add（按钮/API）",
+        comment="权限码，如 pool:key:add",
     )
     path: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="前端路由（menu 类型）"
+        String(255), nullable=True, comment="前端路由"
     )
     component: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="前端组件路径（menu 类型）"
+        String(255), nullable=True, comment="前端组件路径"
     )
     query_param: Mapped[str | None] = mapped_column(
         String(255), nullable=True, comment="路由查询参数"
     )
-    is_frame: Mapped[bool] = mapped_column(
-        default=False, comment="是否外链"
-    )
+    is_frame: Mapped[bool] = mapped_column(default=False, comment="是否外链")
     is_cache: Mapped[bool] = mapped_column(
         default=True, comment="是否 keep-alive 缓存"
     )
@@ -311,15 +299,15 @@ class Menu(BaseEntity):
     )
     sort_order: Mapped[int] = mapped_column(default=0, comment="排序")
     visible: Mapped[bool] = mapped_column(
-        default=True, comment="是否显示；隐藏菜单仍授权，只是不展示"
+        default=True, comment="是否显示；隐藏菜单仍授权"
     )
     status: Mapped[str] = mapped_column(
         String(16),
         default="active",
-        comment="状态 ActiveStatus：active | disabled",
+        comment="状态 ActiveStatus",
     )
     remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注（name 是不透明 i18n key，此处给开发者读）"
+        String(255), nullable=True, comment="name 是 i18n key，此处给开发者读"
     )
 
 

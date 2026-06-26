@@ -36,36 +36,34 @@ class RateLimitRule(BaseEntity):
         BigInteger,
         nullable=True,
         index=True,
-        comment="主体 ID（global 时为 null）",
+        comment="主体 id；global 时为空",
     )
     logical_model_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
         index=True,
-        comment="限制特定模型（null=所有模型）",
+        comment="限制特定模型；null=所有模型",
     )
 
     # --- Limits ---
     rpm_limit: Mapped[int | None] = mapped_column(
-        Integer, nullable=True, comment="每分钟请求上限（null=不限）"
+        Integer, nullable=True, comment="每分钟请求上限；null=不限"
     )
     tpm_limit: Mapped[int | None] = mapped_column(
-        Integer, nullable=True, comment="每分钟 token 上限（null=不限）"
+        Integer, nullable=True, comment="每分钟 token 上限；null=不限"
     )
     tpm_burst_limit: Mapped[int | None] = mapped_column(
-        Integer, nullable=True, comment="TPM 突发上限（null=不限）"
+        Integer, nullable=True, comment="TPM 突发上限；null=不限"
     )
     max_concurrent: Mapped[int | None] = mapped_column(
-        Integer, nullable=True, comment="最大并发流式请求数（null=不限）"
+        Integer, nullable=True, comment="最大并发流式请求数；null=不限"
     )
 
     # --- Control ---
     enforce: Mapped[bool] = mapped_column(
-        Boolean, default=True, comment="是否执行（false=仅记录不拦截）"
+        Boolean, default=True, comment="是否执行；false=仅记录不拦截"
     )
     status: Mapped[str] = mapped_column(
-        String(16), default="active", index=True, comment="active | disabled"
+        String(16), default="active", index=True, comment="状态 ActiveStatus"
     )
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注说明"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

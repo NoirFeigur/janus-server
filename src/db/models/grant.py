@@ -40,12 +40,12 @@ class UserModelGrant(BaseEntity):
     scope: Mapped[str] = mapped_column(
         String(16),
         index=True,
-        comment="授予范围 GrantScope：user=用户 | department=部门",
+        comment="授予范围 GrantScope：user | department",
     )
     scope_id: Mapped[int] = mapped_column(
         BigInteger,
         index=True,
-        comment="scope=user 指向 sys_user.id；scope=department 指向 sys_department.id",
+        comment="scope=user→sys_user.id；scope=department→sys_department.id",
     )
 
     logical_model_id: Mapped[int] = mapped_column(
@@ -56,6 +56,4 @@ class UserModelGrant(BaseEntity):
         comment="是否该 scope 的默认模型（员工未传 model 时用）",
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

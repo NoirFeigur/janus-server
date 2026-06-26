@@ -34,21 +34,19 @@ class SysAttach(BaseEntity):
 
     object_key: Mapped[str] = mapped_column(
         String(512),
-        comment="桶内相对路径（全局唯一），如 avatar/2026/06/{id}.webp",
+        comment="桶内相对路径，如 avatar/2026/06/{id}.webp",
     )
     bucket: Mapped[str] = mapped_column(
         String(128),
-        comment="所在桶名（冗余存，便于将来多桶/迁移/审计）",
+        comment="所在桶名（多桶/迁移/审计用）",
     )
     original_name: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="上传时原始文件名（下载用，可空）"
+        String(255), nullable=True, comment="上传时原始文件名（下载用）"
     )
     content_type: Mapped[str] = mapped_column(
         String(128), comment="MIME 类型，如 image/webp"
     )
-    file_size: Mapped[int] = mapped_column(
-        BigInteger, comment="文件字节数（存入对象存储后的最终大小）"
-    )
+    file_size: Mapped[int] = mapped_column(BigInteger, comment="文件字节数")
     biz_type: Mapped[str] = mapped_column(
         String(32),
         default=AttachBizType.attachment,

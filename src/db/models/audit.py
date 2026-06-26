@@ -32,31 +32,31 @@ class OperLog(LogEntity):
         BigInteger,
         nullable=True,
         index=True,
-        comment="操作人 sys_user.id（逻辑引用）；null=系统操作",
+        comment="操作人 sys_user.id；null=系统操作",
     )
     actor_name: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
-        comment="操作人用户名快照（冗余，审计需在用户改名/删除后仍可读）",
+        comment="操作人用户名快照（改名/删除后仍可读）",
     )
     module: Mapped[str] = mapped_column(
         String(64),
         index=True,
-        comment="业务模块/资源域（如 user/role/menu/dept）",
+        comment="业务模块/资源域，如 user/role/menu/dept",
     )
     action: Mapped[str] = mapped_column(
         String(32),
-        comment="操作动作（如 create/update/delete/batch_delete）",
+        comment="操作动作，如 create/update/delete",
     )
     method: Mapped[str] = mapped_column(String(8), comment="HTTP 方法")
     path: Mapped[str] = mapped_column(String(255), comment="请求路径")
     target_id: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
-        comment="受影响资源 id（雪花，字符串存储）",
+        comment="受影响资源 id",
     )
     request_ip: Mapped[str | None] = mapped_column(
-        String(45), nullable=True, comment="请求来源 IP（兼容 IPv6）"
+        String(45), nullable=True, comment="请求来源 IP"
     )
     user_agent: Mapped[str | None] = mapped_column(
         String(255), nullable=True, comment="请求 User-Agent"
@@ -65,25 +65,25 @@ class OperLog(LogEntity):
         String(64),
         nullable=True,
         index=True,
-        comment="关联 trace_id（贯穿结构化日志）",
+        comment="关联 trace_id",
     )
     before_value: Mapped[dict[str, Any] | None] = mapped_column(
         _SQLITE_JSONB,
         nullable=True,
-        comment="变更前快照；null=不适用（如创建/查询）",
+        comment="变更前快照；null=不适用",
     )
     after_value: Mapped[dict[str, Any] | None] = mapped_column(
         _SQLITE_JSONB,
         nullable=True,
-        comment="变更后快照；null=不适用（如删除/查询）",
+        comment="变更后快照；null=不适用",
     )
     status: Mapped[str] = mapped_column(
         String(16),
         index=True,
-        comment="操作结果 AuditOutcome：success | failure",
+        comment="操作结果 AuditOutcome",
     )
     error_code: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, comment="失败时的 ErrorCode 值；成功为空"
+        String(64), nullable=True, comment="失败时的 ErrorCode；成功为空"
     )
     latency_ms: Mapped[int | None] = mapped_column(
         nullable=True, comment="端到端处理耗时（毫秒）"
@@ -112,12 +112,12 @@ class LoginLog(LogEntity):
         comment="命中的 sys_user.id；用户名无法解析时为空",
     )
     username: Mapped[str] = mapped_column(
-        String(64), index=True, comment="尝试登录的用户名（无论成败都记录）"
+        String(64), index=True, comment="尝试登录的用户名"
     )
     status: Mapped[str] = mapped_column(
         String(16),
         index=True,
-        comment="登录结果 AuditOutcome：success | failure",
+        comment="登录结果 AuditOutcome",
     )
     failure_reason: Mapped[str | None] = mapped_column(
         String(64),
@@ -125,7 +125,7 @@ class LoginLog(LogEntity):
         comment="失败原因 LoginFailureReason；成功为空",
     )
     request_ip: Mapped[str | None] = mapped_column(
-        String(45), nullable=True, comment="登录来源 IP（兼容 IPv6）"
+        String(45), nullable=True, comment="登录来源 IP"
     )
     user_agent: Mapped[str | None] = mapped_column(
         String(255), nullable=True, comment="登录 User-Agent"

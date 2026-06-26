@@ -31,10 +31,10 @@ class CatalogChangeLog(LogEntity):
         String(32), index=True, comment="变更资源类型：channel | key | model | deployment"
     )
     resource_id: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, comment="变更资源 ID"
+        String(64), nullable=True, comment="变更资源 id"
     )
     action: Mapped[str] = mapped_column(
-        String(32), index=True, comment="操作：create | update | delete | rotate | auto_disable"
+        String(32), index=True, comment="操作：create | update | delete | rotate"
     )
     before_value: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True, comment="变更前值（脱敏）"
@@ -46,10 +46,10 @@ class CatalogChangeLog(LogEntity):
         JSONB, nullable=True, comment="差异摘要（field→{old,new}）"
     )
     snapshot_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="关联配置快照 ID（变更前自动创建）"
+        BigInteger, nullable=True, comment="关联配置快照 id"
     )
     trace_id: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, comment="请求 trace_id（关联网关日志）"
+        String(64), nullable=True, comment="请求 trace_id"
     )
 
 
@@ -60,22 +60,20 @@ class CatalogConfigSnapshot(LogEntity):
     __table_args__ = {"comment": "目录配置快照：用于 dry-run 校验和回滚"}
 
     actor_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="创建快照的操作人"
+        BigInteger, nullable=True, comment="创建快照的操作人 sys_user.id"
     )
     reason: Mapped[str] = mapped_column(
         String(32),
         comment="创建原因：known_good | pre_write | rollback | dry_run",
     )
     config_hash: Mapped[str] = mapped_column(
-        String(64), index=True, comment="配置内容 SHA-256（用于去重和比对）"
+        String(64), index=True, comment="配置内容 SHA-256（去重和比对）"
     )
     is_known_good: Mapped[bool] = mapped_column(
-        Boolean, default=False, comment="是否为最近一次验证通过的已知良好配置"
+        Boolean, default=False, comment="是否最近一次验证通过的已知良好配置"
     )
     config: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
-        comment="完整配置 JSON：channels/keys/models/deployments（密钥字段保留加密形式）",
+        comment="完整配置 JSON：channels/keys/models/deployments（密钥保留加密形式）",
     )
-    remark: Mapped[str | None] = mapped_column(
-        Text, nullable=True, comment="备注（回滚时记录原因）"
-    )
+    remark: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -33,10 +33,10 @@ class SysConfig(BaseEntity):
 
     config_key: Mapped[str] = mapped_column(
         String(128),
-        comment="配置键（全局唯一），如 auth.login_max_failures",
+        comment="配置键，如 auth.login_max_failures",
     )
     config_value: Mapped[str] = mapped_column(
-        Text, comment="配置值，统一以字符串存储；按 value_type 解析"
+        Text, comment="配置值（字符串存储，按 value_type 解析）"
     )
     value_type: Mapped[str] = mapped_column(
         String(16),
@@ -44,13 +44,11 @@ class SysConfig(BaseEntity):
         comment="值类型 ConfigValueType：string | int | bool | json",
     )
     config_name: Mapped[str] = mapped_column(
-        String(128), comment="人类可读名称（管理后台展示）"
+        String(128), comment="人类可读名称（后台展示）"
     )
     is_builtin: Mapped[bool] = mapped_column(
         default=False,
         comment="是否平台内置项：true=可改不可删",
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -32,7 +32,7 @@ class ApiKey(BaseEntity):
     )
     name: Mapped[str] = mapped_column(
         String(64),
-        comment='用途标签，如 "本地开发" / "oa-定时任务"',
+        comment='用途标签，如 "本地开发"',
     )
 
     key_hash: Mapped[str] = mapped_column(
@@ -42,14 +42,14 @@ class ApiKey(BaseEntity):
     )
     key_prefix: Mapped[str] = mapped_column(
         String(16),
-        comment='明文前缀如 "sk-a1b2"，列表脱敏展示（非敏感）',
+        comment='明文前缀如 "sk-a1b2"，列表脱敏展示',
     )
 
     status: Mapped[str] = mapped_column(
         String(16),
         default="active",
         index=True,
-        comment="状态 ApiKeyStatus：active | disabled",
+        comment="状态 ApiKeyStatus",
     )
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, comment="过期时间；null=永不过期"
@@ -57,9 +57,7 @@ class ApiKey(BaseEntity):
     last_used_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
-        comment="最后使用时间（异步更新，避免热行）",
+        comment="最后使用时间（异步更新）",
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -44,7 +44,7 @@ class Quota(BaseEntity):
     scope: Mapped[str] = mapped_column(
         String(16),
         index=True,
-        comment="配额范围 QuotaScope：user=用户 | department=部门 | global=全局",
+        comment="配额范围 QuotaScope：user | department | global",
     )
     scope_id: Mapped[int | None] = mapped_column(
         BigInteger,
@@ -57,23 +57,23 @@ class Quota(BaseEntity):
         BigInteger,
         nullable=True,
         index=True,
-        comment="逻辑模型 logical_model.id；null=该范围跨所有模型的总配额",
+        comment="逻辑模型 logical_model.id；null=跨所有模型的总配额",
     )
 
     # —— Period + metric ——
     period: Mapped[str] = mapped_column(
         String(16),
-        comment="周期 QuotaPeriod：daily=每日 | monthly=每月 | total=永不重置",
+        comment="周期 QuotaPeriod：daily | monthly | total",
     )
     metric: Mapped[str] = mapped_column(
         String(16),
         default="tokens",
-        comment="度量 QuotaMetric：tokens=令牌数 | requests=请求数 | cost=成本点",
+        comment="度量 QuotaMetric：tokens | requests | cost",
     )
 
     limit_value: Mapped[Decimal] = mapped_column(
         Numeric(14, 6),
-        comment="限额上限；精度同 usage_record.cost（tokens/requests 用整数）",
+        comment="限额上限（tokens/requests 用整数）",
     )
 
     enforce: Mapped[bool] = mapped_column(
@@ -85,8 +85,6 @@ class Quota(BaseEntity):
         String(16),
         default="active",
         index=True,
-        comment="状态 ActiveStatus：active | disabled",
+        comment="状态 ActiveStatus",
     )
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

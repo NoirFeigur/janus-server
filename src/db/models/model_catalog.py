@@ -40,23 +40,23 @@ class UpstreamChannel(BaseEntity):
 
     name: Mapped[str] = mapped_column(
         String(64),
-        comment="渠道名，如 anthropic-official / bedrock-claude / deepseek",
+        comment="渠道名，如 anthropic-official / bedrock-claude",
     )
     provider: Mapped[str] = mapped_column(
         String(32),
         index=True,
-        comment="厂商：anthropic|gemini|deepseek|glm|qwen|mimo...（驱动 litellm 前缀/计价）",
+        comment="厂商（驱动 litellm 前缀/计价），如 anthropic/gemini/deepseek",
     )
     protocol: Mapped[str] = mapped_column(
         String(16),
         index=True,
-        comment="对上游的协议：anthropic|openai|gemini",
+        comment="对上游的协议：anthropic | openai | gemini",
     )
 
     api_base: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
-        comment="上游 base_url；官方厂商为空（litellm 默认）",
+        comment="上游 base_url；官方厂商为空",
     )
 
     extra_config: Mapped[dict[str, Any] | None] = mapped_column(
@@ -69,12 +69,10 @@ class UpstreamChannel(BaseEntity):
         String(16),
         default="active",
         index=True,
-        comment="状态 ChannelStatus：active | disabled",
+        comment="状态 ChannelStatus",
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class ChannelKey(BaseEntity):
@@ -110,20 +108,18 @@ class ChannelKey(BaseEntity):
         String(16),
         default="active",
         index=True,
-        comment="状态 ChannelKeyStatus：active | disabled（cooldown 是 Redis 运行态，不入库）",
+        comment="状态 ChannelKeyStatus（cooldown 是 Redis 运行态，不入库）",
     )
 
     rpm_limit: Mapped[int | None] = mapped_column(
         nullable=True,
-        comment="单 deployment rpm 上限（喂给 litellm.Router）；null=不限",
+        comment="单 deployment rpm 上限；null=不限",
     )
     tpm_limit: Mapped[int | None] = mapped_column(
         nullable=True, comment="单 deployment tpm 上限；null=不限"
     )
 
-    weight: Mapped[int] = mapped_column(
-        default=1, comment="加权轮询权重"
-    )
+    weight: Mapped[int] = mapped_column(default=1, comment="加权轮询权重")
     priority: Mapped[int] = mapped_column(
         default=0, comment="渠道内 key 排序（小者先；0=主）"
     )
@@ -131,12 +127,10 @@ class ChannelKey(BaseEntity):
     last_used_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
-        comment="最后使用时间（异步更新，用于僵尸 key 发现）",
+        comment="最后使用时间（僵尸 key 发现用）",
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class LogicalModel(BaseEntity):
@@ -155,7 +149,7 @@ class LogicalModel(BaseEntity):
 
     name: Mapped[str] = mapped_column(
         String(64),
-        comment='员工作为 model 发送的统一模型名，如 "claude-sonnet"',
+        comment='员工发送的统一模型名，如 "claude-sonnet"',
     )
     display_name: Mapped[str] = mapped_column(
         String(64),
@@ -166,13 +160,13 @@ class LogicalModel(BaseEntity):
         String(32),
         nullable=True,
         index=True,
-        comment='模型选择器分组，如 "通用"/"代码"/"长文"',
+        comment='模型选择器分组，如 "通用"/"代码"',
     )
     sort_order: Mapped[int] = mapped_column(default=0, comment="排序")
 
     context_length: Mapped[int | None] = mapped_column(
         nullable=True,
-        comment="null=运行时由 litellm.get_max_tokens() 解析；有值=显式覆盖",
+        comment="null=运行时由 litellm 解析；有值=显式覆盖",
     )
 
     # Internal pricing coefficients (per-million-token), not real USD. null = not
@@ -180,24 +174,22 @@ class LogicalModel(BaseEntity):
     price_input: Mapped[Decimal | None] = mapped_column(
         Numeric(12, 6),
         nullable=True,
-        comment="输入计价系数（每百万 token，内部成本点非美元）；null=不单独计价",
+        comment="输入计价系数（每百万 token，内部成本点）；null=不单独计价",
     )
     price_output: Mapped[Decimal | None] = mapped_column(
         Numeric(12, 6),
         nullable=True,
-        comment="输出计价系数（每百万 token，内部成本点非美元）；null=不单独计价",
+        comment="输出计价系数（每百万 token，内部成本点）；null=不单独计价",
     )
 
     status: Mapped[str] = mapped_column(
         String(16),
         default="active",
         index=True,
-        comment="状态 ActiveStatus：active | disabled",
+        comment="状态 ActiveStatus",
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class ModelDeployment(BaseEntity):
@@ -230,9 +222,7 @@ class ModelDeployment(BaseEntity):
         comment="该渠道下的上游真实模型名，如 claude-sonnet-4-6",
     )
 
-    weight: Mapped[int] = mapped_column(
-        default=1, comment="跨渠道权重"
-    )
+    weight: Mapped[int] = mapped_column(default=1, comment="跨渠道权重")
     priority: Mapped[int] = mapped_column(
         default=0, comment="跨渠道主备（小者先；0=主）"
     )
@@ -241,9 +231,7 @@ class ModelDeployment(BaseEntity):
         String(16),
         default="active",
         index=True,
-        comment="状态 ActiveStatus：active | disabled",
+        comment="状态 ActiveStatus",
     )
 
-    remark: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

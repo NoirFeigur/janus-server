@@ -37,35 +37,35 @@ class BaseEntity(Base):
         primary_key=True,
         autoincrement=False,
         default=next_id,
-        comment="主键：雪花 ID，应用层分配（非自增）",
+        comment="雪花 ID 主键",
     )
     is_deleted: Mapped[bool] = mapped_column(
-        default=False, comment="软删标记：true=已删除（逻辑删除，不物理删行）"
+        default=False, comment="软删标记（逻辑删除）"
     )
     created_by: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
-        comment="创建人 sys_user.id（逻辑引用，无物理外键）；null=系统操作",
+        comment="创建人 sys_user.id；null=系统操作",
     )
     create_dept: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
         index=True,
-        comment="创建部门 sys_department.id（逻辑引用），用于数据权限过滤",
+        comment="创建部门 sys_department.id（数据权限过滤用）",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
-        comment="创建时间（timestamptz，UTC，由数据库 now() 生成）",
+        comment="创建时间",
     )
     updated_by: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="最后更新人 sys_user.id（逻辑引用）"
+        BigInteger, nullable=True, comment="最后更新人 sys_user.id"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
-        comment="最后更新时间（timestamptz，UTC，更新时自动刷新）",
+        comment="最后更新时间",
     )
 
 
@@ -79,12 +79,12 @@ class LogEntity(Base):
         primary_key=True,
         autoincrement=False,
         default=next_id,
-        comment="主键：雪花 ID，应用层分配（非自增）",
+        comment="雪花 ID 主键",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
-        comment="创建时间（timestamptz，UTC，由数据库 now() 生成）",
+        comment="创建时间",
     )
 
 
@@ -104,10 +104,10 @@ class LinkEntity(Base):
         primary_key=True,
         autoincrement=False,
         default=next_id,
-        comment="主键：雪花 ID，应用层分配（非自增）",
+        comment="雪花 ID 主键",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
-        comment="创建时间（timestamptz，UTC，由数据库 now() 生成）",
+        comment="创建时间",
     )

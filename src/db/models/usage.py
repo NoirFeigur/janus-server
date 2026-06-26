@@ -48,22 +48,18 @@ class UsageRecord(LogEntity):
         BigInteger,
         nullable=True,
         index=True,
-        comment="实际路由到的渠道 upstream_channel.id（事后分析）",
+        comment="实际路由到的渠道 upstream_channel.id",
     )
     upstream_model: Mapped[str | None] = mapped_column(
         String(128), nullable=True, comment="实际调用的上游真实模型名"
     )
 
     # —— Metering (how much) ——
-    prompt_tokens: Mapped[int] = mapped_column(
-        default=0, comment="输入 token 数"
-    )
+    prompt_tokens: Mapped[int] = mapped_column(default=0, comment="输入 token 数")
     completion_tokens: Mapped[int] = mapped_column(
         default=0, comment="输出 token 数"
     )
-    total_tokens: Mapped[int] = mapped_column(
-        default=0, comment="总 token 数（冗余，便于聚合）"
-    )
+    total_tokens: Mapped[int] = mapped_column(default=0, comment="总 token 数（冗余）")
     cost: Mapped[Decimal | None] = mapped_column(
         Numeric(14, 6),
         nullable=True,
@@ -74,7 +70,7 @@ class UsageRecord(LogEntity):
     status: Mapped[str] = mapped_column(
         String(16),
         index=True,
-        comment="结果 UsageStatus：success | error | timeout",
+        comment="结果 UsageStatus",
     )
     latency_ms: Mapped[int | None] = mapped_column(
         nullable=True, comment="端到端延迟（毫秒）"
@@ -83,10 +79,10 @@ class UsageRecord(LogEntity):
         String(64),
         nullable=True,
         index=True,
-        comment="贯穿网关日志/Redis 的关联 id（无 call_audit 表）",
+        comment="贯穿网关日志/Redis 的关联 id",
     )
     downgraded_features: Mapped[list[Any] | None] = mapped_column(
         JSONB,
         nullable=True,
-        comment="本次调用被丢弃/降级的特性（G13）；null/空=未降级",
+        comment="本次调用被降级的特性；null/空=未降级",
     )
