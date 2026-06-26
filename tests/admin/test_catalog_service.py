@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from cryptography.fernet import Fernet
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.admin.catalog.schemas import (
@@ -28,9 +26,21 @@ from src.exceptions import AppError
 pytestmark = pytest.mark.asyncio
 
 TEST_FERNET_KEY = Fernet.generate_key().decode()
-os.environ["JANUS_CHANNEL_ENCRYPTION_KEYS"] = TEST_FERNET_KEY
-get_settings.cache_clear()
-_cipher.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _set_fernet_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set a test encryption key with auto-restore teardown.
+
+    ``monkeypatch`` reverts both the env var and the cached settings attribute
+    after each test, so this module no longer leaks ``JANUS_CHANNEL_ENCRYPTION_KEYS``
+    into the rest of the suite (which previously broke the real-DB lifespan test).
+    """
+    monkeypatch.setenv("JANUS_CHANNEL_ENCRYPTION_KEYS", TEST_FERNET_KEY)
+    monkeypatch.setattr(
+        get_settings(), "channel_encryption_keys", SecretStr(TEST_FERNET_KEY)
+    )
+    _cipher.cache_clear()
 
 ACTOR = AuthenticatedUser(
     user_id=1000,
@@ -97,9 +107,6 @@ async def test_create_channel_duplicate_name_rejected(
 
 
 async def test_create_key_encrypts_plaintext(admin_session: AsyncSession) -> None:
-    os.environ["JANUS_CHANNEL_ENCRYPTION_KEYS"] = TEST_FERNET_KEY
-    get_settings.cache_clear()
-    _cipher.cache_clear()
     svc = CatalogService(admin_session)
     channel = await svc.create_channel(_channel_payload(), actor=ACTOR)
     plaintext = "sk-upstream-secret"
