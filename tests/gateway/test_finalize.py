@@ -401,3 +401,143 @@ async def test_finalize_does_not_requery_quota_without_reservations(
     service.quota.settle_reservations.assert_not_called()
     service.quota.compensate_reservations.assert_not_called()
     assert ctx.quota_settled is False
+
+
+# ---------------------------------------------------------------------------
+# #9: billing-critical step failures must NOT be silently swallowed — they land
+# in a durable billing DLQ (observable + replayable). Telemetry steps may still
+# be swallowed.
+# ---------------------------------------------------------------------------
+
+
+def _one_reservation() -> QuotaReservation:
+    return QuotaReservation(
+        key="quota:u:1:10:2026-06:tokens",
+        quota_id=7,
+        metric="tokens",
+        scope="user",
+        enforce=True,
+        limit_value=Decimal("100000"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_quota_settle_failure_lands_in_billing_dlq(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """Oracle #9: a raised quota settlement (e.g. DB down) was swallowed by
+    suppress(Exception) — billing silently lost. It must instead be recorded to
+    the billing DLQ for retry/inspection."""
+    from src.gateway.events import BILLING_DLQ_KEY, reset_outbox
+
+    reset_outbox()
+    ctx = GatewayRequestContext(
+        user_id=1,
+        request_id="req-q-fail",
+        logical_model_id=10,
+        prompt_tokens=30,
+        completion_tokens=45,
+        total_tokens=75,
+        quota_reserved=True,
+    )
+    logical_model = Mock()
+    logical_model.id = 10
+    logical_model.price_input = None
+    logical_model.price_output = None
+
+    service = AsyncMock()
+    service.quota = AsyncMock()
+    service.quota.settle_reservations.side_effect = RuntimeError("db down")
+
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        quota_reservations=[_one_reservation()],
+    )
+
+    assert await fake_redis.llen(BILLING_DLQ_KEY) == 1
+    raw = await fake_redis.lpop(BILLING_DLQ_KEY)
+    assert raw is not None
+    rec = json.loads(raw)
+    assert rec["kind"] == "quota_settle"
+    assert rec["request_id"] == "req-q-fail"
+    assert "db down" in rec["error"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_tpm_settle_failure_lands_in_billing_dlq(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """A raised TPM settlement must be recorded to the billing DLQ, not swallowed."""
+    from src.gateway.events import BILLING_DLQ_KEY, reset_outbox
+
+    reset_outbox()
+    rules = [{"id": 1, "tpm_limit": 10000, "subject_type": "user", "subject_id": 1}]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        request_id="req-tpm-fail",
+        logical_model_id=10,
+        total_tokens=50,
+    )
+
+    with patch(
+        "src.gateway.rate_limit.settle_tpm",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("redis settle boom"),
+    ):
+        await finalize_gateway_request(ctx, rate_limit_rules=rules)
+
+    assert await fake_redis.llen(BILLING_DLQ_KEY) == 1
+    raw = await fake_redis.lpop(BILLING_DLQ_KEY)
+    assert raw is not None
+    rec = json.loads(raw)
+    assert rec["kind"] == "tpm_settle"
+    assert rec["request_id"] == "req-tpm-fail"
+
+
+@pytest.mark.asyncio
+async def test_finalize_usage_enqueue_failure_lands_in_billing_dlq_and_log_still_enqueued(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """A raised usage enqueue is recorded to the billing DLQ AND must not block
+    the sibling log enqueue (fail-safe-between-steps contract preserved)."""
+    from src.gateway.events import BILLING_DLQ_KEY, reset_outbox
+
+    reset_outbox()
+    ctx = GatewayRequestContext(user_id=1, request_id="req-u-fail", logical_model_name="gpt-4")
+
+    with patch(
+        "src.gateway.finalize.enqueue_usage_event",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("boom"),
+    ):
+        await finalize_gateway_request(ctx)
+
+    assert await fake_redis.llen(BILLING_DLQ_KEY) == 1
+    raw = await fake_redis.lpop(BILLING_DLQ_KEY)
+    assert raw is not None
+    assert json.loads(raw)["kind"] == "usage_enqueue"
+    # Observability step still ran despite the billing failure.
+    assert await fake_redis.llen(LOG_QUEUE_KEY) == 1
+
+
+@pytest.mark.asyncio
+async def test_finalize_telemetry_failure_is_still_swallowed(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """Telemetry/observability failures (metrics) stay swallowed — they must not
+    land in the billing DLQ nor abort finalize."""
+    from src.gateway.events import BILLING_DLQ_KEY, reset_outbox
+
+    reset_outbox()
+    ctx = GatewayRequestContext(user_id=1, logical_model_name="gpt-4")
+
+    with patch(
+        "src.gateway.finalize.emit_request_metrics",
+        side_effect=RuntimeError("metrics down"),
+    ):
+        # Must not raise.
+        await finalize_gateway_request(ctx)
+
+    assert await fake_redis.llen(BILLING_DLQ_KEY) == 0

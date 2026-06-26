@@ -149,13 +149,20 @@ class GatewayService:
         user_id: int,
         department_id: int | None,
         logical_model_id: int,
+        estimated_tokens: int = 0,
+        estimated_cost: Decimal | None = None,
     ) -> QuotaCheckResult:
         quotas = await self._get_active_quotas_cached(
             user_id, department_id, logical_model_id
         )
         try:
             return await self.quota.check_and_increment(
-                user_id, department_id, logical_model_id, quotas
+                user_id,
+                department_id,
+                logical_model_id,
+                quotas,
+                estimated_tokens=estimated_tokens,
+                estimated_cost=estimated_cost,
             )
         except QuotaLimitExceeded as exc:
             raise AppError(

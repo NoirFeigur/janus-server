@@ -25,6 +25,7 @@ from src.db.session import async_session_factory, engine
 from src.exceptions import register_exception_handlers
 from src.files.router import router as attach_router
 from src.gateway.endpoints_v1 import router as gateway_v1_router
+from src.gateway.router import drain_finalizers
 from src.gateway.router import router as gateway_router
 from src.gateway.router_manager import RouterManager
 
@@ -54,6 +55,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # 再显式 dispose DB engine(归还连接池里的所有连接 + 关闭底层 asyncpg 连接)。
         # 不依赖进程退出做隐式回收:优雅关闭路径里显式 dispose 让 PG 端连接立即释放
         # (不等 TCP 超时),也避免在 reload/多 app 实例场景下泄漏连接池。
+        # 先 drain 还在飞的流式 finalizer(Oracle #7 part 2):它们要落账/结算配额,
+        # 必须赶在关 Redis + dispose engine 之前在活连接池上跑完,否则结算丢失 + 预留泄漏。
+        unfinished = await drain_finalizers()
+        if unfinished:
+            _log.warning("app.shutdown.finalizers_unfinished", count=unfinished)
         await RouterManager.shutdown()
         if worker_id_lease is not None:
             await worker_id_lease.release()

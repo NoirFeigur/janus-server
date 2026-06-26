@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING, Any
 from src.core.logging import get_logger
 from src.core.metrics import emit_request_metrics
 from src.gateway.context import GatewayRequestContext
-from src.gateway.events import enqueue_log_event, enqueue_usage_event
+from src.gateway.events import (
+    enqueue_log_event,
+    enqueue_usage_event,
+    record_billing_failure,
+)
 
 if TYPE_CHECKING:
     from src.db.models.model_catalog import LogicalModel
@@ -80,13 +84,18 @@ async def _settle_quota(
     logical_model: LogicalModel | None,
     service: GatewayService | None,
 ) -> None:
-    """Settle quota, charging any usage already observed before a failure."""
+    """Settle quota, charging any usage already observed before a failure.
+
+    Billing-critical (Oracle #9): a raised settlement is NOT swallowed — it is
+    recorded to the billing DLQ for replay/inspection. The step stays non-fatal
+    (the failure is captured, not re-raised) so it never aborts sibling steps.
+    """
     if ctx.quota_settled or not ctx.quota_reserved:
         return
     if service is None or logical_model is None:
         return
 
-    with suppress(Exception):
+    try:
         # Compensate only when the upstream produced literally zero work.  A
         # stream that prefilled prompt tokens before a timeout/abort still cost
         # the upstream real money (Anthropic emits ``output_tokens`` only in the
@@ -115,6 +124,17 @@ async def _settle_quota(
             logical_model_id=logical_model.id,
             total_tokens=ctx.total_tokens,
         )
+    except Exception as exc:
+        await record_billing_failure(
+            kind="quota_settle",
+            request_id=ctx.request_id,
+            error=repr(exc),
+            detail={
+                "user_id": ctx.user_id,
+                "logical_model_id": ctx.logical_model_id,
+                "total_tokens": ctx.total_tokens,
+            },
+        )
 
 
 def _compute_cost(
@@ -135,8 +155,14 @@ async def _enqueue_usage(
     *,
     logical_model: LogicalModel | None,
 ) -> None:
-    """Enqueue a usage record event to the durable Redis queue."""
-    with suppress(Exception):
+    """Enqueue a usage record event to the durable Redis queue.
+
+    Billing-critical (Oracle #9): a raised enqueue is recorded to the billing
+    DLQ rather than swallowed. ``enqueue_usage_event`` itself is outbox-backed
+    and returns False (not raises) on a transient Redis blip — only a genuine
+    unexpected raise reaches the billing DLQ here.
+    """
+    try:
         from src.gateway.usage import compute_cost
 
         cost: Decimal | None = None
@@ -161,6 +187,17 @@ async def _enqueue_usage(
             "downgraded_features": ctx.downgraded_features,
         }
         await enqueue_usage_event(payload)
+    except Exception as exc:
+        await record_billing_failure(
+            kind="usage_enqueue",
+            request_id=ctx.request_id,
+            error=repr(exc),
+            detail={
+                "user_id": ctx.user_id,
+                "logical_model_id": ctx.logical_model_id,
+                "total_tokens": ctx.total_tokens,
+            },
+        )
 
 
 async def _enqueue_log(ctx: GatewayRequestContext) -> None:
@@ -245,9 +282,16 @@ async def _settle_tpm(
     """
     if not rate_limit_rules:
         return
-    with suppress(Exception):
+    try:
         from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST, settle_tpm
 
         reserved_tokens = ctx.tpm_estimated_tokens or ESTIMATED_TOKENS_PER_REQUEST
         delta_tokens = reserved_tokens - ctx.total_tokens
         await settle_tpm(ctx.request_id, rate_limit_rules, delta_tokens)
+    except Exception as exc:
+        await record_billing_failure(
+            kind="tpm_settle",
+            request_id=ctx.request_id,
+            error=repr(exc),
+            detail={"total_tokens": ctx.total_tokens},
+        )

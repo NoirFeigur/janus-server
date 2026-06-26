@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -860,3 +861,456 @@ async def test_check_rate_limits_skips_check_when_no_rules() -> None:
 
     assert result == []
     mock_check.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# #7: a finalize failure must not strand the concurrent slot or upstream conn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_finalize_failure_still_releases_slot_and_closes_upstream() -> None:
+    """Oracle #7: if ``finalize_gateway_request`` raises, the concurrent slot
+    release AND the upstream close MUST still happen.
+
+    The old ``_finalize_stream`` ran the three cleanup steps in sequence inside a
+    single shielded block, so a billing/quota exception in the (slow, DB-touching)
+    finalize step skipped both ``release_concurrent`` and ``_aclose_response`` —
+    permanently leaking the concurrent semaphore slot and the upstream HTTP
+    connection. Resource cleanup must be independent of finalize success."""
+    sse_chunks = _make_anthropic_sse(
+        ("message_start", {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 5, "output_tokens": 0}},
+        }),
+        ("message_stop", {"type": "message_stop"}),
+    )
+    upstream = _ClosableByteStream(sse_chunks)
+
+    fake_service = AsyncMock()
+    fake_service.repo = AsyncMock()
+    fake_service.repo.get_active_quotas = AsyncMock(return_value=[])
+    fake_service.quota = AsyncMock()
+
+    rules = [{"id": 1, "max_concurrent": 5, "subject_type": "user", "subject_id": 100}]
+
+    with (
+        patch(
+            "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
+        ) as finalize,
+        patch(
+            "src.gateway.router.release_concurrent", new_callable=AsyncMock
+        ) as mock_release,
+    ):
+        finalize.side_effect = RuntimeError("billing backend down")
+        async for _ in _stream_anthropic_native(
+            response=upstream,
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=fake_service,
+            started_at=0.0,
+            request_id="req-finalize-fail",
+            member="m-finalize-fail",
+            channel_id=7,
+            upstream_model="anthropic/claude-sonnet-4-20250514",
+            rate_limit_rules=rules,
+        ):
+            pass
+
+    # Finalize was attempted and blew up, but neither resource leaked.
+    finalize.assert_awaited_once()
+    mock_release.assert_awaited_once_with("m-finalize-fail", rules)
+    assert upstream.aclose_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# #7 part 2: lifespan drains in-flight finalizers before Redis/DB teardown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_finalizer_registers_and_auto_removes() -> None:
+    """A spawned finalizer is tracked while running and removed on completion."""
+    import asyncio
+
+    from src.gateway.router import _inflight_finalizers, _spawn_finalizer
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _work() -> None:
+        started.set()
+        await release.wait()
+
+    task = _spawn_finalizer(_work())
+    await started.wait()
+    # Registered while in-flight.
+    assert task in _inflight_finalizers
+
+    release.set()
+    await task
+    # Auto-removed via the done-callback once finished.
+    assert task not in _inflight_finalizers
+
+
+@pytest.mark.asyncio
+async def test_drain_finalizers_waits_for_inflight_then_returns_zero() -> None:
+    """Oracle #7 part 2: a still-running finalizer is awaited to completion by
+    the drain, so its billing/quota settle lands before Redis/DB teardown."""
+    import asyncio
+
+    from src.gateway.router import _spawn_finalizer, drain_finalizers
+
+    settled = False
+
+    async def _settle() -> None:
+        nonlocal settled
+        await asyncio.sleep(0.05)
+        settled = True
+
+    _spawn_finalizer(_settle())
+    unfinished = await drain_finalizers(timeout=1.0)
+
+    assert unfinished == 0
+    assert settled is True
+
+
+@pytest.mark.asyncio
+async def test_drain_finalizers_reports_stragglers_past_timeout() -> None:
+    """A finalizer that overruns the drain timeout is counted, not awaited
+    forever — shutdown must stay bounded."""
+    import asyncio
+
+    from src.gateway.router import _inflight_finalizers, _spawn_finalizer, drain_finalizers
+
+    async def _wedged() -> None:
+        await asyncio.sleep(10)
+
+    task = _spawn_finalizer(_wedged())
+    try:
+        unfinished = await drain_finalizers(timeout=0.05)
+        assert unfinished == 1
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        _inflight_finalizers.discard(task)
+
+
+@pytest.mark.asyncio
+async def test_drain_finalizers_empty_returns_zero() -> None:
+    """No in-flight finalizers drains instantly to zero."""
+    from src.gateway.router import drain_finalizers
+
+    assert await drain_finalizers(timeout=0.01) == 0
+
+
+# ---------------------------------------------------------------------------
+# #12: a cancelled stream (client disconnect) must close the upstream connection
+# BEFORE running the slow DB-touching finalize. If finalize ran first, a client
+# disconnect mid-finalize would leave the upstream connection leaked while the
+# settle blocks. Close-first returns the connection to the pool unconditionally.
+# ---------------------------------------------------------------------------
+
+
+class _OrderRecordingStream:
+    """A byte stream that hangs after its chunks and records aclose ordering."""
+
+    def __init__(self, chunks: list[bytes], order: list[str]) -> None:
+        self._chunks = chunks
+        self._index = 0
+        self._order = order
+
+    def __aiter__(self) -> _OrderRecordingStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        import asyncio
+
+        if self._index >= len(self._chunks):
+            await asyncio.sleep(3600)  # hang → lets the consumer cancel us
+            raise StopAsyncIteration
+        chunk = self._chunks[self._index]
+        self._index += 1
+        return chunk
+
+    async def aclose(self) -> None:
+        self._order.append("aclose")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_closes_upstream_before_finalize() -> None:
+    """Oracle #12: on cancellation the upstream is closed before finalize runs.
+
+    Drives an Anthropic stream as a task, cancels it mid-flight (client
+    disconnect), and asserts the recorded order is aclose THEN finalize — the
+    upstream connection is returned to the pool before the slow settle."""
+    import asyncio
+
+    order: list[str] = []
+    sse_chunks = _make_anthropic_sse(
+        ("message_start", {"type": "message_start",
+                           "message": {"usage": {"input_tokens": 5, "output_tokens": 0}}}),
+    )
+    upstream = _OrderRecordingStream(sse_chunks, order)
+
+    async def _record_finalize(*_args: Any, **_kwargs: Any) -> None:
+        order.append("finalize")
+
+    async def _consume() -> None:
+        async for _ in _stream_anthropic_native(
+            response=upstream,
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-cancel-order",
+            member="m-cancel-order",
+            channel_id=7,
+            upstream_model="claude-sonnet",
+        ):
+            pass
+
+    with patch(
+        "src.gateway.router.finalize_gateway_request",
+        new=AsyncMock(side_effect=_record_finalize),
+    ):
+        task = asyncio.ensure_future(_consume())
+        # Let the stream yield its first chunk and then block on the hang.
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    assert order == ["aclose", "finalize"]
+
+
+# ---------------------------------------------------------------------------
+# #11: on idle/duration timeout a stream must NOT emit its normal success
+# terminator (OpenAI `data: [DONE]`) — that signals a clean completion and the
+# client treats the truncated stream as whole. It must emit an error event so
+# the client knows the response was cut short.
+# ---------------------------------------------------------------------------
+
+
+async def _hang_after(chunks: list[Any]) -> AsyncIterator[Any]:
+    """Yield the given chunks, then hang forever (simulates an idle upstream)."""
+    import asyncio
+
+    for chunk in chunks:
+        yield chunk
+    await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_stream_openai_timeout_emits_error_not_done() -> None:
+    """Oracle #11: an idle-timed-out OpenAI stream emits an SSE error event and
+    NOT `data: [DONE]` — otherwise the client thinks the stream completed."""
+
+    class Chunk:
+        def __init__(self, data: dict[str, Any]) -> None:
+            self._data = data
+            self.model = data.get("model")
+            self.usage = data.get("usage")
+            self._hidden_params = data.get("_hidden_params")
+
+        def model_dump(self) -> dict[str, Any]:
+            return self._data
+
+    first = Chunk({"id": "c1", "model": "openai/gpt-4o",
+                   "choices": [{"index": 0, "delta": {"content": "hi"}}]})
+
+    collected: list[str] = []
+    with (
+        patch("src.gateway.router.finalize_gateway_request", new_callable=AsyncMock),
+        patch("src.gateway.router._STREAM_IDLE_TIMEOUT_SECONDS", 0.05),
+    ):
+        async for chunk in _stream_openai(
+            response=_hang_after([first]),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-openai-timeout",
+            member="member-openai-timeout",
+        ):
+            collected.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
+
+    body = "".join(collected)
+    assert "[DONE]" not in body
+    assert "error" in body.lower()
+
+
+@pytest.mark.asyncio
+async def test_stream_anthropic_timeout_emits_error_event() -> None:
+    """An idle-timed-out Anthropic stream emits an SSE `error` event."""
+    first = _make_anthropic_sse(
+        ("message_start", {"type": "message_start",
+                           "message": {"usage": {"input_tokens": 5, "output_tokens": 0}}}),
+    )[0]
+
+    collected: list[bytes] = []
+    with (
+        patch("src.gateway.router.finalize_gateway_request", new_callable=AsyncMock),
+        patch("src.gateway.router._STREAM_IDLE_TIMEOUT_SECONDS", 0.05),
+    ):
+        async for chunk in _stream_anthropic_native(
+            response=_hang_after([first]),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-anthropic-timeout",
+            member="member-anthropic-timeout",
+            channel_id=1,
+            upstream_model="claude-sonnet",
+        ):
+            collected.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+
+    body = b"".join(collected).decode("utf-8")
+    assert "event: error" in body
+    assert "error" in body.lower()
+
+
+@pytest.mark.asyncio
+async def test_stream_gemini_timeout_emits_error_event() -> None:
+    """An idle-timed-out Gemini stream emits an SSE error payload."""
+    first = _make_gemini_sse(
+        {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]},
+    )[0]
+
+    collected: list[bytes] = []
+    with (
+        patch("src.gateway.router.finalize_gateway_request", new_callable=AsyncMock),
+        patch("src.gateway.router._STREAM_IDLE_TIMEOUT_SECONDS", 0.05),
+    ):
+        async for chunk in _stream_gemini_native(
+            response=_hang_after([first]),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-gemini-timeout",
+            member="member-gemini-timeout",
+            channel_id=1,
+            upstream_model="gemini-2.0",
+        ):
+            collected.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+
+    body = b"".join(collected).decode("utf-8")
+    assert "error" in body.lower()
+
+
+# ---------------------------------------------------------------------------
+# B1 + B2: the /v1/responses streaming path (endpoints_v1._stream_responses) was
+# the odd one out — a bare `async for` with NO idle/duration timeout (B2), and a
+# finalizer that ran the DB settle FIRST and was never registered for drain (B1).
+# It now reuses router._finalize_stream via _spawn_finalizer and bounds each pull
+# with an idle timeout, at parity with the chat/native providers above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_idle_timeout_emits_error_event() -> None:
+    """B2: a wedged upstream on /v1/responses now idle-times-out and emits an SSE
+    error event instead of hanging forever holding the concurrent slot + TPM
+    reservation. The Responses API has no `[DONE]` sentinel, so a truncated
+    stream is signalled purely by the error event."""
+    from src.gateway.endpoints_v1 import _stream_responses
+
+    first = {"type": "response.output_text.delta", "delta": "hi"}
+
+    collected: list[str] = []
+    with (
+        patch("src.gateway.router.finalize_gateway_request", new_callable=AsyncMock),
+        patch("src.gateway.endpoints_v1._STREAM_IDLE_TIMEOUT_SECONDS", 0.05),
+    ):
+        async for chunk in _stream_responses(
+            response=_hang_after([first]),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-responses-timeout",
+            member="member-responses-timeout",
+            channel_id=1,
+            upstream_model="gpt-4o",
+        ):
+            collected.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
+
+    body = "".join(collected)
+    assert "stream_timeout" in body
+    assert "error" in body.lower()
+    assert "[DONE]" not in body
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_finalizer_drainable_and_closes_before_settle() -> None:
+    """B1: the /v1/responses finalizer now (a) goes through _spawn_finalizer so the
+    lifespan can drain it on shutdown, and (b) frees held resources (upstream
+    close + concurrent slot) BEFORE the DB-touching billing settle. The old path
+    ran finalize first inside a non-drainable shield."""
+    import src.gateway.endpoints_v1 as ep
+    from src.gateway.endpoints_v1 import _stream_responses
+
+    calls: list[str] = []
+
+    class _RecordingResponse:
+        _done = False
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            if not self._done:
+                self._done = True
+                return {"type": "x", "usage": {"input_tokens": 5, "output_tokens": 7}}
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            calls.append("aclose")
+
+    async def _fake_finalize(*_a: Any, **_k: Any) -> None:
+        calls.append("finalize")
+
+    spawn_seen: list[Any] = []
+    real_spawn = ep._spawn_finalizer
+
+    def _spy_spawn(coro: Any) -> Any:
+        task = real_spawn(coro)
+        spawn_seen.append(task)
+        return task
+
+    rules = [
+        {
+            "id": 1,
+            "subject_type": "user",
+            "subject_id": 10,
+            "logical_model_id": 1,
+            "max_concurrent": 5,
+        }
+    ]
+    with (
+        patch("src.gateway.router.finalize_gateway_request", side_effect=_fake_finalize),
+        patch("src.gateway.router.release_concurrent", new_callable=AsyncMock) as rel,
+        patch.object(ep, "_spawn_finalizer", _spy_spawn),
+    ):
+        async for _ in _stream_responses(
+            response=_RecordingResponse(),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-b1",
+            member="member-b1",
+            channel_id=1,
+            upstream_model="gpt-4o",
+            rate_limit_rules=rules,
+        ):
+            pass
+
+    # Routed through the drainable finalizer (registered in _inflight_finalizers).
+    assert len(spawn_seen) == 1
+    # Held resources freed before the billing settle.
+    assert calls.index("aclose") < calls.index("finalize")
+    rel.assert_awaited_once()

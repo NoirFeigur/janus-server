@@ -42,6 +42,19 @@ _CHARS_PER_TOKEN = 4
 # bills the actual overage at finalize time.
 _MAX_UPFRONT_ESTIMATE = 4000
 
+# Absolute upper bound on the client-declared output cap (``max_tokens`` /
+# ``max_completion_tokens`` / ``maxOutputTokens`` / ``max_output_tokens``). The
+# raw JSON integer is unbounded (Python ints have no width limit), so a single
+# request could declare a multi-billion output ceiling. That ceiling is added to
+# the prompt estimate in :func:`estimate_request_tokens` and then reserved
+# against the shared department/global quota AND the TPM bucket BEFORE the
+# upstream call — a single crafted request could exhaust the entire shared quota
+# counter for everyone. Clamp to a value comfortably above any real model's
+# output window (current frontier reasoning models top out near ~128k output) so
+# legitimate large generations are untouched while the abuse vector is closed.
+# Settlement at finalize still reconciles to actual usage either way.
+_MAX_COMPLETION_CEILING = 200_000
+
 # TPM bucket TTL. MUST outlive the longest possible request so settlement still
 # finds the bucket. A stream may run up to ``_STREAM_MAX_DURATION_SECONDS`` (30
 # min, mirrored in router._STREAM_MAX_DURATION_SECONDS) before settle_tpm runs;
@@ -51,15 +64,97 @@ _MAX_UPFRONT_ESTIMATE = 4000
 # cap plus finalize latency.
 _TPM_BUCKET_TTL_MS = 1_860_000
 
+# Concurrent-semaphore stale-eviction timeout (Oracle #10). MUST strictly outlive
+# the longest legitimate stream so an ACTIVE stream is never mistaken for an
+# abandoned slot. The old value equalled the 30-min max stream duration
+# (``_STREAM_MAX_DURATION_SECONDS`` in router), so a stream still running at the
+# cap was evicted as "stale" and its slot handed to a new request — silently
+# admitting beyond ``max_concurrent``. 35 min = 30-min cap + 5-min finalize/settle
+# slack: long enough that a live stream keeps its slot, short enough that a truly
+# crashed stream's slot is still reclaimed within a few minutes of the cap.
+_CONCURRENT_STALE_TIMEOUT_SECONDS = 2100
 
-def estimate_request_tokens(messages: object) -> int:
-    """Estimate prompt tokens for an upfront TPM reservation.
+# Process-local emergency rate limiter (Oracle #8). When Redis is unreachable the
+# Redis-backed admission controls cannot run. The original code failed fully open
+# (``allowed=True`` for EVERY request) — a Redis outage turned the gateway into a
+# zero-protection door, exposing upstream providers to unbounded load at the very
+# moment the system is already degraded. Instead each replica applies a
+# conservative, PROCESS-LOCAL fixed-window cap per subject so abusers are still
+# throttled during the outage.
+#
+# This is explicitly best-effort and degraded: it is per-process, NOT
+# cluster-wide, so the effective cluster cap is roughly ``cap × replica_count``.
+# That is an acceptable, bounded over-admission compared to unlimited. The window
+# is a coarse fixed 60s bucket — cheap and lock-free under asyncio's single
+# thread (the event loop serialises the check+commit, so no race). State is
+# bounded by distinct-subject cardinality (~user count): stale windows are reset
+# on next access, never accumulating per-time-bucket entries.
+_EMERGENCY_WINDOW_SECONDS = 60
+# Degraded cap for a subject whose rule has no rpm_limit (token/concurrent-only):
+# Redis down must never mean unlimited even for these.
+_EMERGENCY_DEFAULT_MAX_PER_WINDOW = 60
+# subject_key -> (window_index, count_in_window)
+_emergency_windows: dict[str, tuple[int, int]] = {}
 
-    Falls back to :data:`ESTIMATED_TOKENS_PER_REQUEST` for inputs we cannot
-    inspect, but otherwise returns a length-derived floor so a 5k-prompt request
-    against a 30k-TPM bucket cannot bypass the limit by reserving only 100
-    tokens upfront and relying on settle-time reconciliation. The estimate is
-    capped so a malicious payload cannot starve the bucket.
+
+def reset_emergency_limiter() -> None:
+    """Clear process-local emergency limiter state (test isolation / reset)."""
+    _emergency_windows.clear()
+
+
+def _emergency_admit(rules: list[dict[str, Any]], now_ms: int) -> bool:
+    """Best-effort process-local fixed-window admission, used ONLY while Redis is
+    down (the fail-open path of :func:`check_rate_limits`).
+
+    Returns True only if the request fits under EVERY applicable subject's
+    degraded window budget; False if any subject has exhausted it. The per-subject
+    cap is the rule's ``rpm_limit`` when set (so degraded behaviour tracks the
+    configured intent), else :data:`_EMERGENCY_DEFAULT_MAX_PER_WINDOW`.
+
+    Headroom is checked for all subjects BEFORE any increment so a multi-rule
+    request is admitted atomically (all-or-nothing) and a denial does not leave a
+    partial increment that would mis-charge an unrelated subject's window.
+    """
+    if not rules:
+        # No rules → no subject identity to throttle against; nothing to cap.
+        return True
+    window_index = (now_ms // 1000) // _EMERGENCY_WINDOW_SECONDS
+    subjects: list[tuple[str, int]] = []
+    for rule in rules:
+        subject = _subject_key(rule)
+        rpm_limit = rule.get("rpm_limit")
+        cap = int(rpm_limit) if rpm_limit is not None else _EMERGENCY_DEFAULT_MAX_PER_WINDOW
+        subjects.append((subject, cap))
+
+    def _current_count(subject: str) -> int:
+        win, count = _emergency_windows.get(subject, (window_index, 0))
+        return count if win == window_index else 0
+
+    # Phase 1: check headroom for ALL subjects.
+    for subject, cap in subjects:
+        if _current_count(subject) >= cap:
+            return False
+    # Phase 2: commit increments (event loop serialises this with phase 1).
+    for subject, _cap in subjects:
+        _emergency_windows[subject] = (window_index, _current_count(subject) + 1)
+    return True
+
+
+def estimate_request_tokens(messages: object, max_completion: int = 0) -> int:
+    """Estimate total tokens for an upfront TPM reservation (prompt + output cap).
+
+    Returns ``prompt_estimate + max_completion`` so the reservation covers BOTH
+    the input AND the tokens the model may generate (Oracle #3). Reserving only
+    the prompt let a small-prompt request with a large ``max_tokens`` slip a big
+    generation past a tight TPM bucket — TPM then effectively limited input size,
+    not throughput. Settlement at finalize reconciles to actuals either way.
+
+    The prompt portion falls back to :data:`ESTIMATED_TOKENS_PER_REQUEST` for
+    inputs we cannot inspect, and is capped at :data:`_MAX_UPFRONT_ESTIMATE` so a
+    malicious payload cannot starve the bucket. ``max_completion`` is the
+    client-declared output ceiling (already self-limited by the caller's own
+    token budget) and is added on top of the capped prompt estimate; a
+    non-positive value contributes nothing.
 
     Accepts the several input shapes the gateway endpoints carry:
 
@@ -69,9 +164,43 @@ def estimate_request_tokens(messages: object) -> int:
     """
     total_chars = _count_input_chars(messages)
     if total_chars <= 0:
-        return ESTIMATED_TOKENS_PER_REQUEST
-    estimate = max(ESTIMATED_TOKENS_PER_REQUEST, total_chars // _CHARS_PER_TOKEN)
-    return min(estimate, _MAX_UPFRONT_ESTIMATE)
+        prompt_estimate = ESTIMATED_TOKENS_PER_REQUEST
+    else:
+        prompt_estimate = max(
+            ESTIMATED_TOKENS_PER_REQUEST, total_chars // _CHARS_PER_TOKEN
+        )
+        prompt_estimate = min(prompt_estimate, _MAX_UPFRONT_ESTIMATE)
+    return prompt_estimate + max(0, max_completion)
+
+
+def coerce_max_completion(value: object) -> int:
+    """Normalize a provider-declared output-token cap into a non-negative int.
+
+    Providers carry the output ceiling in differently-typed, optional fields
+    (Gemini ``generationConfig["maxOutputTokens"]``, OpenAI ``max_tokens`` /
+    ``max_completion_tokens``, Responses ``max_output_tokens``). The value may be
+    absent (``None``), a bare int, or a stringified int from a loosely-typed
+    client. Anything we cannot read as a positive int contributes nothing to the
+    reservation rather than raising on the hot path.
+    """
+    if isinstance(value, bool):  # bool is an int subclass — never a token count
+        return 0
+    if isinstance(value, int):
+        return _clamp_completion(value)
+    if isinstance(value, str):
+        with suppress(ValueError):
+            return _clamp_completion(int(value.strip()))
+    return 0
+
+
+def _clamp_completion(value: int) -> int:
+    """Floor at 0, ceil at :data:`_MAX_COMPLETION_CEILING`.
+
+    The ceiling closes the unbounded-reservation abuse vector (a raw JSON int has
+    no width limit, so a crafted ``max_tokens`` could reserve an arbitrarily large
+    slice of the shared quota/TPM counters before the upstream call).
+    """
+    return max(0, min(value, _MAX_COMPLETION_CEILING))
 
 
 def _count_input_chars(value: object) -> int:
@@ -203,11 +332,19 @@ return {1, tokens, limit}
 # Positive delta refunds unused reservation (capped at limit); negative delta
 # deducts over-consumption beyond the upfront estimate (may drive the bucket
 # into debt that recovers via refill). Never touches the refill timestamp.
+#
+# Debt-aware TTL (Oracle #4): when the settle drives the balance negative, the
+# bucket must outlive the time refill needs to repay that debt — otherwise the
+# key expires mid-recovery, the next request reads a fresh full bucket, and the
+# heavy caller's over-consumption is silently forgiven (TPM bypass). Recovery
+# time is ``abs(debt) / refill_rate`` minutes; we set the TTL to that window plus
+# the base TTL as slack, and never shrink below the base TTL.
 _LUA_TPM_SETTLE = """
 local key = KEYS[1]
 local delta = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
 local ttl_ms = tonumber(ARGV[3])
+local refill_rate = tonumber(ARGV[4])
 
 if redis.call('EXISTS', key) == 0 then
     return 0
@@ -219,7 +356,16 @@ if tokens > limit then
     tokens = limit
 end
 redis.call('HSET', key, 'tokens', tokens)
-redis.call('PEXPIRE', key, ttl_ms)
+
+local effective_ttl = ttl_ms
+if tokens < 0 and refill_rate and refill_rate > 0 then
+    local recovery_ms = math.ceil((-tokens) * 60000 / refill_rate)
+    local debt_ttl = recovery_ms + ttl_ms
+    if debt_ttl > effective_ttl then
+        effective_ttl = debt_ttl
+    end
+end
+redis.call('PEXPIRE', key, effective_ttl)
 return 1
 """
 
@@ -281,10 +427,18 @@ async def check_rate_limits(
     tpm_remaining: int | None = None
     concurrent_remaining: int | None = None
 
+    rpm_acquired: list[dict[str, Any]] = []
     tpm_acquired: list[dict[str, Any]] = []
     concurrent_acquired = False
 
     async def _rollback() -> None:
+        # Release every gate this request actually acquired, in any order — a
+        # later gate's denial means the request never runs, so its RPM window
+        # entry, TPM reservation and concurrent slot must ALL be returned.
+        # Omitting RPM (the original bug) leaked the sliding-window slot: a
+        # never-admitted request kept throttling the subject for a full minute.
+        if rpm_acquired:
+            await release_rpm(member, rpm_acquired)
         if tpm_acquired:
             await settle_tpm(request_id, tpm_acquired, estimated_tokens)
         if concurrent_acquired:
@@ -322,6 +476,7 @@ async def check_rate_limits(
                         retry_after_seconds=retry_after,
                         denied_reason="rpm_exceeded",
                     )
+                rpm_acquired.append(rule)
 
             # TPM check
             tpm_limit = rule.get("tpm_limit")
@@ -355,7 +510,7 @@ async def check_rate_limits(
             max_concurrent = rule.get("max_concurrent")
             if max_concurrent is not None and is_stream:
                 key = f"rl:conc:{rule_id}:{subject_key}"
-                timeout_ms = 1800 * 1000  # 30 min max stream
+                timeout_ms = _CONCURRENT_STALE_TIMEOUT_SECONDS * 1000
                 result = await redis.eval(
                     _LUA_CONCURRENT_CHECK, 1, key, now_ms, max_concurrent,
                     member, timeout_ms
@@ -373,9 +528,26 @@ async def check_rate_limits(
                 concurrent_acquired = True
 
     except RedisError:
-        # Fail-open: if Redis is down, allow the request through
-        _log.warning("rate_limit.redis_unavailable", request_id=request_id)
-        return RateLimitCheckResult(allowed=True)
+        # Redis is down — the Redis-backed admission controls cannot run. Rather
+        # than failing fully open (the original bug: allowed=True for EVERY
+        # request, zero protection), apply a degraded PROCESS-LOCAL emergency cap
+        # per subject (Oracle #8). This is a controlled fail-open: legitimate
+        # traffic still flows, but an abuser cannot use the outage to flood
+        # upstreams unbounded. Surfaced as a health-alert warning so ops can react.
+        admitted = _emergency_admit(rules, now_ms)
+        _log.warning(
+            "rate_limit.redis_unavailable",
+            request_id=request_id,
+            degraded_admitted=admitted,
+            health_alert="rate_limit_degraded",
+        )
+        if admitted:
+            return RateLimitCheckResult(allowed=True)
+        return RateLimitCheckResult(
+            allowed=False,
+            retry_after_seconds=_EMERGENCY_WINDOW_SECONDS,
+            denied_reason="degraded_rate_limited",
+        )
 
     return RateLimitCheckResult(
         allowed=True,
@@ -440,26 +612,34 @@ async def settle_tpm(request_id: str, rules: list[dict[str, Any]], delta_tokens:
       normal time-based refill, which correctly throttles heavy callers.
 
     A zero delta is a no-op.
+
+    Redis failures are NOT swallowed here: settlement is billing-critical (it
+    reconciles the TPM bucket against real token usage), so a failure must reach
+    :func:`finalize._settle_tpm`, which records it to the billing DLQ for later
+    replay. The best-effort rollback callers (``check_rate_limits._rollback``,
+    ``router`` / ``endpoints_v1._rollback_rate_limit_reservations``) each wrap
+    their ``settle_tpm`` call in their own ``suppress(Exception)``, so surfacing
+    the error here does not break their fire-and-forget semantics.
     """
     if delta_tokens == 0:
         return
-    with suppress(RedisError):
-        redis = get_redis()
-        for rule in rules:
-            tpm_limit = rule.get("tpm_limit")
-            if tpm_limit is not None:
-                tpm_burst_limit = rule.get("tpm_burst_limit") or tpm_limit
-                rule_id = rule.get("id", 0)
-                subject_key = _subject_key(rule)
-                key = f"rl:tpm:{rule_id}:{subject_key}"
-                await redis.eval(
-                    _LUA_TPM_SETTLE,
-                    1,
-                    key,
-                    str(delta_tokens),
-                    str(tpm_burst_limit),
-                    str(_TPM_BUCKET_TTL_MS),
-                )
+    redis = get_redis()
+    for rule in rules:
+        tpm_limit = rule.get("tpm_limit")
+        if tpm_limit is not None:
+            tpm_burst_limit = rule.get("tpm_burst_limit") or tpm_limit
+            rule_id = rule.get("id", 0)
+            subject_key = _subject_key(rule)
+            key = f"rl:tpm:{rule_id}:{subject_key}"
+            await redis.eval(
+                _LUA_TPM_SETTLE,
+                1,
+                key,
+                str(delta_tokens),
+                str(tpm_burst_limit),
+                str(_TPM_BUCKET_TTL_MS),
+                str(tpm_limit),
+            )
 
 
 def _subject_key(rule: dict[str, Any]) -> str:

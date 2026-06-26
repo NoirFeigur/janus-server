@@ -424,6 +424,46 @@ class AsyncRedisDouble:
             await self.rpush(inflight_key, envelope)
             return envelope  # type: ignore[return-value]
 
+        # Atomic stale-claim recovery (Oracle #13). Mirrors the Lua script: scans
+        # inflight, requeues stale payloads, dead-letters malformed envelopes, all
+        # in one shot. Reads ``self._lists`` directly (NOT ``self.lrange``) so it
+        # stays atomic even when a test patches ``lrange`` to yield — real Redis
+        # Lua runs to completion without interleaving.
+        if "RECOVER_STALE_CLAIMS" in script:
+            import json
+
+            inflight_key = keys[0]
+            queue_key = keys[1]
+            dlq_key = keys[2]
+            cutoff_ms = float(argv[0])
+
+            envelopes = list(self._lists.get(inflight_key, []))
+            recovered = 0
+            dlqd = 0
+            for envelope in envelopes:
+                try:
+                    decoded = json.loads(envelope)
+                except (json.JSONDecodeError, TypeError):
+                    decoded = None
+                if not isinstance(decoded, dict) or decoded.get("payload") is None:
+                    await self.rpush(dlq_key, envelope)
+                    await self.lrem(inflight_key, 1, envelope)
+                    dlqd += 1
+                    continue
+                try:
+                    claimed_at = float(decoded.get("claimed_at_ms"))
+                except (TypeError, ValueError):
+                    await self.rpush(dlq_key, envelope)
+                    await self.lrem(inflight_key, 1, envelope)
+                    dlqd += 1
+                    continue
+                if claimed_at <= cutoff_ms:
+                    await self.rpush(queue_key, decoded["payload"])
+                    await self.lrem(inflight_key, 1, envelope)
+                    recovered += 1
+            return [recovered, dlqd]
+
+
         # Concurrent script: uses "timeout_ms" variable (unique marker)
         if "timeout_ms" in script:
             key = keys[0]
@@ -468,11 +508,15 @@ class AsyncRedisDouble:
 
         # TPM settle script detection: signed-delta reconciliation (unique
         # marker: "delta" ARGV). Applies estimated-minus-actual to the bucket,
-        # capped at limit; no-op when the key is absent. Mirrors _LUA_TPM_SETTLE.
+        # capped at limit; no-op when the key is absent. Mirrors _LUA_TPM_SETTLE,
+        # including the debt-aware TTL: a negative balance must outlive the
+        # refill-recovery window or the bucket expires and the overage is lost.
         if "delta" in script:
             key = keys[0]
             delta = int(argv[0])
             limit = int(argv[1])
+            ttl_ms = float(argv[2]) if len(argv) > 2 else 0.0
+            refill_rate = float(argv[3]) if len(argv) > 3 else 0.0
             if key not in self._hashes:
                 return [0]
             h = self._hashes[key]
@@ -480,6 +524,14 @@ class AsyncRedisDouble:
             if tokens > limit:
                 tokens = limit
             h["tokens"] = str(tokens)
+            effective_ttl = ttl_ms
+            if tokens < 0 and refill_rate > 0:
+                recovery_ms = math.ceil((-tokens) * 60000 / refill_rate)
+                debt_ttl = recovery_ms + ttl_ms
+                if debt_ttl > effective_ttl:
+                    effective_ttl = debt_ttl
+            if effective_ttl > 0:
+                self._expiry[key] = time.monotonic() + (effective_ttl / 1000.0)
             return [1]
 
         # TPM script detection: HMGET + HSET pattern
@@ -489,6 +541,7 @@ class AsyncRedisDouble:
             limit = int(argv[1])
             request_tokens = int(argv[2])
             refill_rate = float(argv[3]) if len(argv) > 3 else float(limit)
+            ttl_ms = float(argv[4]) if len(argv) > 4 else 0.0
 
             h = self._hashes.get(key, {})
             tokens = float(h.get("tokens", str(limit)))
@@ -503,6 +556,8 @@ class AsyncRedisDouble:
 
             tokens = tokens - request_tokens
             self._hashes[key] = {"tokens": str(int(tokens)), "ts": str(int(now_ms))}
+            if ttl_ms > 0:
+                self._expiry[key] = time.monotonic() + (ttl_ms / 1000.0)
             return [1, int(tokens), limit]
 
         # Default: allow

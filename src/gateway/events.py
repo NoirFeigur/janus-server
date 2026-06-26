@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -33,14 +34,51 @@ USAGE_INFLIGHT_KEY = "gw:event:usage:inflight"
 LOG_INFLIGHT_KEY = "gw:event:log:inflight"
 USAGE_DLQ_KEY = "gw:event:usage:dlq"
 LOG_DLQ_KEY = "gw:event:log:dlq"
+# Billing-failure DLQ (Oracle #9). A billing-critical finalize step (quota
+# settle, TPM settle, usage enqueue) that RAISES must not vanish into a
+# suppress(Exception): the lost settlement is silent revenue/limit drift. Each
+# failure is recorded here (durably, via the outbox-backed enqueue) so it is
+# observable and replayable, while the finalize step itself stays non-fatal so a
+# single billing hiccup never aborts the response or its sibling steps.
+BILLING_DLQ_KEY = "gw:event:billing:dlq"
 
 # Batch tuning
 DEFAULT_BATCH_SIZE = 100
 MAX_RETRY_ATTEMPTS = 3
 DEFAULT_INFLIGHT_STALE_SECONDS = 300
 
+# Process-local outbox (Oracle #8). When a Redis enqueue fails (transient outage),
+# the event is parked here instead of being silently dropped — losing a usage
+# event loses billing/revenue. On the next *successful* enqueue (Redis recovered)
+# the backlog is replayed FIFO ahead of the new event, so accounting catches up.
+# Bounded per queue so a prolonged outage cannot exhaust process memory: once the
+# cap is hit the OLDEST buffered events are evicted (a deque maxlen does this),
+# trading the least-recent accounting data for liveness. This is a last-resort
+# net for short blips, NOT a durable store — sustained Redis loss still needs ops
+# intervention, surfaced via the eviction warning.
+_OUTBOX_MAX_PER_QUEUE = 10_000
+_outboxes: dict[str, deque[str]] = {}
+
+
+def _outbox_for(queue_key: str) -> deque[str]:
+    box = _outboxes.get(queue_key)
+    if box is None:
+        box = deque(maxlen=_OUTBOX_MAX_PER_QUEUE)
+        _outboxes[queue_key] = box
+    return box
+
+
+def _outbox_size(queue_key: str) -> int:
+    """Number of events currently parked in the local outbox for ``queue_key``."""
+    box = _outboxes.get(queue_key)
+    return len(box) if box is not None else 0
+
+
+def reset_outbox() -> None:
+    """Clear all process-local outboxes (test isolation / explicit reset)."""
+    _outboxes.clear()
+
 _ATTEMPT_KEY = "_attempt"
-_CLAIMED_AT_KEY = "claimed_at_ms"
 _PAYLOAD_KEY = "payload"
 
 _LUA_CLAIM_EVENT = """
@@ -57,6 +95,49 @@ redis.call("RPUSH", KEYS[2], envelope)
 return envelope
 """
 
+# Atomic stale-claim recovery (Oracle #13). The old Python version did a
+# non-atomic LRANGE snapshot then per-envelope RPUSH+LREM: two concurrent
+# recover passes (e.g. two ARQ workers) both snapshot the same stale envelope
+# and BOTH requeue it, double-processing the event (double billing / duplicate
+# log row). Doing the whole scan-requeue-remove inside one Lua script makes it a
+# single atomic Redis operation — the second pass sees the envelope already gone.
+# Returns {recovered_count, dlq_count}. ``LREM 1`` removes the FIRST matching
+# envelope; the per-claim ``claimed_at_ms`` makes envelopes effectively unique.
+_LUA_RECOVER_STALE = """
+-- RECOVER_STALE_CLAIMS
+local inflight_key = KEYS[1]
+local queue_key = KEYS[2]
+local dlq_key = KEYS[3]
+local cutoff_ms = tonumber(ARGV[1])
+
+local envelopes = redis.call("LRANGE", inflight_key, 0, -1)
+local recovered = 0
+local dlqd = 0
+
+for _, envelope in ipairs(envelopes) do
+    local ok, decoded = pcall(cjson.decode, envelope)
+    if not ok or type(decoded) ~= "table" or decoded.payload == nil then
+        -- Undecodable / malformed envelope: dead-letter it.
+        redis.call("RPUSH", dlq_key, envelope)
+        redis.call("LREM", inflight_key, 1, envelope)
+        dlqd = dlqd + 1
+    else
+        local claimed_at = tonumber(decoded.claimed_at_ms)
+        if claimed_at == nil then
+            redis.call("RPUSH", dlq_key, envelope)
+            redis.call("LREM", inflight_key, 1, envelope)
+            dlqd = dlqd + 1
+        elseif claimed_at <= cutoff_ms then
+            redis.call("RPUSH", queue_key, decoded.payload)
+            redis.call("LREM", inflight_key, 1, envelope)
+            recovered = recovered + 1
+        end
+    end
+end
+
+return {recovered, dlqd}
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class ClaimedEvent:
@@ -69,19 +150,51 @@ class ClaimedEvent:
 async def enqueue_event(queue_key: str, payload: dict[str, Any]) -> bool:
     """Push a JSON-serialized event to the specified Redis queue.
 
-    Returns True on success, False on failure (fail-open: never raises).
+    Returns True when the event reached Redis, False when it was parked in the
+    process-local outbox (Oracle #8) because Redis was unreachable. Never raises:
+    the hot path must not block on internal accounting.
+
+    On a successful push, any backlog accumulated in the outbox during a prior
+    outage is replayed FIFO *before* this event, so accounting order is
+    preserved as closely as possible once Redis recovers.
     """
+    serialized = json.dumps(payload, default=str)
     try:
         redis = get_redis()
-        await redis.rpush(queue_key, json.dumps(payload, default=str))
+        await _flush_outbox(redis, queue_key)
+        await redis.rpush(queue_key, serialized)
         return True
     except Exception:
+        box = _outbox_for(queue_key)
+        evicting = len(box) >= _OUTBOX_MAX_PER_QUEUE
+        box.append(serialized)
         _log.warning(
-            "gateway.event_queue.enqueue_failed",
+            "gateway.event_queue.enqueue_buffered",
             queue_key=queue_key,
             payload_keys=list(payload.keys()),
+            outbox_size=len(box),
+            outbox_evicting=evicting,
         )
         return False
+
+
+async def _flush_outbox(redis: Any, queue_key: str) -> None:
+    """Replay any outbox backlog for ``queue_key`` to Redis, oldest first.
+
+    Called at the top of a successful enqueue. If a replay push fails the event
+    is put back at the FRONT of the outbox and the flush stops, so ordering is
+    preserved and the still-failing backlog is retried on the next attempt.
+    """
+    box = _outboxes.get(queue_key)
+    if not box:
+        return
+    while box:
+        item = box.popleft()
+        try:
+            await redis.rpush(queue_key, item)
+        except Exception:
+            box.appendleft(item)
+            raise
 
 
 async def enqueue_usage_event(payload: dict[str, Any]) -> bool:
@@ -92,6 +205,34 @@ async def enqueue_usage_event(payload: dict[str, Any]) -> bool:
 async def enqueue_log_event(payload: dict[str, Any]) -> bool:
     """Enqueue a gateway request log event (called from gateway finalizer)."""
     return await enqueue_event(LOG_QUEUE_KEY, payload)
+
+
+async def record_billing_failure(
+    *, kind: str, request_id: str | None, error: str, detail: dict[str, Any] | None = None
+) -> None:
+    """Record a billing-critical finalize-step failure to the billing DLQ (Oracle #9).
+
+    A raised quota/TPM settle or usage enqueue would otherwise be swallowed by a
+    blanket ``suppress(Exception)``, silently dropping revenue/limit accounting.
+    This logs at ERROR (the always-available backstop alert) and durably enqueues
+    a structured record to :data:`BILLING_DLQ_KEY` for inspection and replay. It
+    is itself non-fatal: the enqueue is outbox-backed and never raises, so
+    recording a billing failure cannot in turn abort the finalize step.
+    """
+    _log.error(
+        "gateway.billing.step_failed",
+        kind=kind,
+        request_id=request_id,
+        error=error,
+    )
+    record = {
+        "kind": kind,
+        "request_id": request_id,
+        "error": error,
+        "detail": detail or {},
+        "recorded_at_ms": _now_ms(),
+    }
+    await enqueue_event(BILLING_DLQ_KEY, record)
 
 
 async def claim_batch(
@@ -195,36 +336,35 @@ async def recover_stale_claims(
     dlq_key: str,
     stale_after_seconds: int = DEFAULT_INFLIGHT_STALE_SECONDS,
 ) -> int:
-    """Requeue claims that have been inflight longer than ``stale_after_seconds``."""
-    recovered = 0
+    """Requeue claims that have been inflight longer than ``stale_after_seconds``.
+
+    Atomic (Oracle #13): the entire scan-requeue-remove runs inside a single Lua
+    script so two concurrent recover passes (e.g. two ARQ workers) cannot both
+    requeue the same stale envelope. Malformed / undecodable envelopes are
+    dead-lettered. Returns the number of envelopes requeued to ``queue_key``.
+    """
     cutoff_ms = _now_ms() - stale_after_seconds * 1000
     try:
         redis = get_redis()
-        envelopes = await redis.lrange(inflight_key, 0, -1)
-        for raw_envelope in envelopes:
-            envelope = str(raw_envelope)
-            claimed = _decode_claimed(envelope)
-            if claimed is None:
-                await redis.rpush(dlq_key, envelope)
-                await redis.lrem(inflight_key, 1, envelope)
-                continue
-            claimed_at = _claimed_at_ms(envelope)
-            if claimed_at is None:
-                await redis.rpush(dlq_key, envelope)
-                await redis.lrem(inflight_key, 1, envelope)
-                continue
-            if claimed_at > cutoff_ms:
-                continue
-            await redis.rpush(queue_key, claimed.raw)
-            await redis.lrem(inflight_key, 1, envelope)
-            recovered += 1
+        result = await redis.eval(
+            _LUA_RECOVER_STALE,
+            3,
+            inflight_key,
+            queue_key,
+            dlq_key,
+            str(cutoff_ms),
+        )
+        # Script returns {recovered_count, dlq_count}.
+        if isinstance(result, (list, tuple)) and result:
+            return int(result[0])
+        return 0
     except Exception:
         _log.exception(
             "gateway.event_queue.recover_stale_failed",
             queue_key=queue_key,
             inflight_key=inflight_key,
         )
-    return recovered
+        return 0
 
 
 async def send_to_dlq(dlq_key: str, items: list[str]) -> None:
@@ -279,13 +419,6 @@ def _decode_claimed(envelope: str) -> ClaimedEvent | None:
         payload = data.get(_PAYLOAD_KEY)
         if isinstance(payload, str):
             return ClaimedEvent(raw=payload, envelope=envelope)
-    return None
-
-
-def _claimed_at_ms(envelope: str) -> int | None:
-    with suppress(json.JSONDecodeError, TypeError, ValueError):
-        data = json.loads(envelope)
-        return int(data.get(_CLAIMED_AT_KEY))
     return None
 
 

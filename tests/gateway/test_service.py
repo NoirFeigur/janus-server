@@ -116,7 +116,9 @@ async def test_check_quota_delegates_to_enforcer() -> None:
     checked = await service.check_quota(100, None, 10)
 
     assert checked is result
-    service.quota.check_and_increment.assert_awaited_once_with(100, None, 10, [quota])
+    service.quota.check_and_increment.assert_awaited_once_with(
+        100, None, 10, [quota], estimated_tokens=0, estimated_cost=None
+    )
 
 
 async def test_check_quota_exceeded_raises_429() -> None:

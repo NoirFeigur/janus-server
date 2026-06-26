@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Mapping
 from contextlib import suppress
 from time import monotonic
 from typing import Annotated, Any, TypeVar
@@ -35,6 +35,7 @@ from src.gateway.quota import QuotaCheckResult, QuotaReservation
 from src.gateway.rate_limit import (
     ESTIMATED_TOKENS_PER_REQUEST,
     check_rate_limits,
+    coerce_max_completion,
     estimate_request_tokens,
     release_concurrent,
 )
@@ -48,6 +49,7 @@ from src.gateway.response_cache import (
 from src.gateway.router_manager import RouterManager
 from src.gateway.schemas import AnthropicRequest, GeminiRequest, OpenAIRequest
 from src.gateway.service import GatewayService
+from src.gateway.usage import compute_cost
 
 router = APIRouter(tags=["gateway"])
 
@@ -58,6 +60,52 @@ RequestSchemaT = TypeVar("RequestSchemaT", bound=BaseModel)
 
 _STREAM_MAX_DURATION_SECONDS = 1800
 _STREAM_IDLE_TIMEOUT_SECONDS = 60
+
+# In-flight stream finalizers (Oracle #7 part 2). Each streaming generator's
+# shielded post-stream cleanup runs as a registered task here. The shield keeps
+# the cleanup alive when the *request* task is cancelled (client disconnect), but
+# on process shutdown the event loop tears down regardless — and the lifespan
+# then closes Redis + disposes the DB engine. A finalizer still mid-flight at
+# that point would slam into closed connection pools, losing the billing/quota
+# settle and leaking the reservation. The lifespan drains this set (bounded by a
+# timeout) BEFORE closing those resources so settles complete on a clean engine.
+_inflight_finalizers: set[asyncio.Task[None]] = set()
+
+# Max time the lifespan waits for in-flight finalizers before forcing shutdown.
+# Comfortably above a normal settle (a few Redis INCRBYs + one DB insert); a
+# finalizer still running past this is wedged and not worth blocking shutdown on.
+_FINALIZER_DRAIN_TIMEOUT_SECONDS = 10.0
+
+
+def _spawn_finalizer(coro: Awaitable[None]) -> asyncio.Task[None]:
+    """Start a stream finalizer as a tracked task so shutdown can drain it.
+
+    The returned task is registered in :data:`_inflight_finalizers` and removed
+    on completion. Callers ``await asyncio.shield(task)`` so a client-disconnect
+    cancellation of the request task does not interrupt the cleanup, while the
+    task reference still lets the lifespan await stragglers on shutdown.
+    """
+    task: asyncio.Task[None] = asyncio.ensure_future(coro)
+    _inflight_finalizers.add(task)
+    task.add_done_callback(_inflight_finalizers.discard)
+    return task
+
+
+async def drain_finalizers(
+    timeout: float = _FINALIZER_DRAIN_TIMEOUT_SECONDS,
+) -> int:
+    """Wait for in-flight stream finalizers to finish, bounded by ``timeout``.
+
+    Called from the app lifespan on shutdown, before Redis/DB teardown, so the
+    billing/quota settle for streams that were still finalizing lands on a live
+    engine. Returns the number of finalizers that did NOT finish within the
+    timeout (0 on a clean drain) so the caller can surface a shutdown warning.
+    """
+    pending = [t for t in _inflight_finalizers if not t.done()]
+    if not pending:
+        return 0
+    _, still_pending = await asyncio.wait(pending, timeout=timeout)
+    return len(still_pending)
 
 
 async def _finalize_stream(
@@ -75,35 +123,55 @@ async def _finalize_stream(
     Wrapping the cleanup in :func:`asyncio.shield` is load-bearing: when the
     client disconnects, Starlette cancels the streaming task and the generator's
     ``finally`` runs with a pending ``CancelledError``. Without the shield the
-    second ``await`` in the chain (e.g. ``release_concurrent`` after
-    ``finalize_gateway_request``) is interrupted at the next checkpoint, leaving
+    second ``await`` in the chain is interrupted at the next checkpoint, leaving
     the TPM reservation un-refunded, the concurrent semaphore slot held, and the
     upstream HTTP connection leaked. The shield guarantees this cleanup runs to
     completion regardless of cancellation.
+
+    Ordering is also load-bearing (Oracle #7). Held resources are freed FIRST and
+    unconditionally — the upstream connection is closed (returned to the pool)
+    and the concurrent semaphore slot released — *before* the slow, DB-touching
+    billing/quota settle. The old code ran ``finalize`` first in a single
+    straight-line block, so an exception there (billing backend down, quota Redis
+    error) skipped both the slot release and the upstream close, leaking the
+    semaphore slot and the upstream connection permanently. The stream is already
+    fully delivered by this point, so a finalize failure is logged but never
+    crashes the generator nor undoes the resource cleanup above.
     """
-    await finalize_gateway_request(
-        ctx,
-        logical_model=logical_model,
-        service=service,
-        rate_limit_rules=rate_limit_rules,
-        quota_reservations=quota_reservations,
-    )
-    # A stream that completed successfully but reported zero tokens almost
-    # always means SSE usage parsing failed (non-standard framing, missing
-    # usage event). That silently refunds the full quota reservation and bills
-    # nothing — a revenue/limit hole worth surfacing for ops to investigate.
-    if ctx.status == UsageStatus.success.value and ctx.total_tokens == 0:
-        _log.warning(
-            "gateway.stream.usage_unparsed",
+    # Free held resources first, independent of billing success.
+    await _aclose_response(response)
+    if rate_limit_rules:
+        await release_concurrent(member, rate_limit_rules)
+    try:
+        await finalize_gateway_request(
+            ctx,
+            logical_model=logical_model,
+            service=service,
+            rate_limit_rules=rate_limit_rules,
+            quota_reservations=quota_reservations,
+        )
+    except Exception:
+        # Bookkeeping failure after the response is already sent: log and move on.
+        _log.exception(
+            "gateway.stream.finalize_failed",
             request_id=ctx.request_id,
             user_id=ctx.user_id,
             logical_model_id=ctx.logical_model_id,
-            provider=ctx.provider,
-            upstream_model=ctx.upstream_model,
         )
-    if rate_limit_rules:
-        await release_concurrent(member, rate_limit_rules)
-    await _aclose_response(response)
+    else:
+        # A stream that completed successfully but reported zero tokens almost
+        # always means SSE usage parsing failed (non-standard framing, missing
+        # usage event). That silently refunds the full quota reservation and bills
+        # nothing — a revenue/limit hole worth surfacing for ops to investigate.
+        if ctx.status == UsageStatus.success.value and ctx.total_tokens == 0:
+            _log.warning(
+                "gateway.stream.usage_unparsed",
+                request_id=ctx.request_id,
+                user_id=ctx.user_id,
+                logical_model_id=ctx.logical_model_id,
+                provider=ctx.provider,
+                upstream_model=ctx.upstream_model,
+            )
 
 
 async def _rollback_rate_limit_reservations(
@@ -168,7 +236,10 @@ async def anthropic_messages(
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, payload.model)
 
-    estimated_tokens = estimate_request_tokens(payload.messages)
+    # Anthropic declares its output cap in `max_tokens` (default 4096).
+    estimated_tokens = estimate_request_tokens(
+        payload.messages, max_completion=payload.max_tokens
+    )
     # P2: Rate limiting (before quota reservation)
     rate_limit_rules = await _check_rate_limits(
         service=service,
@@ -181,7 +252,14 @@ async def anthropic_messages(
     )
 
     try:
-        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+        estimated_cost = compute_cost(logical_model, estimated_tokens, 0)
+        quota_result = await service.check_quota(
+            user.user_id,
+            user.department_id,
+            logical_model.id,
+            estimated_tokens=estimated_tokens,
+            estimated_cost=estimated_cost,
+        )
     except Exception:
         await _rollback_rate_limit_reservations(
             request_id=request_id,
@@ -337,7 +415,12 @@ async def gemini_generate_content(
 
     stream = request.url.path.endswith(":streamGenerateContent")
 
-    estimated_tokens = estimate_request_tokens(payload.contents)
+    # Gemini declares its output cap in generationConfig.maxOutputTokens.
+    gen_config = payload.generationConfig or {}
+    estimated_tokens = estimate_request_tokens(
+        payload.contents,
+        max_completion=coerce_max_completion(gen_config.get("maxOutputTokens")),
+    )
     # P2: Rate limiting (before quota reservation)
     rate_limit_rules = await _check_rate_limits(
         service=service,
@@ -350,7 +433,14 @@ async def gemini_generate_content(
     )
 
     try:
-        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+        estimated_cost = compute_cost(logical_model, estimated_tokens, 0)
+        quota_result = await service.check_quota(
+            user.user_id,
+            user.department_id,
+            logical_model.id,
+            estimated_tokens=estimated_tokens,
+            estimated_cost=estimated_cost,
+        )
     except Exception:
         await _rollback_rate_limit_reservations(
             request_id=request_id,
@@ -588,7 +678,12 @@ async def _execute_completion(
     request_id = _request_id(request)
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, requested_model)
-    estimated_tokens = estimate_request_tokens(messages)
+    # OpenAI chat declares its output cap in max_completion_tokens (newer) or the
+    # legacy max_tokens; prefer the former when both are present.
+    _output_cap = params.get("max_completion_tokens", params.get("max_tokens"))
+    estimated_tokens = estimate_request_tokens(
+        messages, max_completion=coerce_max_completion(_output_cap)
+    )
     requested_features = requested_features_from_params(messages=messages, params=params)
 
     # P2: Rate limiting (before quota reservation)
@@ -603,7 +698,14 @@ async def _execute_completion(
     )
 
     try:
-        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+        estimated_cost = compute_cost(logical_model, estimated_tokens, 0)
+        quota_result = await service.check_quota(
+            user.user_id,
+            user.department_id,
+            logical_model.id,
+            estimated_tokens=estimated_tokens,
+            estimated_cost=estimated_cost,
+        )
     except Exception:
         await _rollback_rate_limit_reservations(
             request_id=request_id,
@@ -829,13 +931,23 @@ async def _stream_openai(
                 ctx.record_ttft()
             bytes_yielded += len(data.encode("utf-8"))
             yield data
-        # Always emit [DONE] so OpenAI SDK clients don't hang waiting for the
-        # terminator on idle/duration timeout. Errors raise out of the loop and
-        # are signalled separately via the response status, so they skip [DONE]
-        # — but timeout breaks fall through here.
-        done = "data: [DONE]\n\n"
-        bytes_yielded += len(done.encode("utf-8"))
-        yield done
+        # On a clean end emit `data: [DONE]` so OpenAI SDK clients don't hang
+        # waiting for the terminator. On a timeout (idle/duration) emit an SSE
+        # error event INSTEAD (Oracle #11): `[DONE]` signals a successful
+        # completion, so the client would treat a truncated response as whole and
+        # silently lose data. Upstream exceptions raise out of the loop and are
+        # signalled via the response status, so they reach neither branch here.
+        if status_value == UsageStatus.timeout.value:
+            err = (
+                'data: {"error": {"message": "stream timed out", '
+                '"type": "timeout", "code": "stream_timeout"}}\n\n'
+            )
+            bytes_yielded += len(err.encode("utf-8"))
+            yield err
+        else:
+            done = "data: [DONE]\n\n"
+            bytes_yielded += len(done.encode("utf-8"))
+            yield done
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
         raise
@@ -861,15 +973,19 @@ async def _stream_openai(
         # Shielded cleanup: settle quota, refund TPM, release concurrent slot,
         # close upstream. Without the shield, a client disconnect cancels these
         # mid-flight (TPM leak, concurrent slot leak, upstream connection leak).
+        # Registered so the lifespan can drain it if the process shuts down while
+        # the cleanup is still in-flight (Oracle #7 part 2).
         await asyncio.shield(
-            _finalize_stream(
-                ctx,
-                logical_model=logical_model,
-                service=service,
-                response=response,
-                member=member,
-                rate_limit_rules=rate_limit_rules,
-                quota_reservations=quota_reservations,
+            _spawn_finalizer(
+                _finalize_stream(
+                    ctx,
+                    logical_model=logical_model,
+                    service=service,
+                    response=response,
+                    member=member,
+                    rate_limit_rules=rate_limit_rules,
+                    quota_reservations=quota_reservations,
+                )
             )
         )
 
@@ -947,6 +1063,19 @@ async def _stream_anthropic_native(
             bytes_yielded += len(raw_bytes)
             yield raw_bytes
 
+        # On timeout (idle/duration) emit an Anthropic SSE `error` event so the
+        # client sees the stream was cut short (Oracle #11). A clean end needs no
+        # terminator (Anthropic's own message_stop already arrived); upstream
+        # exceptions raise out of the loop and are signalled via response status.
+        if status_value == UsageStatus.timeout.value:
+            err = (
+                b'event: error\n'
+                b'data: {"type": "error", "error": '
+                b'{"type": "timeout_error", "message": "stream timed out"}}\n\n'
+            )
+            bytes_yielded += len(err)
+            yield err
+
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
         raise
@@ -958,16 +1087,19 @@ async def _stream_anthropic_native(
         ctx.status = status_value
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
         # Shielded cleanup: see _finalize_stream docstring for why this is
-        # mandatory for client-disconnect safety.
+        # mandatory for client-disconnect safety. Registered so the lifespan can
+        # drain it if the process shuts down mid-cleanup (Oracle #7 part 2).
         await asyncio.shield(
-            _finalize_stream(
-                ctx,
-                logical_model=logical_model,
-                service=service,
-                response=response,
-                member=member,
-                rate_limit_rules=rate_limit_rules,
-                quota_reservations=quota_reservations,
+            _spawn_finalizer(
+                _finalize_stream(
+                    ctx,
+                    logical_model=logical_model,
+                    service=service,
+                    response=response,
+                    member=member,
+                    rate_limit_rules=rate_limit_rules,
+                    quota_reservations=quota_reservations,
+                )
             )
         )
 
@@ -1044,6 +1176,17 @@ async def _stream_gemini_native(
             bytes_yielded += len(raw_bytes)
             yield raw_bytes
 
+        # On timeout (idle/duration) emit a Gemini SSE error payload so the client
+        # sees the stream was cut short (Oracle #11). A clean end needs no
+        # terminator; upstream exceptions raise out and are signalled via status.
+        if status_value == UsageStatus.timeout.value:
+            err = (
+                b'data: {"error": {"code": 504, "status": "DEADLINE_EXCEEDED", '
+                b'"message": "stream timed out"}}\n\n'
+            )
+            bytes_yielded += len(err)
+            yield err
+
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
         raise
@@ -1055,16 +1198,19 @@ async def _stream_gemini_native(
         ctx.status = status_value
         ctx.set_usage(usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"])
         # Shielded cleanup: see _finalize_stream docstring for why this is
-        # mandatory for client-disconnect safety.
+        # mandatory for client-disconnect safety. Registered so the lifespan can
+        # drain it if the process shuts down mid-cleanup (Oracle #7 part 2).
         await asyncio.shield(
-            _finalize_stream(
-                ctx,
-                logical_model=logical_model,
-                service=service,
-                response=response,
-                member=member,
-                rate_limit_rules=rate_limit_rules,
-                quota_reservations=quota_reservations,
+            _spawn_finalizer(
+                _finalize_stream(
+                    ctx,
+                    logical_model=logical_model,
+                    service=service,
+                    response=response,
+                    member=member,
+                    rate_limit_rules=rate_limit_rules,
+                    quota_reservations=quota_reservations,
+                )
             )
         )
 

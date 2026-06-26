@@ -38,12 +38,20 @@ from src.gateway.quota import QuotaCheckResult, QuotaReservation
 from src.gateway.rate_limit import (
     ESTIMATED_TOKENS_PER_REQUEST,
     check_rate_limits,
+    coerce_max_completion,
     estimate_request_tokens,
     release_concurrent,
+)
+from src.gateway.router import (
+    _STREAM_IDLE_TIMEOUT_SECONDS,
+    _STREAM_MAX_DURATION_SECONDS,
+    _finalize_stream,
+    _spawn_finalizer,
 )
 from src.gateway.router_manager import RouterManager
 from src.gateway.schemas import GatewayRequestBase
 from src.gateway.service import GatewayService
+from src.gateway.usage import compute_cost
 
 router = APIRouter(tags=["gateway"])
 
@@ -108,7 +116,14 @@ async def _embeddings_impl(
         estimated_tokens=estimated_tokens,
     )
     try:
-        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+        estimated_cost = compute_cost(logical_model, estimated_tokens, 0)
+        quota_result = await service.check_quota(
+            user.user_id,
+            user.department_id,
+            logical_model.id,
+            estimated_tokens=estimated_tokens,
+            estimated_cost=estimated_cost,
+        )
     except Exception:
         await _rollback_rate_limit_reservations(
             request_id=request_id,
@@ -228,7 +243,11 @@ async def _responses_impl(
     request_id = _request_id(request)
     rl_member = uuid4().hex
     logical_model = await service.resolve_model(user, payload.model)
-    estimated_tokens = estimate_request_tokens(payload.input)
+    # Responses API declares its output cap in max_output_tokens.
+    estimated_tokens = estimate_request_tokens(
+        payload.input,
+        max_completion=coerce_max_completion(payload.max_output_tokens),
+    )
     rate_limit_rules = await _check_rate_limits(
         service=service,
         user=user,
@@ -239,7 +258,14 @@ async def _responses_impl(
         estimated_tokens=estimated_tokens,
     )
     try:
-        quota_result = await service.check_quota(user.user_id, user.department_id, logical_model.id)
+        estimated_cost = compute_cost(logical_model, estimated_tokens, 0)
+        quota_result = await service.check_quota(
+            user.user_id,
+            user.department_id,
+            logical_model.id,
+            estimated_tokens=estimated_tokens,
+            estimated_cost=estimated_cost,
+        )
     except Exception:
         await _rollback_rate_limit_reservations(
             request_id=request_id,
@@ -389,16 +415,46 @@ async def _stream_responses(
     status_value = UsageStatus.success.value
     prompt_tokens = 0
     completion_tokens = 0
+    # Drive the iterator manually so each pull is bounded by an idle timeout and
+    # the whole stream by a max duration — parity with the chat/native providers
+    # in router.py. A bare ``async for`` (the original) had NO timeout, so a
+    # wedged upstream held the concurrent slot + TPM reservation indefinitely.
+    response_iter = response.__aiter__()
+    stream_start = monotonic()
+    bytes_yielded = 0
     try:
-        async for event in response:
+        while True:
+            if monotonic() - stream_start > _STREAM_MAX_DURATION_SECONDS:
+                status_value = UsageStatus.timeout.value
+                break
+            try:
+                async with asyncio.timeout(_STREAM_IDLE_TIMEOUT_SECONDS):
+                    event = await response_iter.__anext__()
+            except TimeoutError:
+                status_value = UsageStatus.timeout.value
+                break
+            except StopAsyncIteration:
+                break
             data = json.dumps(jsonable_encoder(_dump_model(event)), ensure_ascii=False)
-            ctx.record_ttft()
+            if bytes_yielded == 0:
+                ctx.record_ttft()
+            bytes_yielded += 1
             yield f"data: {data}\n\n"
             # Try to extract usage from final event
             usage = _extract_responses_usage(event)
             if usage["total_tokens"]:
                 prompt_tokens = usage["prompt_tokens"]
                 completion_tokens = usage["completion_tokens"]
+        # On idle/duration timeout emit an SSE error event so the client knows the
+        # response was truncated rather than silently treating a partial stream as
+        # complete (Oracle #11, mirrored from router). A clean end needs no
+        # terminator — the Responses API carries its own ``response.completed``
+        # event, unlike chat completions' ``[DONE]`` sentinel.
+        if status_value == UsageStatus.timeout.value:
+            yield (
+                'data: {"error": {"message": "stream timed out", '
+                '"type": "timeout", "code": "stream_timeout"}}\n\n'
+            )
     except asyncio.CancelledError:
         status_value = UsageStatus.error.value
         raise
@@ -409,15 +465,23 @@ async def _stream_responses(
         total_tokens = prompt_tokens + completion_tokens
         ctx.status = status_value
         ctx.set_usage(prompt_tokens, completion_tokens, total_tokens)
+        # Reuse router._finalize_stream via _spawn_finalizer: registers the
+        # cleanup in the shared in-flight set so the lifespan can drain it on
+        # shutdown (B1), and applies the load-bearing cleanup ORDER (close
+        # upstream + release concurrent slot FIRST, then the DB-touching billing
+        # settle). The old _finalize_stream_response ran finalize first and was
+        # never drainable.
         await asyncio.shield(
-            _finalize_stream_response(
-                ctx,
-                logical_model=logical_model,
-                service=service,
-                response=response,
-                member=member,
-                rate_limit_rules=rate_limit_rules,
-                quota_reservations=quota_reservations,
+            _spawn_finalizer(
+                _finalize_stream(
+                    ctx,
+                    logical_model=logical_model,
+                    service=service,
+                    response=response,
+                    member=member,
+                    rate_limit_rules=rate_limit_rules,
+                    quota_reservations=quota_reservations,
+                )
             )
         )
 
@@ -463,29 +527,12 @@ async def _rollback_rate_limit_reservations(
 
         await settle_tpm(request_id, rate_limit_rules, estimated_tokens)
     with suppress(Exception):
+        from src.gateway.rate_limit import release_rpm
+
+        await release_rpm(member, rate_limit_rules)
+    with suppress(Exception):
         await release_concurrent(member, rate_limit_rules)
 
-
-async def _finalize_stream_response(
-    ctx: GatewayRequestContext,
-    *,
-    logical_model: Any,
-    service: GatewayService,
-    response: Any,
-    member: str,
-    rate_limit_rules: list[dict[str, Any]] | None,
-    quota_reservations: list[QuotaReservation] | None,
-) -> None:
-    await finalize_gateway_request(
-        ctx,
-        logical_model=logical_model,
-        service=service,
-        rate_limit_rules=rate_limit_rules,
-        quota_reservations=quota_reservations,
-    )
-    if rate_limit_rules:
-        await release_concurrent(member, rate_limit_rules)
-    await _aclose_response(response)
 
 
 async def _check_rate_limits(
@@ -623,16 +670,6 @@ def _provider_from_metadata(litellm_meta: dict[str, Any]) -> str | None:
     if isinstance(deployment, str) and "/" in deployment:
         return deployment.split("/", 1)[0]
     return None
-
-
-async def _aclose_response(response: Any) -> None:
-    aclose = getattr(response, "aclose", None)
-    if aclose is None:
-        return
-    try:
-        await aclose()
-    except Exception:
-        return
 
 
 def _quota_headers(quota_result: QuotaCheckResult) -> dict[str, str]:

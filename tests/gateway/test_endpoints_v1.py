@@ -16,6 +16,7 @@ from src.gateway.endpoints_v1 import (
     _parse_body,
     _request_id,
     _responses_impl,
+    _rollback_rate_limit_reservations,
     _stream_responses,
     _upstream_error,
     list_models,
@@ -240,6 +241,33 @@ async def test_embeddings_rolls_back_rate_limit_when_quota_rejects() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rollback_releases_rpm_tpm_and_concurrent() -> None:
+    """Oracle #5: the v1 rollback path must release RPM too, not just TPM and
+    concurrent. A request that passed RPM but is rejected by a later gate (quota)
+    never runs, so its RPM sliding-window slot must be returned — otherwise the
+    leaked slot throttles future admitted requests. router.py already did this;
+    endpoints_v1 was missing the ``release_rpm`` step entirely."""
+    rules = [{"id": 1, "rpm_limit": 10, "tpm_limit": 1000, "max_concurrent": 2}]
+    with (
+        patch("src.gateway.rate_limit.settle_tpm", new_callable=AsyncMock) as settle,
+        patch("src.gateway.rate_limit.release_rpm", new_callable=AsyncMock) as rpm,
+        patch(
+            "src.gateway.endpoints_v1.release_concurrent", new_callable=AsyncMock
+        ) as conc,
+    ):
+        await _rollback_rate_limit_reservations(
+            request_id="req-1",
+            member="m-1",
+            rate_limit_rules=rules,
+            estimated_tokens=100,
+        )
+
+    settle.assert_awaited_once()
+    rpm.assert_awaited_once_with("m-1", rules)
+    conc.assert_awaited_once_with("m-1", rules)
+
+
+@pytest.mark.asyncio
 async def test_responses_forwards_extra_params_and_records_downgrade() -> None:
     service = AsyncMock()
     service.resolve_model.return_value = _fake_logical_model()
@@ -319,10 +347,10 @@ async def test_responses_stream_cleanup_is_shielded_and_releases_slot() -> None:
 
     with (
         patch(
-            "src.gateway.endpoints_v1.finalize_gateway_request", new_callable=AsyncMock
+            "src.gateway.router.finalize_gateway_request", new_callable=AsyncMock
         ) as finalize,
         patch(
-            "src.gateway.endpoints_v1.release_concurrent", new_callable=AsyncMock
+            "src.gateway.router.release_concurrent", new_callable=AsyncMock
         ) as release,
     ):
         async for _ in _stream_responses(

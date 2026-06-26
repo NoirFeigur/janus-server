@@ -149,6 +149,102 @@ async def test_cost_quota_soft_warning_current_in_points(
     assert result.warnings[0].limit == Decimal("5")
 
 
+async def test_token_reservation_bounds_concurrent_overshoot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oracle #2: token quota must reserve the ESTIMATED amount up front, not +1.
+
+    With a 1000-token limit and a 400-token estimate, only two requests fit
+    (400 + 400 = 800 ≤ 1000); the third (would be 1200) must be rejected at
+    pre-flight. The old +1 reservation let unbounded concurrent requests all
+    pass pre-flight and only overshoot at settle time.
+    """
+    redis = FakeRedis()
+    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
+    enforcer = QuotaEnforcer()
+    quota = _token_quota(limit="1000")
+
+    r1 = await enforcer.check_and_increment(
+        100, None, 10, [quota], estimated_tokens=400
+    )
+    r2 = await enforcer.check_and_increment(
+        100, None, 10, [quota], estimated_tokens=400
+    )
+    assert r1.passed and r2.passed
+    assert r1.reservations[0].reserved == 400
+
+    with pytest.raises(QuotaLimitExceeded):
+        await enforcer.check_and_increment(
+            100, None, 10, [quota], estimated_tokens=400
+        )
+
+
+async def test_cost_reservation_bounds_concurrent_overshoot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oracle #2: cost quota reserves the estimated cost (micro-units), not +1."""
+    redis = FakeRedis()
+    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
+    enforcer = QuotaEnforcer()
+    quota = _cost_quota(limit="10")  # 10 points = 10_000_000 micro-units
+
+    # Each request estimated at 4 points → two fit (8), third (12) rejected.
+    r1 = await enforcer.check_and_increment(
+        100, None, 10, [quota], estimated_cost=Decimal("4")
+    )
+    assert r1.passed
+    assert r1.reservations[0].reserved == 4_000_000
+    await enforcer.check_and_increment(
+        100, None, 10, [quota], estimated_cost=Decimal("4")
+    )
+
+    with pytest.raises(QuotaLimitExceeded):
+        await enforcer.check_and_increment(
+            100, None, 10, [quota], estimated_cost=Decimal("4")
+        )
+
+
+async def test_settle_reservations_balances_against_estimated_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Settle adjusts by (actual - reserved), not (actual - 1)."""
+    redis = FakeRedis()
+    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
+    enforcer = QuotaEnforcer()
+    quota = _token_quota(limit="100000")
+
+    result = await enforcer.check_and_increment(
+        100, None, 10, [quota], estimated_tokens=400
+    )
+    reserved_key = result.reservations[0].key
+    assert redis._data[reserved_key] == 400  # reserved estimate, not +1
+
+    # Actual was 250: adjustment = 250 - 400 = -150 → counter settles to 250.
+    await enforcer.settle_reservations(
+        result.reservations, actual_tokens=250, actual_cost=None
+    )
+    assert redis._data[reserved_key] == 250
+
+
+async def test_compensate_reservations_gives_back_full_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Error path: compensate returns the full reserved estimate, not just +1."""
+    redis = FakeRedis()
+    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
+    enforcer = QuotaEnforcer()
+    quota = _token_quota(limit="100000")
+
+    result = await enforcer.check_and_increment(
+        100, None, 10, [quota], estimated_tokens=400
+    )
+    reserved_key = result.reservations[0].key
+    assert redis._data[reserved_key] == 400
+
+    await enforcer.compensate_reservations(result.reservations)
+    assert redis._data[reserved_key] == 0
+
+
 async def test_period_key_daily_format() -> None:
     period_key = QuotaEnforcer._period_key(QuotaPeriod.daily.value)
 
@@ -264,3 +360,44 @@ async def test_compensate_reservations_gives_back_reservation(
     await enforcer.compensate_reservations(result.reservations)
 
     assert redis._data[reserved_key] == 0
+
+
+async def test_ttl_outlives_longest_request_near_period_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oracle #6: a reservation key TTL must outlive the longest possible
+    request, not just the time to period-end.
+
+    At 23:59:59 a daily key would otherwise get TTL ~1s. A 10-minute stream then
+    settles via INCRBY on the (now expired) key, which Redis recreates with NO
+    TTL — an immortal orphan that poisons the next period's count. The TTL must
+    therefore include a grace window covering the max stream duration + settle
+    latency so the key is still alive (with its TTL intact) when settle runs."""
+    from datetime import UTC, datetime, timedelta
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:  # type: ignore[override]
+            # Last second of a day → naive time-to-midnight is ~1s.
+            return datetime(2026, 6, 26, 23, 59, 59, tzinfo=UTC)
+
+    monkeypatch.setattr("src.gateway.quota.datetime", _FrozenDatetime)
+
+    daily_ttl = QuotaEnforcer._ttl_seconds(QuotaPeriod.daily.value)
+    monthly_ttl = QuotaEnforcer._ttl_seconds(QuotaPeriod.monthly.value)
+    assert daily_ttl is not None
+    assert monthly_ttl is not None
+    # Must cover the grace window (max stream duration + settle latency), so a
+    # long request that started just before midnight still finds its key alive.
+    from src.gateway.quota import _QUOTA_TTL_GRACE_SECONDS
+
+    assert daily_ttl >= _QUOTA_TTL_GRACE_SECONDS
+    assert monthly_ttl >= _QUOTA_TTL_GRACE_SECONDS
+    # Sanity: still bounded — period remainder (~1s) + grace, not a year.
+    assert daily_ttl <= _QUOTA_TTL_GRACE_SECONDS + 60
+    _ = timedelta  # keep import used if pruned
+
+
+async def test_ttl_total_period_has_no_expiry() -> None:
+    """The 'total' period never expires — no grace window applies."""
+    assert QuotaEnforcer._ttl_seconds(QuotaPeriod.total.value) is None

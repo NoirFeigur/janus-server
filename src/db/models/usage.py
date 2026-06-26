@@ -78,8 +78,9 @@ class UsageRecord(LogEntity):
     request_id: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
+        unique=True,
         index=True,
-        comment="贯穿网关日志/Redis 的关联 id",
+        comment="贯穿网关日志/Redis 的关联 id（唯一：记账幂等防重复扣费）",
     )
     downgraded_features: Mapped[list[Any] | None] = mapped_column(
         JSONB,

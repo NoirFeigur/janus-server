@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import cast
 
+import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import (
@@ -69,3 +70,21 @@ async def fake_redis() -> AsyncIterator[AsyncRedisDouble]:
     finally:
         redis_module._client = original
         await double.aclose()
+
+
+@pytest.fixture(autouse=True)
+def reset_gateway_process_state() -> None:
+    """Clear process-local gateway globals before every test.
+
+    The event outbox (``_outboxes``) and emergency rate-limiter window
+    (``_emergency_windows``) are module-level state that survives between tests.
+    Without a reset, a test that fills the bounded outbox to its cap leaks those
+    parked events into the next test's first ``enqueue_event`` flush (which
+    drains the outbox FIFO before the new event), inflating queue lengths. Reset
+    mirrors the no-shared-state guarantee the ``fake_redis`` fixture provides.
+    """
+    from src.gateway.events import reset_outbox
+    from src.gateway.rate_limit import reset_emergency_limiter
+
+    reset_outbox()
+    reset_emergency_limiter()

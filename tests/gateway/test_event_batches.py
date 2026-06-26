@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.db.models.gateway_observability import GatewayRequestLog
@@ -191,6 +192,65 @@ async def test_flush_usage_records_deduplicates_within_batch(
     assert count == 1
 
 
+async def test_usage_record_request_id_unique_constraint(
+    gateway_session: AsyncSession,
+) -> None:
+    """Two usage rows with the same non-null request_id must be rejected by the
+    DB unique index — the durable guard against double-billing (Oracle #1)."""
+    gateway_session.add(UsageRecord(**_usage_payload(request_id="dup-unique")))
+    await gateway_session.commit()
+
+    gateway_session.add(UsageRecord(**_usage_payload(request_id="dup-unique")))
+    with pytest.raises(IntegrityError):
+        await gateway_session.commit()
+    await gateway_session.rollback()
+
+
+async def test_usage_record_request_id_allows_multiple_nulls(
+    gateway_session: AsyncSession,
+) -> None:
+    """The unique index must still allow multiple NULL request_ids (NULLs are
+    distinct), so rows without a correlation id are never blocked."""
+    gateway_session.add(UsageRecord(**_usage_payload(request_id=None)))
+    gateway_session.add(UsageRecord(**_usage_payload(request_id=None)))
+    await gateway_session.commit()
+
+    count = await gateway_session.scalar(
+        select(func.count())
+        .select_from(UsageRecord)
+        .where(UsageRecord.request_id.is_(None))
+    )
+    assert count == 2
+
+
+async def test_flush_usage_records_idempotent_across_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis: AsyncRedisDouble,
+    gateway_session: AsyncSession,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A second worker/recovery flush of an already-written request_id must be a
+    no-op at the DB (ON CONFLICT DO NOTHING), not a duplicate insert nor a crash
+    — the cross-process race guard (Oracle #1)."""
+    _patch_unit_of_work(monkeypatch, sqlite_session_factory)
+    gateway_session.add(UsageRecord(**_usage_payload(request_id="race-req")))
+    await gateway_session.commit()
+
+    await enqueue_usage_event(_usage_payload(request_id="race-req", total_tokens=999))
+    written = await flush_usage_records({})
+
+    assert written == 0
+    assert await fake_redis.llen(USAGE_QUEUE_KEY) == 0
+    assert await fake_redis.llen(USAGE_INFLIGHT_KEY) == 0
+    rows = (
+        await gateway_session.scalars(
+            select(UsageRecord).where(UsageRecord.request_id == "race-req")
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].total_tokens == 18  # original row untouched, not overwritten
+
+
 async def test_flush_gateway_logs_acks_after_db_success(
     monkeypatch: pytest.MonkeyPatch,
     fake_redis: AsyncRedisDouble,
@@ -252,3 +312,47 @@ async def test_flush_gateway_logs_deduplicates_within_batch(
         .where(GatewayRequestLog.request_id == "same-log-batch")
     )
     assert count == 1
+
+
+async def test_gateway_request_log_request_id_unique_constraint(
+    gateway_session: AsyncSession,
+) -> None:
+    """Two log rows with the same request_id must be rejected by the DB unique
+    index — the durable guard against a duplicate flush crashing on a non-atomic
+    SELECT-then-INSERT race (Oracle #14)."""
+    gateway_session.add(GatewayRequestLog(**_log_payload(request_id="dup-log-unique")))
+    await gateway_session.commit()
+
+    gateway_session.add(GatewayRequestLog(**_log_payload(request_id="dup-log-unique")))
+    with pytest.raises(IntegrityError):
+        await gateway_session.commit()
+    await gateway_session.rollback()
+
+
+async def test_flush_gateway_logs_idempotent_across_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis: AsyncRedisDouble,
+    gateway_session: AsyncSession,
+    sqlite_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A second worker/recovery flush of an already-written request_id must be a
+    no-op at the DB (ON CONFLICT DO NOTHING), not a crash from the unique
+    constraint nor a duplicate insert — the cross-process race guard (Oracle
+    #14)."""
+    _patch_unit_of_work(monkeypatch, sqlite_session_factory)
+    gateway_session.add(GatewayRequestLog(**_log_payload(request_id="race-log")))
+    await gateway_session.commit()
+
+    await enqueue_log_event(_log_payload(request_id="race-log", tokens_in=999))
+    written = await flush_gateway_logs({})
+
+    assert written == 0
+    assert await fake_redis.llen(LOG_QUEUE_KEY) == 0
+    assert await fake_redis.llen(LOG_INFLIGHT_KEY) == 0
+    rows = (
+        await gateway_session.scalars(
+            select(GatewayRequestLog).where(GatewayRequestLog.request_id == "race-log")
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].tokens_in == 11  # original row untouched, not overwritten

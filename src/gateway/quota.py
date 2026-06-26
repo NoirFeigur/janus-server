@@ -13,25 +13,36 @@ from src.enums import QuotaMetric, QuotaPeriod, QuotaScope
 
 logger = logging.getLogger(__name__)
 
+# Grace window added to every period-end quota key TTL (Oracle #6). A reservation
+# key must outlive the LONGEST possible request: settlement runs at finalize via
+# INCRBY on the exact key reserved at check time, and INCRBY on an *expired* key
+# silently recreates it with NO TTL — an immortal orphan that poisons the next
+# period's count. Covering the max stream duration (1800s, mirrored in
+# router._STREAM_MAX_DURATION_SECONDS) plus settle/finalize latency slack keeps
+# the key alive (TTL intact, since INCRBY preserves an existing TTL) through
+# settlement, after which it expires naturally a few minutes into the new period.
+_QUOTA_TTL_GRACE_SECONDS = 1800 + 300
+
 _QUOTA_CHECK_LUA = """
 -- KEYS: quota redis keys (one per quota rule)
--- ARGV: [num_quotas, ttl1, limit1, enforce1, ttl2, limit2, enforce2, ...]
+-- ARGV: [num_quotas, ttl1, limit1, enforce1, reserve1, ttl2, limit2, enforce2, reserve2, ...]
 -- Returns: {0=pass/1=fail, failed_index (0-based, -1 if pass), current_count}
 local n = tonumber(ARGV[1])
 local incremented = {}
 for i = 1, n do
-    local base = 1 + (i-1)*3
+    local base = 1 + (i-1)*4
     local ttl = tonumber(ARGV[base+1])
     local limit = tonumber(ARGV[base+2])
     local enforce = tonumber(ARGV[base+3])
-    local count = redis.call('INCRBY', KEYS[i], 1)
-    if count == 1 and ttl > 0 then
+    local reserve = tonumber(ARGV[base+4])
+    local count = redis.call('INCRBY', KEYS[i], reserve)
+    if count == reserve and ttl > 0 then
         redis.call('EXPIRE', KEYS[i], ttl)
     end
-    table.insert(incremented, i)
+    table.insert(incremented, {i, reserve})
     if enforce == 1 and count > limit then
-        for _, idx in ipairs(incremented) do
-            redis.call('DECRBY', KEYS[idx], 1)
+        for _, pair in ipairs(incremented) do
+            redis.call('DECRBY', KEYS[pair[1]], pair[2])
         end
         return {1, i-1, count}
     end
@@ -58,6 +69,12 @@ class QuotaReservation:
     hot-reloads or period rollover between check and settle (the divergence
     window is unbounded for long streams).  Reservation and settlement always
     balance on the same counter.
+
+    ``reserved`` is the amount actually incremented at check time (in Redis
+    units: tokens/requests 1:1, cost in micro-units). Settlement adjusts by
+    ``actual - reserved`` and compensation gives back exactly ``reserved`` — so
+    a request never overshoots by more than its own estimate error, not by its
+    full real usage (Oracle #2).
     """
 
     key: str
@@ -66,6 +83,7 @@ class QuotaReservation:
     scope: str
     enforce: bool
     limit_value: Decimal
+    reserved: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,17 +108,19 @@ class QuotaLimitExceeded(RuntimeError):
 class QuotaEnforcer:
     """Redis-backed quota checking and compensation primitives.
 
-    **Quota is a SOFT upper bound — single-request overshoot is by design.**
-    Pre-flight ``check_and_increment`` only reserves ``+1`` on each counter; the
-    real token/cost amount is reconciled in ``settle_reservations`` after the
-    upstream call completes. A request that sits exactly at the limit therefore
-    still passes pre-flight and runs to completion — only the *next* request is
-    rejected once settlement has pushed the counter over. For streaming calls the
-    final token count is unknowable up front, so this is the correct trade; the
-    consequence is that ``tokens``/``cost`` ceilings can be exceeded by at most
-    one in-flight request's worth. ``settle_reservations`` logs (does not reject)
-    a post-settlement breach. Hard, no-overshoot enforcement would require a
-    blocking pre-estimate that streaming cannot provide.
+    **Quota reserves the request's ESTIMATED cost up front, then reconciles.**
+    Pre-flight ``check_and_increment`` increments each token/cost counter by the
+    request's estimate (``estimated_tokens`` / ``estimated_cost``), not a flat
+    ``+1`` — so N concurrent in-flight requests reserve N estimates, and the
+    aggregate cannot silently blow past the limit while every request sits at
+    ``+1`` (Oracle #2). ``requests`` counters still reserve ``+1`` (one request
+    is one request). After the upstream call completes, ``settle_reservations``
+    adjusts each counter by ``actual - reserved`` so the final count reflects
+    real usage; ``compensate_reservations`` gives back exactly ``reserved`` on
+    the error path. A single request can still overshoot by its own estimate
+    *error* (actual minus estimate), but never by its full real usage, and the
+    overshoot no longer scales with concurrency. ``settle_reservations`` logs
+    (does not reject) a post-settlement breach; the *next* request is rejected.
     """
 
     def __init__(self) -> None:
@@ -112,6 +132,8 @@ class QuotaEnforcer:
         department_id: int | None,
         logical_model_id: int,
         quotas: Sequence[Quota],
+        estimated_tokens: int = 0,
+        estimated_cost: Decimal | None = None,
     ) -> QuotaCheckResult:
         if not quotas:
             return QuotaCheckResult(passed=True)
@@ -125,8 +147,12 @@ class QuotaEnforcer:
             )
             for quota in quotas
         ]
+        reserves = [
+            self._reserve_for_metric(quota.metric, estimated_tokens, estimated_cost)
+            for quota in quotas
+        ]
         argv: list[str | int] = [len(quotas)]
-        for quota in quotas:
+        for quota, reserve in zip(quotas, reserves, strict=True):
             # Cost quotas use micro-units (×1_000_000) for Redis integer precision.
             limit = (
                 int(quota.limit_value * 1_000_000)
@@ -138,6 +164,7 @@ class QuotaEnforcer:
                     self._ttl_seconds(quota.period) or 0,
                     limit,
                     int(quota.enforce),
+                    reserve,
                 ]
             )
         result = await self._run_check(redis, keys, argv)
@@ -176,8 +203,9 @@ class QuotaEnforcer:
                 scope=quota.scope,
                 enforce=quota.enforce,
                 limit_value=quota.limit_value,
+                reserved=reserve,
             )
-            for key, quota in zip(keys, quotas, strict=True)
+            for key, quota, reserve in zip(keys, quotas, reserves, strict=True)
         ]
         return QuotaCheckResult(passed=True, warnings=warnings, reservations=reservations)
 
@@ -191,12 +219,14 @@ class QuotaEnforcer:
 
         Targets the resolved Redis keys captured by ``check_and_increment`` so
         reservation and settlement always balance on the same counter, even if
-        the quota config hot-reloaded or the period rolled over mid-request.
+        the quota config hot-reloaded or the period rolled over mid-request. Each
+        counter is adjusted by ``actual - reserved`` so the final count reflects
+        real usage regardless of the pre-flight estimate (Oracle #2).
         """
         redis = get_redis()
         for res in reservations:
             adjustment = self._settlement_adjustment_for_metric(
-                res.metric, actual_tokens, actual_cost
+                res.metric, res.reserved, actual_tokens, actual_cost
             )
             if adjustment == 0:
                 continue
@@ -219,23 +249,44 @@ class QuotaEnforcer:
         self,
         reservations: Sequence[QuotaReservation],
     ) -> None:
-        """Give back the +1 pre-flight reservation on the exact keys reserved."""
+        """Give back the full pre-flight reservation on the exact keys reserved."""
         redis = get_redis()
         for res in reservations:
-            await redis.decr(res.key)
+            if res.reserved:
+                await redis.incrby(res.key, -res.reserved)
+
+    @staticmethod
+    def _reserve_for_metric(
+        metric: str, estimated_tokens: int, estimated_cost: Decimal | None
+    ) -> int:
+        """Amount to reserve at check time, in Redis units (Oracle #2).
+
+        ``requests`` reserves ``+1`` (one request is one request). ``tokens``
+        reserves the token estimate; ``cost`` reserves the estimated cost in
+        micro-units. A zero/absent estimate floors at ``1`` so the counter still
+        advances and freshness/TTL logic holds.
+        """
+        if metric == QuotaMetric.requests.value:
+            return 1
+        if metric == QuotaMetric.tokens.value:
+            return max(1, estimated_tokens)
+        if metric == QuotaMetric.cost.value:
+            micro = int((estimated_cost or Decimal(0)) * 1_000_000)
+            return max(1, micro)
+        return 1
 
     @staticmethod
     def _settlement_adjustment_for_metric(
-        metric: str, actual_tokens: int, actual_cost: Decimal | None
+        metric: str, reserved: int, actual_tokens: int, actual_cost: Decimal | None
     ) -> int:
         if metric == QuotaMetric.requests.value:
             return 0
         if metric == QuotaMetric.tokens.value:
-            return actual_tokens - 1
+            return actual_tokens - reserved
         if metric == QuotaMetric.cost.value:
-            # Cost stored in micro-units (×1_000_000); reservation was 1 micro-unit.
+            # Cost stored in micro-units (×1_000_000); reservation was `reserved`.
             micro_cost = int((actual_cost or Decimal(0)) * 1_000_000)
-            return micro_cost - 1
+            return micro_cost - reserved
         return 0
 
     @staticmethod
@@ -273,20 +324,21 @@ class QuotaEnforcer:
     async def _run_check_fallback(
         self, redis: AsyncRedis, keys: Sequence[str], argv: Sequence[str | int]
     ) -> list[int]:
-        incremented: list[str] = []
+        incremented: list[tuple[str, int]] = []
         quota_count = int(argv[0])
         for index in range(quota_count):
-            base = 1 + index * 3
+            base = 1 + index * 4
             ttl = int(argv[base])
             limit = int(argv[base + 1])
             enforce = int(argv[base + 2])
-            count = int(await redis.incr(keys[index]))
-            if count == 1 and ttl > 0:
+            reserve = int(argv[base + 3])
+            count = int(await redis.incrby(keys[index], reserve))
+            if count == reserve and ttl > 0:
                 await redis.expire(keys[index], ttl)
-            incremented.append(keys[index])
+            incremented.append((keys[index], reserve))
             if enforce == 1 and count > limit:
-                for key in incremented:
-                    await redis.decr(key)
+                for key, amount in incremented:
+                    await redis.incrby(key, -amount)
                 return [1, index, count]
         return [0, -1, -1]
 
@@ -335,12 +387,12 @@ class QuotaEnforcer:
         if period == QuotaPeriod.daily.value:
             tomorrow = (now + timedelta(days=1)).date()
             end = datetime(tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=UTC)
-            return max(1, int((end - now).total_seconds()))
+            return max(1, int((end - now).total_seconds())) + _QUOTA_TTL_GRACE_SECONDS
         if period == QuotaPeriod.monthly.value:
             year = now.year + (1 if now.month == 12 else 0)
             month = 1 if now.month == 12 else now.month + 1
             end = datetime(year, month, 1, tzinfo=UTC)
-            return max(1, int((end - now).total_seconds()))
+            return max(1, int((end - now).total_seconds())) + _QUOTA_TTL_GRACE_SECONDS
         return None
 
 
