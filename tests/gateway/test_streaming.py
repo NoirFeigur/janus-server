@@ -1322,7 +1322,14 @@ async def test_responses_stream_usage_captured_when_client_disconnects_after_usa
     client that disconnects right after receiving the final usage-bearing event
     (breaking the consumer loop, which closes the generator mid-yield) still has
     its tokens recorded. Parsing after the yield would lose them and refund the
-    full reservation — a revenue/limit hole. Mirrors router._stream_openai."""
+    full reservation — a revenue/limit hole. Mirrors router._stream_openai.
+
+    Uses the REAL Responses-API streaming shape: the terminal
+    ``response.completed`` event carries usage nested at ``event.response.usage``
+    (a ``ResponseCompletedEvent`` has no top-level ``usage``), not at the top
+    level. This exercises both the parse-before-yield order and the nested-usage
+    extraction together (the bug E2E surfaced: top-level lookup returned zero on
+    every streaming call)."""
     from src.gateway.endpoints_v1 import _stream_responses
 
     captured: dict[str, int] = {}
@@ -1341,8 +1348,17 @@ async def test_responses_stream_usage_captured_when_client_disconnects_after_usa
         async def __anext__(self) -> dict[str, Any]:
             if not self._sent:
                 self._sent = True
-                return {"type": "response.completed",
-                        "usage": {"input_tokens": 11, "output_tokens": 23}}
+                # Real shape: usage nested under .response, not top-level.
+                return {
+                    "type": "response.completed",
+                    "response": {
+                        "usage": {
+                            "input_tokens": 11,
+                            "output_tokens": 23,
+                            "total_tokens": 34,
+                        }
+                    },
+                }
             import asyncio
             await asyncio.sleep(3600)  # would hang; consumer breaks before this
 
@@ -1374,3 +1390,41 @@ async def test_responses_stream_usage_captured_when_client_disconnects_after_usa
     assert captured["prompt"] == 11
     assert captured["completion"] == 23
     assert captured["total"] == 34
+
+
+def test_extract_responses_usage_reads_nested_streaming_shape() -> None:
+    """Responses-API streaming terminal events nest usage at
+    ``event.response.usage``; non-streaming responses expose it top-level. Both
+    must extract. The nested case regressed silently to zero in production (E2E),
+    refunding the full reservation on every streaming call."""
+    from types import SimpleNamespace
+
+    from src.gateway.endpoints_v1 import _extract_responses_usage
+
+    # Non-streaming: top-level usage (dict and attribute forms).
+    top_dict = {"usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}}
+    assert _extract_responses_usage(top_dict) == {
+        "prompt_tokens": 5,
+        "completion_tokens": 7,
+        "total_tokens": 12,
+    }
+
+    # Streaming: ResponseCompletedEvent — no top-level usage, nested on .response.
+    inner = SimpleNamespace(
+        usage=SimpleNamespace(input_tokens=5089, output_tokens=6, total_tokens=5095)
+    )
+    completed_event = SimpleNamespace(type="response.completed", response=inner)
+    assert not hasattr(completed_event, "usage")
+    assert _extract_responses_usage(completed_event) == {
+        "prompt_tokens": 5089,
+        "completion_tokens": 6,
+        "total_tokens": 5095,
+    }
+
+    # Nested dict form also works.
+    nested_dict = {"response": {"usage": {"input_tokens": 1, "output_tokens": 2}}}
+    assert _extract_responses_usage(nested_dict) == {
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "total_tokens": 3,
+    }

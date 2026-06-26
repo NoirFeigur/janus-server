@@ -633,6 +633,19 @@ def _extract_responses_usage(response: Any) -> dict[str, int]:
     usage = getattr(response, "usage", None)
     if usage is None and isinstance(response, dict):
         usage = response.get("usage")
+    # Streaming terminal events (`ResponseCompletedEvent`) carry no top-level
+    # `usage`; the tokens live one level down on the wrapped response object
+    # (`event.response.usage`). Non-streaming responses expose `usage` directly.
+    # Without this fallback every streaming /v1/responses call parses zero
+    # tokens and silently refunds the full reservation (revenue/limit hole).
+    if usage is None:
+        inner = getattr(response, "response", None)
+        if inner is None and isinstance(response, dict):
+            inner = response.get("response")
+        if inner is not None:
+            usage = getattr(inner, "usage", None)
+            if usage is None and isinstance(inner, dict):
+                usage = inner.get("usage")
     if usage is None:
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     prompt_tokens = _usage_value(usage, "input_tokens")
