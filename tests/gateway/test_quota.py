@@ -401,3 +401,82 @@ async def test_ttl_outlives_longest_request_near_period_end(
 async def test_ttl_total_period_has_no_expiry() -> None:
     """The 'total' period never expires — no grace window applies."""
     assert QuotaEnforcer._ttl_seconds(QuotaPeriod.total.value) is None
+
+
+# ---------------------------------------------------------------------------
+# Concurrency / double-spend / underflow invariants
+# ---------------------------------------------------------------------------
+
+
+async def test_multi_quota_later_exceed_rolls_back_earlier_increment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later quota's hard breach must roll back EVERY earlier increment in the
+    same check — no partial reservation leak (double-spend adjacent).
+
+    ``check_and_increment`` increments each quota counter in order, and if any
+    enforced counter trips its limit it DECRBYs every counter already
+    incremented in this call (quota.py fallback L339-342 / the Lua mirror). If
+    that rollback were incomplete, the first quota would keep a reservation for a
+    request that was rejected and never ran — a permanent leak that throttles the
+    subject and, on a cost/token counter, silently overcounts usage. This locks
+    the all-or-nothing reservation contract across multiple quotas.
+    """
+    redis = FakeRedis()
+    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
+    enforcer = QuotaEnforcer()
+
+    # First quota (requests) has ample headroom; second (tokens) trips at +400.
+    requests_quota = _quota(limit="100")  # requests metric, won't trip on +1
+    token_quota = _token_quota(limit="1")  # tokens metric, +400 reserve >> 1
+    requests_key = enforcer._key_for_quota(100, None, 10, requests_quota)
+    token_key = enforcer._key_for_quota(100, None, 10, token_quota)
+
+    with pytest.raises(QuotaLimitExceeded) as exc_info:
+        await enforcer.check_and_increment(
+            100, None, 10, [requests_quota, token_quota], estimated_tokens=400
+        )
+
+    # The breach is attributed to the token quota (the second rule).
+    assert exc_info.value.exceeded.quota is token_quota
+    # BOTH counters rolled back to their pre-call value — no leaked reservation.
+    assert redis._data.get(requests_key, 0) == 0
+    assert redis._data.get(token_key, 0) == 0
+
+
+async def test_concurrent_reserve_then_settle_aggregates_without_double_spend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two in-flight requests on the SAME quota counter reserve, then settle to
+    actuals — the final count equals the sum of real usage, never negative.
+
+    Both requests hit the same resolved key (same user/model/period/metric), so
+    this is the concurrent double-spend / underflow surface: each reserves its
+    estimate up front (counter holds the aggregate in-flight reservation), then
+    each settles by ``actual - reserved`` against that exact key. The end state
+    must be exactly ``actual_1 + actual_2`` (no reservation double-counted, no
+    over-refund driving the counter below zero).
+    """
+    redis = FakeRedis()
+    monkeypatch.setattr("src.gateway.quota.get_redis", lambda: redis)
+    enforcer = QuotaEnforcer()
+    quota = _token_quota(limit="100000")
+
+    # Both requests reserve 400 up front (interleaved in-flight).
+    r1 = await enforcer.check_and_increment(
+        100, None, 10, [quota], estimated_tokens=400
+    )
+    r2 = await enforcer.check_and_increment(
+        100, None, 10, [quota], estimated_tokens=400
+    )
+    key = r1.reservations[0].key
+    assert r2.reservations[0].key == key  # same counter — the contended case
+    assert redis._data[key] == 800  # aggregate reservation, both in flight
+
+    # Settle interleaved: r1 used 250, r2 used 600.
+    await enforcer.settle_reservations(r1.reservations, actual_tokens=250, actual_cost=None)
+    assert redis._data[key] >= 0  # never underflows mid-settlement
+    await enforcer.settle_reservations(r2.reservations, actual_tokens=600, actual_cost=None)
+
+    # Final counter is exactly the sum of actuals — no double-spend, no underflow.
+    assert redis._data[key] == 850
