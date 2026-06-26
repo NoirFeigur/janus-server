@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
+import litellm
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -39,6 +40,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 启动:进程级初始化结构化日志(幂等)。
     configure_logging()
     _log.info("app.startup", app=app.title)
+    # litellm 默认把 openai provider 的 anthropic_messages(/v1/messages 入口)
+    # 强制路由到 /v1/responses(Responses API),再用 chat-completion 解析器解 ——
+    # 对 OpenAI 兼容上游(deepseek/glm/qwen 等)会自噎抛 APIError。置此开关让
+    # anthropic_messages 走 /v1/chat/completions,使「Anthropic 客户端 → OpenAI
+    # 兼容上游」跨协议路径可用(对真 OpenAI 上游同样兼容,chat/completions 更通用)。
+    litellm.use_chat_completions_url_for_anthropic_messages = True
     # 生产配置 fail-fast:非 local 环境缺 JWT key / 开 debug / CORS 通配 / 未设信任代理
     # 跳数,直接拒启动(胜过到首次登录才在 500 里暴露,或带着跨域凭据窃取洞上线)。
     validate_runtime(get_settings())
