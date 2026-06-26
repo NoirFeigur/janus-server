@@ -241,6 +241,53 @@ async def test_embeddings_rolls_back_rate_limit_when_quota_rejects() -> None:
 
 
 @pytest.mark.asyncio
+async def test_embeddings_quota_exceeded_does_not_call_upstream_or_finalize() -> None:
+    """#5: a quota rejection must abort BEFORE the upstream call and BEFORE the
+    finalizer — no spurious billing.
+
+    ``check_quota`` raises ``AppError(quota_exceeded, 429)`` when the limit is
+    blown. The endpoint must propagate that 429 without ever invoking
+    ``router.aembedding`` (no upstream cost incurred) and without awaiting
+    ``finalize_gateway_request`` (no usage event enqueued for a request that
+    never ran). This locks the control-flow guarantee that a rejected request
+    leaks no billing.
+    """
+    from src.exceptions import AppError
+
+    service = AsyncMock()
+    service.resolve_model.return_value = _fake_logical_model()
+    service.get_rate_limit_rules.return_value = [{"id": 1, "tpm_limit": 1000}]
+    service.check_quota.side_effect = AppError(
+        ErrorCode.quota_exceeded, status_code=429, params={"current": "2"}
+    )
+    router = AsyncMock()
+
+    with (
+        patch("src.gateway.endpoints_v1.RouterManager.get_router", return_value=router),
+        patch("src.gateway.endpoints_v1.check_rate_limits", new_callable=AsyncMock) as rl,
+        patch("src.gateway.rate_limit.settle_tpm", new_callable=AsyncMock),
+        patch("src.gateway.endpoints_v1.release_concurrent", new_callable=AsyncMock),
+        patch(
+            "src.gateway.endpoints_v1.finalize_gateway_request", new_callable=AsyncMock
+        ) as finalize,
+        pytest.raises(AppError) as exc_info,
+    ):
+        rl.return_value = Mock(allowed=True)
+        await _embeddings_impl(
+            request=_fake_request(),
+            user=_fake_user(),
+            service=service,
+            payload=EmbeddingsRequest(model="gpt-4", input="hi"),
+        )
+
+    assert exc_info.value.status_code == 429
+    # Upstream was never hit — no cost incurred for a rejected request.
+    router.aembedding.assert_not_called()
+    # Finalizer never ran — no usage event enqueued for a request that never ran.
+    finalize.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_rollback_releases_rpm_tpm_and_concurrent() -> None:
     """Oracle #5: the v1 rollback path must release RPM too, not just TPM and
     concurrent. A request that passed RPM but is rejected by a later gate (quota)

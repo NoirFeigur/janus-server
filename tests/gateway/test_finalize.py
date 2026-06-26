@@ -372,6 +372,122 @@ async def test_finalize_settles_partial_usage_even_when_stream_errors(
 
 
 @pytest.mark.asyncio
+async def test_finalize_full_refund_on_success_with_zero_tokens(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """A SUCCESS whose usage parsed to zero tokens compensates the full
+    reservation (NOT a token-settle).
+
+    This locks the billing consequence of the streaming ``usage_unparsed`` hole
+    (router._finalize_stream L162): when SSE usage framing can't be parsed the
+    stream still reports status=success with total_tokens==0, and
+    ``should_compensate`` (finalize.py L105) gives back the full reservation —
+    the request is effectively free. The team chose log+refund deliberately;
+    this test pins that behavior so a future change can't silently flip it to a
+    partial/zero settle (which would leave the reservation leaked) without a
+    failing test.
+    """
+    reservations = [
+        QuotaReservation(
+            key="quota:u:1:10:2026-06:tokens",
+            quota_id=7,
+            metric="tokens",
+            scope="user",
+            enforce=True,
+            limit_value=Decimal("100000"),
+        )
+    ]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        logical_model_id=10,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        quota_reserved=True,
+    )
+    # Status stays the default success — this is the unparsed-usage path, NOT an error.
+    assert ctx.status == UsageStatus.success.value
+    logical_model = Mock()
+    logical_model.id = 10
+    logical_model.price_input = None
+    logical_model.price_output = None
+
+    service = AsyncMock()
+    service.quota = AsyncMock()
+    service.repo = AsyncMock()
+
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        quota_reservations=reservations,
+    )
+
+    service.quota.compensate_reservations.assert_awaited_once_with(reservations)
+    service.quota.settle_reservations.assert_not_called()
+    assert ctx.quota_settled is True
+
+
+@pytest.mark.asyncio
+async def test_finalize_is_idempotent_does_not_double_settle(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """Calling finalize twice settles quota exactly once (quota_settled guard).
+
+    The stream cleanup path and an error path could both reach the finalizer for
+    the same request. ``_settle_quota`` early-returns on ``ctx.quota_settled``
+    (finalize.py L93), so a second finalize must NOT issue a second
+    settle/compensate against Redis — otherwise the counter is adjusted twice and
+    the quota is over- or under-charged.
+    """
+    reservations = [
+        QuotaReservation(
+            key="quota:u:1:10:2026-06:tokens",
+            quota_id=7,
+            metric="tokens",
+            scope="user",
+            enforce=True,
+            limit_value=Decimal("100000"),
+        )
+    ]
+    ctx = GatewayRequestContext(
+        user_id=1,
+        logical_model_id=10,
+        prompt_tokens=30,
+        completion_tokens=45,
+        total_tokens=75,
+        quota_reserved=True,
+    )
+    logical_model = Mock()
+    logical_model.id = 10
+    logical_model.price_input = None
+    logical_model.price_output = None
+
+    service = AsyncMock()
+    service.quota = AsyncMock()
+    service.repo = AsyncMock()
+
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        quota_reservations=reservations,
+    )
+    assert ctx.quota_settled is True
+
+    # Second finalize for the same request must be a no-op for quota settlement.
+    await finalize_gateway_request(
+        ctx,
+        logical_model=logical_model,
+        service=service,
+        quota_reservations=reservations,
+    )
+
+    service.quota.settle_reservations.assert_awaited_once()
+    service.quota.compensate_reservations.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_finalize_does_not_requery_quota_without_reservations(
     fake_redis: AsyncRedisDouble,
 ) -> None:
