@@ -282,6 +282,8 @@ async def _settle_tpm(
     """
     if not rate_limit_rules:
         return
+    reserved_tokens = ctx.tpm_estimated_tokens
+    delta_tokens = 0
     try:
         from src.gateway.rate_limit import ESTIMATED_TOKENS_PER_REQUEST, settle_tpm
 
@@ -293,5 +295,21 @@ async def _settle_tpm(
             kind="tpm_settle",
             request_id=ctx.request_id,
             error=repr(exc),
-            detail={"total_tokens": ctx.total_tokens},
+            detail={
+                # Enough to replay the settlement against the same buckets:
+                # the signed delta, the reservation it was computed from, the
+                # actual usage, and the rule/subject identity to re-key Redis.
+                "delta_tokens": delta_tokens,
+                "reserved_tokens": reserved_tokens,
+                "total_tokens": ctx.total_tokens,
+                "rules": [
+                    {
+                        "id": rule.get("id"),
+                        "subject_type": rule.get("subject_type"),
+                        "subject_id": rule.get("subject_id"),
+                        "logical_model_id": rule.get("logical_model_id"),
+                    }
+                    for rule in rate_limit_rules
+                ],
+            },
         )

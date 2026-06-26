@@ -316,10 +316,11 @@ async def _responses_impl(
     if payload.stream:
         channel_id = _channel_id_from_metadata(litellm_meta)
         upstream_model = litellm_meta.get("deployment")
+        provider = _provider_from_metadata(litellm_meta)
         downgraded_features = detect_downgraded_features(
             requested_features=requested_features,
             upstream_model=upstream_model,
-            provider=_provider_from_metadata(litellm_meta),
+            provider=provider,
         )
         return StreamingResponse(
             _stream_responses(
@@ -332,6 +333,7 @@ async def _responses_impl(
                 member=rl_member,
                 channel_id=channel_id,
                 upstream_model=upstream_model,
+                provider=provider,
                 downgraded_features=downgraded_features,
                 estimated_tokens=estimated_tokens,
                 rate_limit_rules=rate_limit_rules,
@@ -346,10 +348,11 @@ async def _responses_impl(
 
     usage = _extract_responses_usage(response)
     upstream_model = litellm_meta.get("deployment") or _response_model(response)
+    provider = _provider_from_metadata(litellm_meta)
     downgraded_features = detect_downgraded_features(
         requested_features=requested_features,
         upstream_model=upstream_model,
-        provider=_provider_from_metadata(litellm_meta),
+        provider=provider,
     )
     ctx = _base_context(
         request_id=request_id,
@@ -359,6 +362,7 @@ async def _responses_impl(
         stream=False,
         channel_id=_channel_id_from_metadata(litellm_meta),
         upstream_model=upstream_model,
+        provider=provider,
         downgraded_features=downgraded_features,
         estimated_tokens=estimated_tokens,
     )
@@ -393,6 +397,7 @@ async def _stream_responses(
     member: str,
     channel_id: int | None,
     upstream_model: str | None,
+    provider: str | None = None,
     downgraded_features: list[str] | None = None,
     estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
     rate_limit_rules: list[dict[str, Any]] | None = None,
@@ -409,6 +414,7 @@ async def _stream_responses(
         stream=True,
         channel_id=channel_id,
         upstream_model=upstream_model,
+        provider=provider,
         downgraded_features=downgraded_features,
         estimated_tokens=estimated_tokens,
     )
@@ -436,15 +442,19 @@ async def _stream_responses(
             except StopAsyncIteration:
                 break
             data = json.dumps(jsonable_encoder(_dump_model(event)), ensure_ascii=False)
-            if bytes_yielded == 0:
-                ctx.record_ttft()
-            bytes_yielded += 1
-            yield f"data: {data}\n\n"
-            # Try to extract usage from final event
+            # Parse usage BEFORE yielding: if the client disconnects right after
+            # receiving a usage-bearing event, the generator is cancelled at the
+            # `yield` and never resumes — extracting after the yield would lose
+            # the tokens and refund the full reservation (over-refund / revenue
+            # hole). Mirror router._stream_openai's safe order.
             usage = _extract_responses_usage(event)
             if usage["total_tokens"]:
                 prompt_tokens = usage["prompt_tokens"]
                 completion_tokens = usage["completion_tokens"]
+            if bytes_yielded == 0:
+                ctx.record_ttft()
+            bytes_yielded += 1
+            yield f"data: {data}\n\n"
         # On idle/duration timeout emit an SSE error event so the client knows the
         # response was truncated rather than silently treating a partial stream as
         # complete (Oracle #11, mirrored from router). A clean end needs no
@@ -583,6 +593,7 @@ def _base_context(
     stream: bool,
     channel_id: int | None = None,
     upstream_model: str | None = None,
+    provider: str | None = None,
     downgraded_features: list[str] | None = None,
     estimated_tokens: int = ESTIMATED_TOKENS_PER_REQUEST,
 ) -> GatewayRequestContext:
@@ -596,6 +607,7 @@ def _base_context(
         logical_model_name=logical_model.name,
         channel_id=channel_id,
         upstream_model=upstream_model,
+        provider=provider,
         downgraded_features=downgraded_features,
         started_at=started_at,
         stream=stream,

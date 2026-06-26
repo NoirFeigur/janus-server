@@ -464,6 +464,19 @@ def test_estimate_tokens_negative_max_completion_ignored() -> None:
     assert estimate_request_tokens(messages, max_completion=-5) == 2000
 
 
+def test_estimate_tokens_clamps_oversized_max_completion() -> None:
+    """The output cap is clamped at the convergence point itself, so a path that
+    passes a raw max_tokens WITHOUT going through coerce_max_completion (the
+    Anthropic native /v1/messages route does exactly this) cannot reserve an
+    unbounded slice of the shared quota/TPM counters. Regression for the Oracle
+    follow-up: router.anthropic_messages feeds payload.max_tokens directly."""
+    messages = [{"role": "user", "content": "x" * 8000}]  # 2000 prompt estimate
+    assert (
+        estimate_request_tokens(messages, max_completion=10_000_000_000)
+        == 2000 + _MAX_COMPLETION_CEILING
+    )
+
+
 # ---------------------------------------------------------------------------
 # B4: coerce_max_completion clamps the client-declared output cap. A raw JSON int
 # has no width limit, so an unbounded max_tokens would reserve an arbitrarily
@@ -512,6 +525,41 @@ async def test_settle_tpm_propagates_redis_error(fake_redis: AsyncRedisDouble) -
     fake_redis.eval = _boom  # type: ignore[method-assign]
     with pytest.raises(RedisError):
         await settle_tpm("req-1", [rule], delta_tokens=50)
+
+
+@pytest.mark.asyncio
+async def test_rollback_settle_tpm_failure_does_not_flip_deny_to_admit(
+    fake_redis: AsyncRedisDouble,
+) -> None:
+    """B3 follow-up regression: surfacing RedisError from ``settle_tpm`` must NOT
+    leak into ``check_rate_limits``'s admission rollback.
+
+    A request that passes TPM but is denied by the concurrent gate runs
+    ``_rollback`` (which refunds the TPM reservation via ``settle_tpm``). If a
+    Redis blip there raised, it would unwind into the enclosing
+    ``except RedisError`` and emergency-ADMIT the request — a rate-limit BYPASS
+    exactly under concurrency pressure. The rollback must stay best-effort and
+    still return the original ``concurrent_exceeded`` deny."""
+    from unittest.mock import patch
+
+    # Both TPM and concurrent gates apply; max_concurrent=1 so the 2nd stream is
+    # denied AFTER it has already reserved TPM, forcing the TPM-refund rollback.
+    rule = _make_rule(tpm_limit=1000, max_concurrent=1)
+    await check_rate_limits(
+        request_id="req-1", member="m-1", rules=[rule], is_stream=True
+    )
+
+    async def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RedisError("redis blip during rollback")
+
+    with patch("src.gateway.rate_limit.settle_tpm", side_effect=_boom):
+        result = await check_rate_limits(
+            request_id="req-2", member="m-2", rules=[rule], is_stream=True
+        )
+
+    # The deny stands; the request is NOT emergency-admitted.
+    assert result.allowed is False
+    assert result.denied_reason == "concurrent_exceeded"
 
 
 # ---------------------------------------------------------------------------

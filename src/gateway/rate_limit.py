@@ -153,8 +153,12 @@ def estimate_request_tokens(messages: object, max_completion: int = 0) -> int:
     inputs we cannot inspect, and is capped at :data:`_MAX_UPFRONT_ESTIMATE` so a
     malicious payload cannot starve the bucket. ``max_completion`` is the
     client-declared output ceiling (already self-limited by the caller's own
-    token budget) and is added on top of the capped prompt estimate; a
-    non-positive value contributes nothing.
+    token budget) and is added on top of the capped prompt estimate; it is
+    floored at 0 and clamped to :data:`_MAX_COMPLETION_CEILING` HERE — this is
+    the single convergence point every endpoint funnels through, so the clamp
+    closes the unbounded-reservation vector even on paths that pass a raw
+    ``max_tokens`` without going through :func:`coerce_max_completion` (e.g. the
+    Anthropic native ``/v1/messages`` route).
 
     Accepts the several input shapes the gateway endpoints carry:
 
@@ -170,7 +174,7 @@ def estimate_request_tokens(messages: object, max_completion: int = 0) -> int:
             ESTIMATED_TOKENS_PER_REQUEST, total_chars // _CHARS_PER_TOKEN
         )
         prompt_estimate = min(prompt_estimate, _MAX_UPFRONT_ESTIMATE)
-    return prompt_estimate + max(0, max_completion)
+    return prompt_estimate + _clamp_completion(max_completion)
 
 
 def coerce_max_completion(value: object) -> int:
@@ -437,10 +441,19 @@ async def check_rate_limits(
         # entry, TPM reservation and concurrent slot must ALL be returned.
         # Omitting RPM (the original bug) leaked the sliding-window slot: a
         # never-admitted request kept throttling the subject for a full minute.
+        #
+        # This rollback is best-effort: a Redis failure mid-rollback must NOT
+        # escape, or it would unwind into the enclosing ``except RedisError`` and
+        # flip a deny (rpm/tpm/concurrent exceeded) into an emergency-admit —
+        # i.e. a rate-limit BYPASS exactly under load. ``release_rpm`` /
+        # ``release_concurrent`` already suppress internally; ``settle_tpm`` no
+        # longer does (it must surface to the billing DLQ on the finalize path),
+        # so it is suppressed HERE, on this admission-control rollback path only.
         if rpm_acquired:
             await release_rpm(member, rpm_acquired)
         if tpm_acquired:
-            await settle_tpm(request_id, tpm_acquired, estimated_tokens)
+            with suppress(RedisError):
+                await settle_tpm(request_id, tpm_acquired, estimated_tokens)
         if concurrent_acquired:
             await release_concurrent(member, rules)
 

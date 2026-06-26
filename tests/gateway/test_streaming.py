@@ -1314,3 +1314,63 @@ async def test_responses_stream_finalizer_drainable_and_closes_before_settle() -
     # Held resources freed before the billing settle.
     assert calls.index("aclose") < calls.index("finalize")
     rel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_usage_captured_when_client_disconnects_after_usage_event() -> None:
+    """B2 follow-up regression: usage is parsed BEFORE the event is yielded, so a
+    client that disconnects right after receiving the final usage-bearing event
+    (breaking the consumer loop, which closes the generator mid-yield) still has
+    its tokens recorded. Parsing after the yield would lose them and refund the
+    full reservation — a revenue/limit hole. Mirrors router._stream_openai."""
+    from src.gateway.endpoints_v1 import _stream_responses
+
+    captured: dict[str, int] = {}
+
+    async def _capture_finalize(ctx: Any, **_k: Any) -> None:
+        captured["prompt"] = ctx.prompt_tokens
+        captured["completion"] = ctx.completion_tokens
+        captured["total"] = ctx.total_tokens
+
+    class _UsageThenHang:
+        _sent = False
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            if not self._sent:
+                self._sent = True
+                return {"type": "response.completed",
+                        "usage": {"input_tokens": 11, "output_tokens": 23}}
+            import asyncio
+            await asyncio.sleep(3600)  # would hang; consumer breaks before this
+
+        async def aclose(self) -> None:
+            return
+
+    with (
+        patch("src.gateway.router.finalize_gateway_request", side_effect=_capture_finalize),
+        patch("src.gateway.router.release_concurrent", new_callable=AsyncMock),
+    ):
+        gen = _stream_responses(
+            response=_UsageThenHang(),
+            user=FakeUser(),
+            logical_model=FakeLogicalModel(),
+            service=AsyncMock(),
+            started_at=0.0,
+            request_id="req-b2-disconnect",
+            member="member-b2-disconnect",
+            channel_id=1,
+            upstream_model="gpt-4o",
+        )
+        # Consume exactly the first (usage-bearing) chunk, then simulate a client
+        # disconnect by closing the generator — its `finally` runs finalize.
+        async for _chunk in gen:
+            break
+        await gen.aclose()
+
+    # Usage was captured pre-yield, despite the disconnect right after it.
+    assert captured["prompt"] == 11
+    assert captured["completion"] == 23
+    assert captured["total"] == 34
