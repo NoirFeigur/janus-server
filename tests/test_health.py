@@ -109,6 +109,45 @@ async def test_lifespan_startup_and_shutdown_run() -> None:
     # Exiting the context ran the shutdown branch (await close_redis()).
 
 
+async def test_lifespan_enables_chat_completions_for_anthropic_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: lifespan must flip litellm to route anthropic_messages
+    through /v1/chat/completions instead of /v1/responses.
+
+    Without this flag, litellm force-routes the ``openai`` provider's
+    anthropic_messages (the /v1/messages client entry) to the Responses API and
+    then parses the reply with the chat-completion parser, choking on every
+    OpenAI-compatible upstream (deepseek/glm/qwen/...) -> 502 upstream.error.
+    We assert lifespan sets the flag regardless of its prior value (start from
+    False to prove lifespan, not a stale global, is what turns it on).
+
+    The heavy startup steps (worker-id lease, RouterManager) are stubbed: they
+    do real Redis/DB I/O and bind global async primitives to the test loop,
+    which is orthogonal to the flag this test guards. The flag is set early in
+    lifespan (before those steps), so stubbing them keeps the test focused and
+    loop-independent."""
+    import litellm
+
+    async def _no_worker_id() -> None:
+        return None
+
+    async def _noop_startup(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        litellm, "use_chat_completions_url_for_anthropic_messages", False
+    )
+    monkeypatch.setattr(main_module, "acquire_worker_id", _no_worker_id)
+    monkeypatch.setattr(main_module.RouterManager, "startup", _noop_startup)
+    monkeypatch.setattr(main_module.RouterManager, "shutdown", _noop_startup)
+
+    test_app = create_app()
+    async with lifespan(test_app):
+        assert litellm.use_chat_completions_url_for_anthropic_messages is True
+
+
+
 async def test_readiness_success_path_direct(monkeypatch: pytest.MonkeyPatch) -> None:
     """Drive the readiness handler directly (not via ASGITransport) so the C
     tracer stays armed and the ``SELECT 1`` execution line is covered."""

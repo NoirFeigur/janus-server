@@ -1428,3 +1428,26 @@ def test_extract_responses_usage_reads_nested_streaming_shape() -> None:
         "completion_tokens": 2,
         "total_tokens": 3,
     }
+
+
+def test_anthropic_streaming_import_chain_resolves() -> None:
+    """Regression: litellm's anthropic_messages streaming iterator transitively
+    imports ``litellm.proxy.*`` (pass_through_endpoints.streaming_handler ->
+    common_request_processing), which hard-depends on ``orjson`` + ``backoff``.
+
+    We use litellm as a library (no Proxy), so those proxy-extra deps were not
+    installed -> every native Anthropic stream (/v1/messages + stream=True)
+    raised ModuleNotFoundError the moment the iterator started, surfacing as a
+    502. They are now pinned in pyproject. Importing the exact failing module
+    chain must resolve cleanly (this is what the gateway hits at runtime)."""
+    import importlib
+
+    # The two transitive deps that were missing.
+    importlib.import_module("orjson")
+    importlib.import_module("backoff")
+    # The litellm module whose import chain pulled them in (the runtime path
+    # for native Anthropic streaming).
+    importlib.import_module(
+        "litellm.proxy.pass_through_endpoints.streaming_handler"
+    )
+
