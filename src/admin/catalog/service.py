@@ -25,7 +25,7 @@ from src.admin.catalog.schemas import (
     UpstreamChannelCreate,
     UpstreamChannelUpdate,
 )
-from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.auth.service import AuthenticatedUser, AuthService
 from src.config import get_settings
 from src.core.channel_crypto import encrypt_channel_key, key_hint
 from src.core.pagination import PageResult, page_result
@@ -84,24 +84,17 @@ DEPLOYMENT_SORT_COLUMNS = {
 class CatalogService:
     """目录服务：上游渠道 / 号池 key / 逻辑模型 / 部署的 CRUD。
 
-    访问模型（有意的读写不对称，非缺陷）：
+    访问模型：
 
     - **catalog 是平台基础设施，不是 user-owned 数据**。channel/key/model/
       deployment 是全公司共享的上游厂商连接与逻辑模型定义，与 usage / credential
       等带强制 ``user_id`` 的用户数据表性质不同。``created_by`` / ``create_dept``
-      仅为 ``BaseEntity`` 继承来的审计列，不构成 catalog 的数据权限边界。
-    - **读取（list/get）按权限门控，不做 data-scope 过滤**：端点要求
-      ``ai:catalog:list`` / ``ai:catalog:query``，持有者即平台管理员，需要看到
-      全部渠道才能配置部署（restricted-scope admin 配 deployment 时必须能引用
-      他人创建的 channel）。secret 在 ``ChannelKeyRead`` 已脱敏（仅暴露
-      ``key_hint``），读取无敏感泄露面。
-    - **写入（create/update/delete）才施加 scope**：create 要求 unrestricted
-      scope；update/delete 要求 catalog wildcard + (unrestricted 或本人创建)。
-      因 restricted-scope admin 无法 create，正常不会 own 任何 catalog 记录，
-      ownership 分支仅覆盖「创建后被降权」的边缘场景。
-
-    若未来 catalog 需按部门隔离（如多租户上游隔离），应在 list/get 接入
-    ``DataScopeFilter`` 并同步调整部署配置流程，避免破坏跨部门引用。
+      仅为 ``BaseEntity`` 继承来的审计列，不构成 catalog 的访问边界。
+    - **读取（list/get）按权限门控**：端点要求 ``ai:catalog:list`` /
+      ``ai:catalog:query``，持有者即平台管理员，可看到全部渠道以配置部署。secret
+      在 ``ChannelKeyRead`` 已脱敏（仅暴露 ``key_hint``），读取无敏感泄露面。
+    - **写入（create/update/delete）要求 catalog wildcard**（``ai:catalog:*``
+      或超级管理员）。
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -111,9 +104,6 @@ class CatalogService:
         self.models = LogicalModelRepository(session)
         self.deployments = ModelDeploymentRepository(session)
         self.auth = AuthService(session)
-
-    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
-        return await self.auth.resolve_data_scope(actor)
 
     async def _require_channel(self, channel_id: int) -> UpstreamChannel:
         channel = await self.channels.get(channel_id)
@@ -183,23 +173,6 @@ class CatalogService:
         if not (actor.is_superuser or actor.has_permission("ai:catalog:*")):
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
-    async def _check_catalog_write_access(
-        self,
-        actor: AuthenticatedUser,
-        resource: ChannelKey | UpstreamChannel | LogicalModel | ModelDeployment,
-    ) -> None:
-        self._require_catalog_wildcard(actor)
-        scope = await self._scope(actor)
-        if scope.unrestricted or resource.created_by == actor.user_id:
-            return
-        raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-
-    async def _require_catalog_create_access(self, actor: AuthenticatedUser) -> None:
-        self._require_catalog_wildcard(actor)
-        scope = await self._scope(actor)
-        if not scope.unrestricted:
-            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-
     def _validate_api_base(self, api_base: str | None) -> None:
         if api_base is None:
             return
@@ -236,7 +209,7 @@ class CatalogService:
     async def create_channel(
         self, payload: UpstreamChannelCreate, *, actor: AuthenticatedUser
     ) -> UpstreamChannel:
-        await self._require_catalog_create_access(actor)
+        self._require_catalog_wildcard(actor)
         self._validate_api_base(payload.api_base)
         await self._ensure_channel_name_unique(payload.name)
         channel = UpstreamChannel(
@@ -264,7 +237,7 @@ class CatalogService:
         actor: AuthenticatedUser,
     ) -> UpstreamChannel:
         channel = await self._require_channel(channel_id)
-        await self._check_catalog_write_access(actor, channel)
+        self._require_catalog_wildcard(actor)
         values = payload.model_dump(exclude_unset=True)
         if "api_base" in values:
             self._validate_api_base(values["api_base"])
@@ -282,7 +255,7 @@ class CatalogService:
         self, channel_id: int, *, actor: AuthenticatedUser
     ) -> None:
         channel = await self._require_channel(channel_id)
-        await self._check_catalog_write_access(actor, channel)
+        self._require_catalog_wildcard(actor)
         if await self.channels.count_active_deployments(channel_id) > 0:
             raise AppError(ErrorCode.request_conflict, status.HTTP_409_CONFLICT)
 
@@ -320,8 +293,7 @@ class CatalogService:
         self, payload: ChannelKeyCreate, *, actor: AuthenticatedUser
     ) -> ChannelKey:
         self._require_catalog_wildcard(actor)
-        channel = await self._require_channel(payload.channel_id)
-        await self._check_catalog_write_access(actor, channel)
+        await self._require_channel(payload.channel_id)
         key = ChannelKey(
             channel_id=payload.channel_id,
             alias=payload.alias,
@@ -346,12 +318,11 @@ class CatalogService:
         self, key_id: int, payload: ChannelKeyUpdate, *, actor: AuthenticatedUser
     ) -> ChannelKey:
         key = await self._require_key(key_id)
-        await self._check_catalog_write_access(actor, key)
+        self._require_catalog_wildcard(actor)
         values = payload.model_dump(exclude_unset=True)
         channel_id = values.get("channel_id")
         if channel_id is not None:
-            channel = await self._require_channel(channel_id)
-            await self._check_catalog_write_access(actor, channel)
+            await self._require_channel(channel_id)
         values["updated_by"] = actor.user_id
         await self.keys.update(key, **values)
         await self.session.refresh(key)
@@ -361,7 +332,7 @@ class CatalogService:
 
     async def delete_key(self, key_id: int, *, actor: AuthenticatedUser) -> None:
         key = await self._require_key(key_id)
-        await self._check_catalog_write_access(actor, key)
+        self._require_catalog_wildcard(actor)
         key.updated_by = actor.user_id
         await self.keys.soft_delete(key)
         add_after_commit_hook(self.session, _publish_router_invalidation)
@@ -372,7 +343,7 @@ class CatalogService:
     ) -> ChannelKey:
         """Replace the encrypted upstream key material for a channel key."""
         key = await self._require_key(key_id)
-        await self._check_catalog_write_access(actor, key)
+        self._require_catalog_wildcard(actor)
         key.api_key_encrypted = encrypt_channel_key(new_api_key)
         key.key_hint = key_hint(new_api_key)
         key.updated_by = actor.user_id
@@ -403,7 +374,7 @@ class CatalogService:
     async def create_model(
         self, payload: LogicalModelCreate, *, actor: AuthenticatedUser
     ) -> LogicalModel:
-        await self._require_catalog_create_access(actor)
+        self._require_catalog_wildcard(actor)
         await self._ensure_model_name_unique(payload.name)
         model = LogicalModel(
             name=payload.name,
@@ -432,7 +403,7 @@ class CatalogService:
         actor: AuthenticatedUser,
     ) -> LogicalModel:
         model = await self._require_model(model_id)
-        await self._check_catalog_write_access(actor, model)
+        self._require_catalog_wildcard(actor)
         values = payload.model_dump(exclude_unset=True)
         name = values.get("name")
         if name is not None:
@@ -446,7 +417,7 @@ class CatalogService:
 
     async def delete_model(self, model_id: int, *, actor: AuthenticatedUser) -> None:
         model = await self._require_model(model_id)
-        await self._check_catalog_write_access(actor, model)
+        self._require_catalog_wildcard(actor)
         if await self.models.count_active_deployments(model_id) > 0:
             raise AppError(ErrorCode.request_conflict, status.HTTP_409_CONFLICT)
 
@@ -485,7 +456,7 @@ class CatalogService:
     async def create_deployment(
         self, payload: ModelDeploymentCreate, *, actor: AuthenticatedUser
     ) -> ModelDeployment:
-        await self._require_catalog_create_access(actor)
+        self._require_catalog_wildcard(actor)
         await self._require_active_model(payload.logical_model_id)
         await self._require_active_channel(payload.channel_id)
         await self._ensure_deployment_unique(
@@ -517,7 +488,7 @@ class CatalogService:
         actor: AuthenticatedUser,
     ) -> ModelDeployment:
         deployment = await self._require_deployment(deployment_id)
-        await self._check_catalog_write_access(actor, deployment)
+        self._require_catalog_wildcard(actor)
         values = payload.model_dump(exclude_unset=True)
         logical_model_id = values.get("logical_model_id", deployment.logical_model_id)
         channel_id = values.get("channel_id", deployment.channel_id)
@@ -542,7 +513,7 @@ class CatalogService:
         self, deployment_id: int, *, actor: AuthenticatedUser
     ) -> None:
         deployment = await self._require_deployment(deployment_id)
-        await self._check_catalog_write_access(actor, deployment)
+        self._require_catalog_wildcard(actor)
         deployment.updated_by = actor.user_id
         await self.deployments.soft_delete(deployment)
         add_after_commit_hook(self.session, _publish_router_invalidation)

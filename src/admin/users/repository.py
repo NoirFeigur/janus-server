@@ -1,16 +1,7 @@
 """Admin user data access (repository layer).
 
 Base CRUD on ``User`` plus role-link management (``UserRole``) and the
-data-scope-aware listing the admin user surface requires. The data-scope filter
-is the only place the resolved scope touches SQL: a row is visible when
-unrestricted, OR its department is in the allowed set, OR (include_self) it is
-the actor's own record.
-
-The resolved scope is consumed via the :class:`~src.db.scope.DataScope`
-structural Protocol, not the concrete ``auth.service.DataScopeFilter`` — a
-repository is a ``db``-layer citizen and must not import upward from ``auth``.
-``DataScopeFilter`` satisfies the Protocol structurally, so callers pass it
-unchanged.
+keyword-filtered listing the admin user surface requires.
 """
 
 from __future__ import annotations
@@ -23,7 +14,6 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from src.db.models.identity import User, UserRole
 from src.db.repository import BaseRepository
-from src.db.scope import DataScope
 
 
 class UserRepository(BaseRepository[User]):
@@ -52,37 +42,16 @@ class UserRepository(BaseRepository[User]):
         user: User | None = await self.session.scalar(stmt)
         return user
 
-    def _scope_predicate(
-        self, scope: DataScope, *, actor_id: int
-    ) -> ColumnElement[bool] | None:
-        """Build the WHERE predicate for a data scope (None = no restriction)."""
-        if scope.unrestricted:
-            return None
-        clauses: list[ColumnElement[bool]] = []
-        if scope.department_ids:
-            clauses.append(User.department_id.in_(scope.department_ids))
-        if scope.include_self:
-            clauses.append(User.id == actor_id)
-        if not clauses:
-            # Restricted scope with no allowed depts and no self → match nothing.
-            return User.id == -1
-        return or_(*clauses)
-
-    async def list_in_scope(
+    async def list_users(
         self,
-        scope: DataScope,
         *,
-        actor_id: int,
         keyword: str | None = None,
         sort: tuple[InstrumentedAttribute[object], bool] | None = None,
         limit: int | None = None,
         offset: int | None = None,
     ) -> Sequence[User]:
-        """List non-deleted users visible under the data scope."""
+        """List non-deleted users (keyword-filtered, sorted, paginated)."""
         stmt = select(User).where(User.is_deleted.is_(False))
-        predicate = self._scope_predicate(scope, actor_id=actor_id)
-        if predicate is not None:
-            stmt = stmt.where(predicate)
         keyword_predicate = self._keyword_predicate(keyword)
         if keyword_predicate is not None:
             stmt = stmt.where(keyword_predicate)
@@ -98,54 +67,24 @@ class UserRepository(BaseRepository[User]):
         result = await self.session.scalars(stmt)
         return result.all()
 
-    async def count_in_scope(
+    async def count_users(
         self,
-        scope: DataScope,
         *,
-        actor_id: int,
         keyword: str | None = None,
     ) -> int:
-        """Count non-deleted users visible under the data scope."""
+        """Count non-deleted users (keyword-filtered)."""
         stmt = select(func.count()).select_from(User).where(User.is_deleted.is_(False))
-        predicate = self._scope_predicate(scope, actor_id=actor_id)
-        if predicate is not None:
-            stmt = stmt.where(predicate)
         keyword_predicate = self._keyword_predicate(keyword)
         if keyword_predicate is not None:
             stmt = stmt.where(keyword_predicate)
         total = await self.session.scalar(stmt)
         return int(total or 0)
 
-    def is_visible(
-        self, user: User, scope: DataScope, *, actor_id: int
-    ) -> bool:
-        """In-Python scope check for a single row (mutation guard)."""
-        if scope.unrestricted:
-            return True
-        if user.department_id is not None and user.department_id in scope.department_ids:
-            return True
-        return bool(scope.include_self and user.id == actor_id)
-
     async def list_role_ids(self, user_id: int) -> list[int]:
         """Role ids currently assigned to the user."""
         stmt = select(UserRole.role_id).where(UserRole.user_id == user_id)
         result = await self.session.scalars(stmt)
         return list(result.all())
-
-    async def department_ids_for_users(
-        self, user_ids: Sequence[int]
-    ) -> dict[int, int | None]:
-        """Map ``user_id -> department_id`` for many users in one query.
-
-        Used by the batch-dominance pre-filter to resolve each target's relative
-        role scope against its OWN department (not the actor's). Absent ids are
-        defaulted by the caller's ``.get``.
-        """
-        if not user_ids:
-            return {}
-        stmt = select(User.id, User.department_id).where(User.id.in_(user_ids))
-        result = await self.session.execute(stmt)
-        return {user_id: department_id for user_id, department_id in result.all()}
 
     async def list_role_ids_for_users(
         self, user_ids: Sequence[int]

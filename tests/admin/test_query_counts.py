@@ -32,7 +32,6 @@ from src.db.models.identity import (
     Department,
     Menu,
     Role,
-    RoleDept,
     RoleMenu,
     User,
     UserRole,
@@ -42,7 +41,7 @@ pytestmark = pytest.mark.asyncio
 
 _TABLES = [
     Base.metadata.tables[m.__tablename__]
-    for m in (User, Department, Role, Menu, UserRole, RoleMenu, RoleDept, ApiKey)
+    for m in (User, Department, Role, Menu, UserRole, RoleMenu, ApiKey)
 ]
 
 
@@ -91,7 +90,7 @@ async def _seed_users_with_roles(
     """
     for i in range(start, start + count):
         user = User(username=f"u{i}", employee_no=f"E-{i}", status="active")
-        role = Role(name=f"r{i}", code=f"r{i}", data_scope="all", status="active")
+        role = Role(name=f"r{i}", code=f"r{i}", status="active")
         session.add_all([user, role])
         await session.flush()
         session.add(UserRole(user_id=user.id, role_id=role.id))
@@ -101,17 +100,16 @@ async def _seed_users_with_roles(
 async def _seed_roles_with_grants(
     session: AsyncSession, count: int, *, start: int = 0
 ) -> None:
-    """Seed ``count`` custom-scope roles, each with a menu + dept grant.
+    """Seed ``count`` roles, each with a menu grant.
 
     ``start`` offsets the unique keys so successive batches don't collide.
     """
     for i in range(start, start + count):
-        role = Role(name=f"r{i}", code=f"r{i}", data_scope="custom", status="active")
+        role = Role(name=f"r{i}", code=f"r{i}", status="active")
         menu = Menu(name=f"m{i}", menu_type="button", perms=f"p:{i}", status="active")
         session.add_all([role, menu])
         await session.flush()
         session.add(RoleMenu(role_id=role.id, menu_id=menu.id))
-        session.add(RoleDept(role_id=role.id, dept_id=1000 + i))
     await session.flush()
 
 
@@ -120,7 +118,7 @@ def _superuser() -> AuthenticatedUser:
         user_id=999,
         username="root",
         department_id=None,
-        permissions=frozenset({"*:*:*"}),  # unrestricted scope, no scope queries
+        permissions=frozenset({"*:*:*"}),
         role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
     )
 
@@ -158,7 +156,7 @@ async def test_list_roles_query_count_is_constant(
     db_session: AsyncSession, sqlite_engine: AsyncEngine
 ) -> None:
     """list_roles must issue the same number of SELECTs for 2 roles as for 5
-    (menu + dept ids each fetched in one bulk query, not two-per-role)."""
+    (menu ids fetched in one bulk query, not one-per-role)."""
     service = RoleService(db_session)
     actor = _superuser()
 
@@ -174,11 +172,10 @@ async def test_list_roles_query_count_is_constant(
 
     assert small[0] == large[0], (
         f"list_roles query count scaled with rows: {small[0]} (2 roles) "
-        f"vs {large[0]} (5 roles) — 1+2R regression"
+        f"vs {large[0]} (5 roles) — 1+R regression"
     )
 
-    # Each role still carries its menu + dept ids (correctness preserved).
+    # Each role still carries its menu ids (correctness preserved).
     assert all(
-        len(menu_ids) == 1 and len(dept_ids) == 1
-        for _role, menu_ids, dept_ids in result_large.items
+        len(menu_ids) == 1 for _role, menu_ids in result_large.items
     )

@@ -52,9 +52,9 @@ async def fake_redis() -> AsyncIterator[AsyncRedisDouble]:
     singleton is restored on teardown to prevent cross-test leakage.
 
     Autouse: enforces the no-shared-Redis invariant for *every* test, so any code
-    path that lazily reaches ``get_redis()`` (e.g. the dept-tree cache inside
-    ``resolve_data_scope``, or a mutation calling ``cache.invalidate``) hits the
-    double instead of the real instance. Tests that need a handle still request it.
+    path that lazily reaches ``get_redis()`` (e.g. a mutation calling
+    ``cache.invalidate``) hits the double instead of the real instance. Tests that
+    need a handle still request it.
 
     Why a hand-rolled double instead of ``fakeredis``: ``fakeredis`` resolves its
     awaits on a background thread, which corrupts coverage.py's C tracer on

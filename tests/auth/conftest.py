@@ -21,7 +21,6 @@ from src.db.models.identity import (
     Department,
     Menu,
     Role,
-    RoleDept,
     RoleMenu,
     User,
     UserRole,
@@ -36,7 +35,6 @@ _AUTH_TABLES = [
         Menu,
         UserRole,
         RoleMenu,
-        RoleDept,
         ApiKey,
         LoginLog,
         SysAttach,
@@ -82,7 +80,7 @@ async def grant_permission(
     session: AsyncSession, *, user: User, perm: str, role_code: str = "r1"
 ) -> Role:
     """Wire user → role → menu(perm) so the perm aggregates."""
-    role = Role(name=role_code, code=role_code, data_scope="self", status="active")
+    role = Role(name=role_code, code=role_code, status="active")
     session.add(role)
     await session.flush()
     menu = Menu(name=f"m.{perm}", menu_type="button", perms=perm, status="active")

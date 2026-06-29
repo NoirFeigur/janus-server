@@ -24,7 +24,6 @@ from src.db.models.identity import (
     Department,
     Menu,
     Role,
-    RoleDept,
     RoleMenu,
     User,
     UserRole,
@@ -43,7 +42,6 @@ _TABLES = [
         Menu,
         UserRole,
         RoleMenu,
-        RoleDept,
         ApiKey,
         LoginLog,
     )

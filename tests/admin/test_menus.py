@@ -167,7 +167,7 @@ async def test_batch_delete_menus_skips_role_granted(admin_ctx: AdminCtx) -> Non
         perms="system:batch:granted",
         sort_order=1,
     )
-    role = Role(name="menu-batch-grant", code="menu-batch-grant", data_scope="self")
+    role = Role(name="menu-batch-grant", code="menu-batch-grant")
     admin_ctx.session.add_all([granted, role])
     await admin_ctx.session.flush()
     admin_ctx.session.add(RoleMenu(role_id=role.id, menu_id=granted.id))
@@ -262,7 +262,7 @@ async def test_delete_menu_blocks_children_and_role_grants(admin_ctx: AdminCtx) 
         },
     )
     granted_id = int(granted.json()["data"]["id"])
-    role = Role(name="grant", code="grant", data_scope="self", status="active")
+    role = Role(name="grant", code="grant", status="active")
     admin_ctx.session.add(role)
     await admin_ctx.session.flush()
     admin_ctx.session.add(RoleMenu(role_id=role.id, menu_id=granted_id))
@@ -297,7 +297,7 @@ async def test_current_menus_returns_only_user_grants(admin_ctx: AdminCtx) -> No
     )
     admin_ctx.session.add_all([visible, hidden, disabled])
     await admin_ctx.session.flush()
-    role = Role(name="current", code="current", data_scope="self", status="active")
+    role = Role(name="current", code="current", status="active")
     admin_ctx.session.add(role)
     await admin_ctx.session.flush()
     admin_ctx.session.add(UserRole(user_id=ADMIN_ID, role_id=role.id))

@@ -1,14 +1,12 @@
 """Auth domain business logic (README: service layer, four-layer discipline).
 
-Three responsibilities, all on top of :class:`AuthRepository` + the
+Two responsibilities, all on top of :class:`AuthRepository` + the
 ``core.security`` primitives:
 
 - **Authentication** — password login (issues a platform RS256 access token) and
   sk-key resolution (hash → lookup → expiry).
 - **Authorization (RBAC)** — per-request permission-code aggregation; holding an
   active role with the ``superadmin`` code is super-admin.
-- **Data scope** — resolve a user's effective department-id set (RuoYi
-  6-tier), the primitive applied by admin user list + mutation queries.
 
 Security primitives raise the infra-level :class:`TokenError`; this layer
 translates every auth failure into an :class:`AppError` carrying an
@@ -19,21 +17,18 @@ to the same opaque ``auth_invalid_token`` (401).
 
 from __future__ import annotations
 
-from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette import status
 
-from src.auth import dept_tree_cache, perm_cache
+from src.auth import perm_cache
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.credentials import CredentialKind
-from src.auth.dept_tree_cache import DeptPair, invalidate_department_tree
 from src.auth.repository import AuthRepository
 from src.config import get_settings
-from src.core import cache
 from src.core.login_throttle import LoginThrottle, ThrottlePolicy
 from src.core.oss import ObjectStorage
 from src.core.redis import get_redis
@@ -52,14 +47,12 @@ from src.core.session_store import RefreshOutcome, SessionStore
 from src.db.models.audit import LoginLog
 from src.db.models.identity import Role
 from src.db.session import unit_of_work
-from src.enums import AuditOutcome, DataScope, ErrorCode, LoginFailureReason
+from src.enums import AuditOutcome, ErrorCode, LoginFailureReason
 from src.exceptions import AppError
 
 __all__ = [
     "AuthService",
     "AuthenticatedUser",
-    "DataScopeFilter",
-    "invalidate_department_tree",
 ]
 
 
@@ -101,22 +94,6 @@ class AuthenticatedUser:
         return self.is_superuser or required in self.permissions
 
 
-@dataclass(frozen=True, slots=True)
-class DataScopeFilter:
-    """A user's effective data-visibility scope, role-union resolved.
-
-    ``unrestricted`` short-circuits everything (a role with ``all``). Otherwise a
-    row is visible if its department is in ``department_ids`` OR the row's owner
-    column matches the user when ``include_self`` is set. The admin query layer
-    translates this into the actual ``WHERE`` clause; this struct is the portable
-    primitive.
-    """
-
-    unrestricted: bool
-    department_ids: frozenset[int]
-    include_self: bool
-
-
 def _now_utc() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -132,22 +109,6 @@ def _is_expired(expires_at: datetime | None) -> bool:
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
     return expires_at < _now_utc()
-
-
-def _collect_subtree(root_ids: Iterable[int], dept_pairs: Sequence[DeptPair]) -> set[int]:
-    """Root department ids plus all their descendants (adjacency-list walk)."""
-    children: dict[int | None, list[int]] = defaultdict(list)
-    for dept_id, parent_id in dept_pairs:
-        children[parent_id].append(dept_id)
-    collected: set[int] = set()
-    stack = list(root_ids)
-    while stack:
-        current = stack.pop()
-        if current in collected:
-            continue
-        collected.add(current)
-        stack.extend(children.get(current, ()))
-    return collected
 
 
 class AuthService:
@@ -603,143 +564,9 @@ class AuthService:
     async def roles_for_assignment(self, role_ids: Sequence[int]) -> Sequence[Role]:
         """Active role rows for an assignment escalation guard.
 
-        Exposes each role's ``code`` (super-admin marker) and ``data_scope``
-        (visibility breadth) so the user-admin layer can reject assigning a role
-        broader than the actor — neither is observable through the perms-only
-        subset check (a ``superadmin`` role with no menus confers zero perms, and
-        an ``all``-scope role confers no perm code yet grants unrestricted view).
+        Exposes each role's ``code`` (super-admin marker) so the user-admin layer
+        can reject assigning a role more privileged than the actor — the marker is
+        not observable through the perms-only subset check (a ``superadmin`` role
+        with no menus confers zero perms yet grants unrestricted authority).
         """
         return await self.repo.list_active_roles_by_ids(role_ids)
-
-    async def role_department_ids(self, role_ids: Sequence[int]) -> frozenset[int]:
-        """Custom-scope department ids granted to a set of roles (scope guard)."""
-        return await self.repo.list_role_department_ids(role_ids)
-
-    async def resolve_role_scope(
-        self,
-        data_scope: DataScope,
-        dept_ids: Sequence[int],
-        *,
-        holder_department_id: int | None,
-    ) -> DataScopeFilter:
-        """Resolve the department visibility a single role confers on a holder.
-
-        The privilege-escalation guards use this to compare a *prospective*
-        grant against the actor's own scope: a scoped actor may assign/mint a
-        role only if the visibility it would confer on the eventual holder is a
-        subset of the actor's own ``department_ids``. This is the piece the old
-        guards got wrong — they waved relative scopes through as "bounded by the
-        holder", but for the SAME holder ``dept_and_child`` resolves to a strictly
-        broader set than ``dept_only``, so an actor minting/assigning the wider
-        relative scope gains breadth it never had.
-
-        Resolution mirrors :meth:`_accumulate_scope` for one role: ``all`` is
-        unrestricted; ``custom`` grants the explicit dept set; ``dept_only`` =
-        ``{holder_dept}``; ``dept_and_child`` / ``dept_and_child_or_self`` =
-        subtree(holder_dept); ``self_only`` confers NO department visibility (only
-        the self flag), so it is always within any actor's scope.
-        """
-        if data_scope == DataScope.all_data:
-            return DataScopeFilter(
-                unrestricted=True, department_ids=frozenset(), include_self=False
-            )
-        department_ids: set[int] = set()
-        include_self = False
-        if data_scope == DataScope.custom:
-            department_ids |= set(dept_ids)
-        elif data_scope == DataScope.dept_only:
-            if holder_department_id is not None:
-                department_ids.add(holder_department_id)
-        elif data_scope == DataScope.dept_and_child:
-            if holder_department_id is not None:
-                department_ids |= _collect_subtree(
-                    {holder_department_id}, await self._load_dept_tree()
-                )
-        elif data_scope == DataScope.self_only:
-            include_self = True
-        elif data_scope == DataScope.dept_and_child_or_self:
-            if holder_department_id is not None:
-                department_ids |= _collect_subtree(
-                    {holder_department_id}, await self._load_dept_tree()
-                )
-            include_self = True
-        return DataScopeFilter(
-            unrestricted=False,
-            department_ids=frozenset(department_ids),
-            include_self=include_self,
-        )
-
-    async def resolve_data_scope(self, user: AuthenticatedUser) -> DataScopeFilter:
-        """Resolve the user's effective data scope (broadest role wins).
-
-        Super-admin (``superadmin`` role code) is unconditionally unrestricted
-        regardless of other roles. Otherwise union semantics across all active
-        roles: ``all`` beats everything; the rest accumulate department ids
-        and/or the self flag. No active role → the most restrictive scope (self
-        only).
-        """
-        if user.is_superuser:
-            return DataScopeFilter(
-                unrestricted=True, department_ids=frozenset(), include_self=False
-            )
-        roles = await self.repo.list_active_roles(user.user_id)
-        if not roles:
-            return DataScopeFilter(
-                unrestricted=False, department_ids=frozenset(), include_self=True
-            )
-        if any(role.data_scope == DataScope.all_data.value for role in roles):
-            return DataScopeFilter(
-                unrestricted=True, department_ids=frozenset(), include_self=False
-            )
-        return await self._accumulate_scope(user, roles)
-
-    async def _accumulate_scope(
-        self, user: AuthenticatedUser, roles: Sequence[Role]
-    ) -> DataScopeFilter:
-        department_ids: set[int] = set()
-        subtree_roots: set[int] = set()
-        include_self = False
-        own_dept = user.department_id
-
-        custom_role_ids = [
-            role.id for role in roles if role.data_scope == DataScope.custom.value
-        ]
-        if custom_role_ids:
-            department_ids |= await self.repo.list_role_department_ids(custom_role_ids)
-
-        for role in roles:
-            scope = role.data_scope
-            if scope == DataScope.dept_only.value and own_dept is not None:
-                department_ids.add(own_dept)
-            elif scope == DataScope.dept_and_child.value and own_dept is not None:
-                subtree_roots.add(own_dept)
-            elif scope == DataScope.self_only.value:
-                include_self = True
-            elif scope == DataScope.dept_and_child_or_self.value:
-                if own_dept is not None:
-                    subtree_roots.add(own_dept)
-                include_self = True
-
-        if subtree_roots:
-            department_ids |= _collect_subtree(subtree_roots, await self._load_dept_tree())
-
-        return DataScopeFilter(
-            unrestricted=False,
-            department_ids=frozenset(department_ids),
-            include_self=include_self,
-        )
-
-    async def _load_dept_tree(self) -> list[DeptPair]:
-        """Department adjacency, cache-aside (short TTL, fail-open to DB)."""
-
-        async def _from_db() -> list[DeptPair]:
-            depts = await self.repo.list_all_departments()
-            return [(d.id, d.parent_id) for d in depts]
-
-        return await cache.get_or_load(
-            dept_tree_cache.CACHE_KEY,
-            _from_db,
-            ttl_seconds=dept_tree_cache.TTL_SECONDS,
-            dumps=dept_tree_cache.encode,
-            loads=dept_tree_cache.decode,
-        )

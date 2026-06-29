@@ -115,7 +115,7 @@ async def test_forbidden_write_records_failure(admin_ctx: AdminCtx) -> None:
 @pytest.mark.asyncio
 async def test_validation_failure_records_failure(admin_ctx: AdminCtx) -> None:
     resp = await admin_ctx.client.post(
-        "/admin/roles", json={"name": "X", "code": "x", "data_scope": "bogus"}
+        "/admin/roles", json={"name": "X"}
     )
     assert resp.status_code == 422
 

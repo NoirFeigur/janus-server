@@ -51,7 +51,7 @@ class BaseEntity(Base):
         BigInteger,
         nullable=True,
         index=True,
-        comment="创建部门 sys_department.id（数据权限过滤用）",
+        comment="创建部门 sys_department.id（审计留痕；非数据权限过滤）",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

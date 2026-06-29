@@ -44,15 +44,6 @@ class MenuType(StrEnum):
     button = "button"  # Fine-grained operation permission.
 
 
-class DataScope(StrEnum):
-    all_data = "all"  # All department data.
-    custom = "custom"  # Explicit department set from role-department grants.
-    dept_only = "dept"  # Current user's own department only.
-    dept_and_child = "dept_and_child"  # Current department and descendants.
-    self_only = "self"  # Records created by the current user only.
-    dept_and_child_or_self = "dept_and_child_or_self"  # Department subtree plus own records.
-
-
 class ChannelStatus(StrEnum):
     active = "active"  # Channel participates in Router construction.
     disabled = "disabled"  # Channel is excluded from routing.

@@ -8,8 +8,7 @@ dependency is overridden:
 The auth middleware still runs; requests carry a test JWT and the middleware uses
 the same SQLite session factory.
 
-An admin user (id 1000) with a ``data_scope=all`` role is seeded so user listing
-is unrestricted by default; data-scope tests override the actor's department.
+An admin user (id 1000) with a role is seeded so user listing works by default.
 """
 
 from __future__ import annotations
@@ -44,7 +43,6 @@ from src.db.models.identity import (
     Department,
     Menu,
     Role,
-    RoleDept,
     RoleMenu,
     User,
     UserRole,
@@ -84,7 +82,6 @@ _TABLES = [
         Menu,
         UserRole,
         RoleMenu,
-        RoleDept,
         ApiKey,
         UpstreamChannel,
         ChannelKey,
@@ -163,8 +160,8 @@ async def admin_ctx(
     monkeypatch.setattr(settings, "platform_jwt_private_key", SecretStr(priv_pem))
     monkeypatch.setattr(settings, "platform_jwt_public_key", None)
 
-    # Seed the admin actor + an all-scope role so user listing is unrestricted.
-    role = Role(name="admin", code="admin", data_scope="all", status="active")
+    # Seed the admin actor + a role so user listing works.
+    role = Role(name="admin", code="admin", status="active")
     session.add(role)
     await session.flush()
     session.add(

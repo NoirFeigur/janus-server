@@ -238,7 +238,7 @@ async def test_delete_menu_with_role_grant_blocked(admin_session) -> None:
     menu = await svc.create_menu(
         MenuCreate(name="Granted", menu_type="menu"), actor=_actor()
     )
-    role = Role(name="r", code="r", data_scope="all", status="active")
+    role = Role(name="r", code="r", status="active")
     admin_session.add(role)
     await admin_session.flush()
     admin_session.add(RoleMenu(role_id=role.id, menu_id=menu.id))
@@ -278,7 +278,7 @@ async def test_current_user_menu_filter(admin_session) -> None:
     invisible = Menu(name="invisible", menu_type="menu", status="active", visible=False)
     admin_session.add_all([visible, invisible])
     await admin_session.flush()
-    role = Role(name="r", code="r", data_scope="self", status="active")
+    role = Role(name="r", code="r", status="active")
     admin_session.add(role)
     await admin_session.flush()
     admin_session.add(UserRole(user_id=42, role_id=role.id))

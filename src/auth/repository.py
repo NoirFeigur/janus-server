@@ -6,7 +6,7 @@ here; the service layer receives domain objects / value sets, never raw
 ``select()`` statements.
 
 No physical foreign keys (§0.7): joins are expressed on the snowflake id
-columns directly. Link tables (UserRole/RoleMenu/RoleDept) are physically
+columns directly. Link tables (UserRole/RoleMenu) are physically
 deleted (no ``is_deleted``); active/not-deleted filters apply only to the
 BaseEntity tables (Role/Menu).
 """
@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.attach import SysAttach
 from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
-from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
+from src.db.models.identity import Menu, Role, RoleMenu, User, UserRole
 from src.enums import ActiveStatus, ApiKeyStatus, AttachBizType, UserStatus
 
 
@@ -189,44 +189,13 @@ class AuthRepository:
         result = await self.session.scalars(stmt)
         return frozenset(result.all())
 
-    async def list_active_roles(self, user_id: int) -> Sequence[Role]:
-        """User's active, non-deleted roles (for data-scope resolution)."""
-        stmt = (
-            select(Role)
-            .join(UserRole, UserRole.role_id == Role.id)
-            .where(UserRole.user_id == user_id)
-            .where(Role.is_deleted.is_(False))
-            .where(Role.status == ActiveStatus.active.value)
-        )
-        result = await self.session.scalars(stmt)
-        return result.all()
-
-    async def list_role_department_ids(self, role_ids: Sequence[int]) -> frozenset[int]:
-        """Custom-scope department ids granted to the given roles (sys_role_dept)."""
-        if not role_ids:
-            return frozenset()
-        stmt = select(RoleDept.dept_id).where(RoleDept.role_id.in_(role_ids))
-        result = await self.session.scalars(stmt)
-        return frozenset(result.all())
-
-    async def list_all_departments(self) -> Sequence[Department]:
-        """All non-deleted departments (id + parent_id) for subtree resolution.
-
-        The tree is small (org departments); loading it and walking the adjacency
-        list in Python avoids a recursive CTE and is portable across PG/SQLite.
-        """
-        stmt = select(Department).where(Department.is_deleted.is_(False))
-        result = await self.session.scalars(stmt)
-        return result.all()
-
     async def list_active_roles_by_ids(self, role_ids: Sequence[int]) -> Sequence[Role]:
         """Active, non-deleted role rows for a given id set (assignment guards).
 
         Used by the user-admin escalation guard to inspect a role's ``code``
-        (super-admin marker) and ``data_scope`` breadth before letting an actor
-        assign it — a perms-only subset check is blind to both (a ``superadmin``
-        role with no menus confers zero perms; an ``all``-scope role confers no
-        perm code yet grants unrestricted visibility). Same active/not-deleted
+        (super-admin marker) before letting an actor assign it — a perms-only
+        subset check is blind to it (a ``superadmin`` role with no menus confers
+        zero perms yet grants unrestricted authority). Same active/not-deleted
         filters as the other RBAC reads.
         """
         if not role_ids:

@@ -4,8 +4,8 @@ Drives the service with a plain ``await`` against an in-memory SQLite session.
 Route tests (``test_roles.py``) already prove the behaviour end-to-end; these
 exist to (a) give honest, measurable coverage of the service body — the
 ``ASGITransport`` route path corrupts coverage.py's C tracer on CPython 3.11 —
-and (b) pin branch-level invariants (custom-scope dept clearing on update, the
-unique-code guard, the full delete cascade) at the unit level.
+and (b) pin branch-level invariants (the unique-code guard, the full delete
+cascade) at the unit level.
 """
 
 from __future__ import annotations
@@ -18,8 +18,7 @@ from src.admin.roles.schemas import RoleCreate, RoleUpdate
 from src.admin.roles.service import RoleService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
-from src.db.models.identity import Menu, Role, RoleDept, RoleMenu, UserRole
-from src.enums import DataScope
+from src.db.models.identity import Menu, Role, RoleMenu, UserRole
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -53,31 +52,16 @@ async def _seed_menu(session: AsyncSession, perm: str) -> int:
     return menu.id
 
 
-async def _seed_scoped_actor_role(
-    session: AsyncSession, user_id: int, data_scope: str = "dept"
-) -> None:
-    """Give an actor a non-super-admin role so ``resolve_data_scope`` returns a
-    bounded scope (a ``dept`` role resolves to the actor's own department)."""
-    role = Role(
-        name=f"r{user_id}", code=f"r{user_id}", data_scope=data_scope, status="active"
-    )
-    session.add(role)
-    await session.flush()
-    session.add(UserRole(user_id=user_id, role_id=role.id))
-    await session.commit()
-
-
 async def test_create_role_with_menus(admin_session: AsyncSession) -> None:
     menu_id = await _seed_menu(admin_session, "system:user:list")
     svc = RoleService(admin_session)
-    role, menu_ids, dept_ids = await svc.create_role(
+    role, menu_ids = await svc.create_role(
         RoleCreate(name="Viewer", code="viewer", menu_ids=[menu_id]), actor=_actor()
     )
     assert role.code == "viewer"
     assert role.created_by == ACTOR_ID
     assert role.create_dept == 10
     assert menu_ids == [menu_id]
-    assert dept_ids == []
 
 
 async def test_create_role_duplicate_code_rejected(admin_session: AsyncSession) -> None:
@@ -97,59 +81,6 @@ async def test_create_role_unknown_menu_rejected(admin_session: AsyncSession) ->
     assert exc.value.status_code == 400
 
 
-async def test_create_custom_scope_role_with_depts(
-    admin_session: AsyncSession,
-) -> None:
-    from src.db.models.identity import Department
-
-    admin_session.add_all(
-        [Department(id=d, name=f"d{d}", parent_id=None) for d in (111, 222)]
-    )
-    await admin_session.commit()
-    svc = RoleService(admin_session)
-    role, _, dept_ids = await svc.create_role(
-        RoleCreate(
-            name="Custom",
-            code="custom",
-            data_scope=DataScope.custom,
-            dept_ids=[111, 222],
-        ),
-        actor=_actor(),
-    )
-    assert set(dept_ids) == {111, 222}
-
-
-async def test_create_custom_scope_unknown_dept_rejected(
-    admin_session: AsyncSession,
-) -> None:
-    svc = RoleService(admin_session)
-    with pytest.raises(AppError) as exc:
-        await svc.create_role(
-            RoleCreate(
-                name="Bad",
-                code="baddept",
-                data_scope=DataScope.custom,
-                dept_ids=[99999],
-            ),
-            actor=_actor(),
-        )
-    assert exc.value.status_code == 400
-
-
-async def test_create_custom_scope_role_empty_depts(
-    admin_session: AsyncSession,
-) -> None:
-    # custom scope + no dept grants: _validate_depts short-circuits (no rows to check).
-    svc = RoleService(admin_session)
-    role, _, dept_ids = await svc.create_role(
-        RoleCreate(
-            name="EmptyCustom", code="emptycustom", data_scope=DataScope.custom
-        ),
-        actor=_actor(),
-    )
-    assert dept_ids == []
-
-
 async def test_get_role_not_found_raises(admin_session: AsyncSession) -> None:
     svc = RoleService(admin_session)
     with pytest.raises(AppError) as exc:
@@ -161,10 +92,10 @@ async def test_update_role_replaces_menus(admin_session: AsyncSession) -> None:
     m1 = await _seed_menu(admin_session, "system:user:list")
     m2 = await _seed_menu(admin_session, "system:user:add")
     svc = RoleService(admin_session)
-    role, _, _ = await svc.create_role(
+    role, _ = await svc.create_role(
         RoleCreate(name="R", code="rr", menu_ids=[m1]), actor=_actor()
     )
-    _, menu_ids, _ = await svc.update_role(
+    _, menu_ids = await svc.update_role(
         role.id, RoleUpdate(menu_ids=[m2]), actor=_actor()
     )
     assert menu_ids == [m2]
@@ -172,7 +103,7 @@ async def test_update_role_replaces_menus(admin_session: AsyncSession) -> None:
 
 async def test_update_role_unknown_menu_rejected(admin_session: AsyncSession) -> None:
     svc = RoleService(admin_session)
-    role, _, _ = await svc.create_role(
+    role, _ = await svc.create_role(
         RoleCreate(name="R", code="rmenu"), actor=_actor()
     )
     with pytest.raises(AppError) as exc:
@@ -180,56 +111,12 @@ async def test_update_role_unknown_menu_rejected(admin_session: AsyncSession) ->
     assert exc.value.status_code == 400
 
 
-async def test_leaving_custom_scope_clears_depts(admin_session: AsyncSession) -> None:
-    from src.db.models.identity import Department
-
-    admin_session.add(Department(id=111, name="d111", parent_id=None))
-    await admin_session.commit()
-    svc = RoleService(admin_session)
-    role, _, dept_ids = await svc.create_role(
-        RoleCreate(
-            name="C", code="cc", data_scope=DataScope.custom, dept_ids=[111]
-        ),
-        actor=_actor(),
-    )
-    assert dept_ids == [111]
-    # Switch away from custom → dept grants must be cleared.
-    _, _, after = await svc.update_role(
-        role.id, RoleUpdate(data_scope=DataScope.dept_only), actor=_actor()
-    )
-    assert after == []
-    remaining = await admin_session.scalars(
-        select(RoleDept.dept_id).where(RoleDept.role_id == role.id)
-    )
-    assert remaining.all() == []
-
-
-async def test_update_custom_scope_replaces_depts(admin_session: AsyncSession) -> None:
-    from src.db.models.identity import Department
-
-    admin_session.add_all(
-        [Department(id=d, name=f"d{d}", parent_id=None) for d in (300, 301)]
-    )
-    await admin_session.commit()
-    svc = RoleService(admin_session)
-    role, _, _ = await svc.create_role(
-        RoleCreate(
-            name="Cust", code="custupd", data_scope=DataScope.custom, dept_ids=[300]
-        ),
-        actor=_actor(),
-    )
-    _, _, dept_ids = await svc.update_role(
-        role.id, RoleUpdate(dept_ids=[301]), actor=_actor()
-    )
-    assert dept_ids == [301]
-
-
 async def test_delete_role_cascades_links(admin_session: AsyncSession) -> None:
     from src.db.models.identity import User
 
     m1 = await _seed_menu(admin_session, "system:role:list")
     svc = RoleService(admin_session)
-    role, _, _ = await svc.create_role(
+    role, _ = await svc.create_role(
         RoleCreate(name="Doomed", code="doomed", menu_ids=[m1]), actor=_actor()
     )
     # Assign the role to a user so the delete cascade has something to clear.
@@ -269,52 +156,10 @@ async def test_list_roles_bulk_grants(admin_session: AsyncSession) -> None:
     )
     await svc.create_role(RoleCreate(name="R2", code="r2"), actor=_actor())
     listing = await svc.list_roles(_actor())
-    by_code = {r.code: (menus, depts) for r, menus, depts in listing.items}
+    by_code = {r.code: menus for r, menus in listing.items}
     assert listing.total == 2
-    assert by_code["r1"][0] == [m1]
-    assert by_code["r2"][0] == []  # role with no menus defaults to empty list
-
-
-async def test_scoped_actor_only_sees_roles_in_scope(
-    admin_session: AsyncSession,
-) -> None:
-    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:list"})
-    visible = Role(
-        name="visible",
-        code="visible",
-        data_scope="self",
-        status="active",
-        created_by=123,
-        create_dept=10,
-    )
-    own = Role(
-        name="own",
-        code="own",
-        data_scope="self",
-        status="active",
-        created_by=2000,
-        create_dept=None,
-    )
-    hidden = Role(
-        name="hidden",
-        code="hidden",
-        data_scope="self",
-        status="active",
-        created_by=9999,
-        create_dept=99,
-    )
-    scope_role = Role(name="scope", code="scope", data_scope="dept", status="active")
-    admin_session.add_all([visible, own, hidden, scope_role])
-    await admin_session.flush()
-    admin_session.add(UserRole(user_id=2000, role_id=scope_role.id))
-    await admin_session.commit()
-
-    svc = RoleService(admin_session)
-    listing = await svc.list_roles(actor)
-    assert {role.code for role, _, _ in listing.items} == {"visible"}
-    with pytest.raises(AppError) as exc:
-        await svc.delete_role(hidden.id, actor=actor)
-    assert exc.value.status_code == 403
+    assert by_code["r1"] == [m1]
+    assert by_code["r2"] == []  # role with no menus defaults to empty list
 
 
 # ---- privilege-escalation guards (role create/update) ----------------------
@@ -341,7 +186,7 @@ async def test_create_role_with_subset_menu_allowed(
     menu_id = await _seed_menu(admin_session, "system:user:list")
     actor = _actor(user_id=2000, permissions={"system:user:list", "system:role:add"})
     svc = RoleService(admin_session)
-    role, menu_ids, _ = await svc.create_role(
+    role, menu_ids = await svc.create_role(
         RoleCreate(name="Ok", code="okrole", menu_ids=[menu_id]), actor=actor
     )
     assert menu_ids == [menu_id]
@@ -351,74 +196,10 @@ async def test_superadmin_may_grant_any_menu(admin_session: AsyncSession) -> Non
     menu_id = await _seed_menu(admin_session, "anything:goes:here")
     svc = RoleService(admin_session)
     # default _actor() is super-admin (perms {"*:*:*"} + superadmin role code).
-    _, menu_ids, _ = await svc.create_role(
+    _, menu_ids = await svc.create_role(
         RoleCreate(name="Su", code="su", menu_ids=[menu_id]), actor=_actor()
     )
     assert menu_ids == [menu_id]
-
-
-async def test_scoped_actor_cannot_grant_all_data_scope(
-    admin_session: AsyncSession,
-) -> None:
-    """A non-unrestricted actor cannot mint an ``all``-scope role."""
-    await _seed_scoped_actor_role(admin_session, user_id=2000)
-    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:add"})
-    svc = RoleService(admin_session)
-    with pytest.raises(AppError) as exc:
-        await svc.create_role(
-            RoleCreate(name="All", code="allscope", data_scope=DataScope.all_data),
-            actor=actor,
-        )
-    assert exc.value.status_code == 403
-
-
-async def test_scoped_actor_cannot_grant_custom_dept_outside_scope(
-    admin_session: AsyncSession,
-) -> None:
-    """Custom-scope dept grants must be a subset of the actor's visible depts."""
-    from src.db.models.identity import Department
-
-    admin_session.add_all(
-        [Department(id=d, name=f"d{d}", parent_id=None) for d in (10, 999)]
-    )
-    await admin_session.commit()
-    # Actor's dept role resolves scope to its own department (10) only.
-    await _seed_scoped_actor_role(admin_session, user_id=2000)
-    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:add"})
-    svc = RoleService(admin_session)
-    with pytest.raises(AppError) as exc:
-        await svc.create_role(
-            RoleCreate(
-                name="Out",
-                code="outdept",
-                data_scope=DataScope.custom,
-                dept_ids=[999],  # not in actor's visible scope {10}
-            ),
-            actor=actor,
-        )
-    assert exc.value.status_code == 403
-
-
-async def test_scoped_actor_may_grant_custom_dept_within_scope(
-    admin_session: AsyncSession,
-) -> None:
-    from src.db.models.identity import Department
-
-    admin_session.add(Department(id=10, name="d10", parent_id=None))
-    await admin_session.commit()
-    await _seed_scoped_actor_role(admin_session, user_id=2000)
-    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:add"})
-    svc = RoleService(admin_session)
-    role, _, dept_ids = await svc.create_role(
-        RoleCreate(
-            name="In",
-            code="indept",
-            data_scope=DataScope.custom,
-            dept_ids=[10],  # within actor's visible scope {10}
-        ),
-        actor=actor,
-    )
-    assert dept_ids == [10]
 
 
 async def test_non_superuser_cannot_create_superadmin_role(
@@ -430,7 +211,6 @@ async def test_non_superuser_cannot_create_superadmin_role(
     superadmin role would pass the menu-subset guard (zero conferred perms) yet
     self-mint full super-admin once assigned. The code guard blocks it up front.
     """
-    await _seed_scoped_actor_role(admin_session, user_id=2000)
     actor = _actor(user_id=2000, department_id=10, permissions={"system:role:add"})
     svc = RoleService(admin_session)
     with pytest.raises(AppError) as exc:
@@ -445,7 +225,7 @@ async def test_superuser_may_create_superadmin_role(
 ) -> None:
     """An actual super-admin may create a super-admin-coded role."""
     svc = RoleService(admin_session)
-    role, _, _ = await svc.create_role(
+    role, _ = await svc.create_role(
         RoleCreate(name="Su", code=SUPERADMIN_ROLE_CODE), actor=_actor()
     )
     assert role.code == SUPERADMIN_ROLE_CODE
@@ -457,11 +237,9 @@ async def test_update_role_escalating_menu_rejected(
     """A scoped actor cannot edit a role to add a permission it lacks."""
     menu_id = await _seed_menu(admin_session, "system:user:delete")
     actor = _actor(user_id=2000, permissions={"system:role:list"})
-    # The role itself is visible to the actor (created_by == actor).
     role = Role(
         name="Vis",
         code="visrole",
-        data_scope="self",
         status="active",
         created_by=2000,
     )
@@ -470,28 +248,6 @@ async def test_update_role_escalating_menu_rejected(
     svc = RoleService(admin_session)
     with pytest.raises(AppError) as exc:
         await svc.update_role(role.id, RoleUpdate(menu_ids=[menu_id]), actor=actor)
-    assert exc.value.status_code == 403
-
-
-async def test_update_role_escalating_scope_to_all_rejected(
-    admin_session: AsyncSession,
-) -> None:
-    await _seed_scoped_actor_role(admin_session, user_id=2000)
-    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:edit"})
-    role = Role(
-        name="Vis",
-        code="visrole2",
-        data_scope="self",
-        status="active",
-        created_by=2000,
-    )
-    admin_session.add(role)
-    await admin_session.commit()
-    svc = RoleService(admin_session)
-    with pytest.raises(AppError) as exc:
-        await svc.update_role(
-            role.id, RoleUpdate(data_scope=DataScope.all_data), actor=actor
-        )
     assert exc.value.status_code == 403
 
 
@@ -505,7 +261,6 @@ async def test_update_role_escalation_guard_runs_before_mutation(
     role = Role(
         name="Before",
         code="beforerole",
-        data_scope="self",
         status="active",
         sort_order=5,
         created_by=2000,
@@ -531,59 +286,31 @@ async def test_update_role_escalation_guard_runs_before_mutation(
 
 
 # ---- dominance guards (manage an EXISTING role) ----------------------------
-# Visibility ≠ manageability: a scoped actor who can SEE a role more powerful
-# than itself must still be refused on update/delete (else it could delete the
-# superadmin role, or rename an all-scope role it could never have minted).
+# A scoped actor that can SEE a role more powerful than itself must still be
+# refused on update/delete (else it could delete the superadmin role, or rename
+# a role carrying a permission it could never have minted).
 
 
 async def test_scoped_actor_cannot_delete_superadmin_role(
     admin_session: AsyncSession,
 ) -> None:
-    """A scoped actor that can SEE the ``superadmin`` role (it created it under
-    some prior grant) still cannot delete it — dominance blocks the reserved
-    code even though visibility passes."""
-    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    """A scoped actor cannot delete the ``superadmin`` role — dominance blocks
+    the reserved code regardless of who created it."""
     su_role = Role(
         name="su-del",
         code=SUPERADMIN_ROLE_CODE,
-        data_scope="self",
         status="active",
-        created_by=2000,  # visible to the actor
-        create_dept=10,  # dept-scope visibility keys off create_dept (not created_by)
+        created_by=2000,
     )
     admin_session.add(su_role)
     await admin_session.commit()
     actor = _actor(user_id=2000, department_id=10, permissions={"system:role:remove"})
     svc = RoleService(admin_session)
 
-    # Visible — prove the block is dominance, not visibility.
-    assert (await svc._require_visible(su_role.id, actor)).id == su_role.id
     with pytest.raises(AppError) as exc:
         await svc.delete_role(su_role.id, actor=actor)
     assert exc.value.status_code == 403
     assert (await admin_session.get(Role, su_role.id)).is_deleted is False
-
-
-async def test_scoped_actor_cannot_delete_all_scope_role(
-    admin_session: AsyncSession,
-) -> None:
-    """An ``all``-scope role is broader than a dept actor's reach → un-deletable."""
-    await _seed_scoped_actor_role(admin_session, user_id=2000)
-    all_role = Role(
-        name="all-del",
-        code="alldel",
-        data_scope="all",
-        status="active",
-        created_by=2000,
-        create_dept=10,  # dept-scope visibility keys off create_dept
-    )
-    admin_session.add(all_role)
-    await admin_session.commit()
-    actor = _actor(user_id=2000, department_id=10, permissions={"system:role:remove"})
-    svc = RoleService(admin_session)
-    with pytest.raises(AppError) as exc:
-        await svc.delete_role(all_role.id, actor=actor)
-    assert exc.value.status_code == 403
 
 
 async def test_scoped_actor_cannot_rename_role_with_menu_beyond_perms(
@@ -595,7 +322,6 @@ async def test_scoped_actor_cannot_rename_role_with_menu_beyond_perms(
     role = Role(
         name="Power",
         code="powerrole",
-        data_scope="self",
         status="active",
         created_by=2000,
     )
@@ -615,7 +341,7 @@ async def test_superuser_can_delete_superadmin_role(
 ) -> None:
     """Regression: the dominance guard must not block an actual super-admin."""
     su_role = Role(
-        name="su-ok", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
+        name="su-ok", code=SUPERADMIN_ROLE_CODE, status="active"
     )
     admin_session.add(su_role)
     await admin_session.commit()
@@ -627,25 +353,28 @@ async def test_superuser_can_delete_superadmin_role(
 async def test_batch_delete_roles_skips_undominated(
     admin_session: AsyncSession,
 ) -> None:
-    """Batch delete skips roles the actor cannot dominate (e.g. ``all``-scope),
-    deleting only the ones it could have minted."""
-    await _seed_scoped_actor_role(admin_session, user_id=2000)
+    """Batch delete skips roles the actor cannot dominate (one carrying a
+    permission the actor lacks), deleting only the ones it could have minted."""
+    menu_id = await _seed_menu(admin_session, "system:user:delete")
     ok_role = Role(
-        name="ok-bd", code="okbd", data_scope="self", status="active",
+        name="ok-bd", code="okbd", status="active",
         created_by=2000, create_dept=10,
     )
-    all_role = Role(
-        name="all-bd", code="allbd", data_scope="all", status="active",
+    blocked_role = Role(
+        name="blocked-bd", code="blockedbd", status="active",
         created_by=2000, create_dept=10,
     )
-    admin_session.add_all([ok_role, all_role])
+    admin_session.add_all([ok_role, blocked_role])
+    await admin_session.flush()
+    # blocked_role carries a perm the actor lacks → undominated.
+    admin_session.add(RoleMenu(role_id=blocked_role.id, menu_id=menu_id))
     await admin_session.commit()
-    ok_id, all_id = ok_role.id, all_role.id
+    ok_id, blocked_id = ok_role.id, blocked_role.id
     actor = _actor(user_id=2000, department_id=10, permissions={"system:role:remove"})
     svc = RoleService(admin_session)
 
-    result = await svc.batch_delete_roles([ok_id, all_id], actor=actor)
+    result = await svc.batch_delete_roles([ok_id, blocked_id], actor=actor)
     assert result.affected == 1
-    assert str(all_id) in result.skipped_ids
+    assert str(blocked_id) in result.skipped_ids
     assert (await admin_session.get(Role, ok_id)).is_deleted is True
-    assert (await admin_session.get(Role, all_id)).is_deleted is False
+    assert (await admin_session.get(Role, blocked_id)).is_deleted is False

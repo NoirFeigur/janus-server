@@ -10,7 +10,7 @@ from starlette import status
 
 from src.admin.quota.repository import QuotaRepository
 from src.admin.quota.schemas import QuotaCreate, QuotaUpdate
-from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.auth.service import AuthenticatedUser, AuthService
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.quota import Quota
@@ -35,9 +35,6 @@ class QuotaService:
         self.repo = QuotaRepository(session)
         self.auth = AuthService(session)
 
-    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
-        return await self.auth.resolve_data_scope(actor)
-
     async def _require(self, quota_id: int) -> Quota:
         quota = await self.repo.get(quota_id)
         if quota is None:
@@ -50,29 +47,16 @@ class QuotaService:
         if scope != "global" and scope_id is None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
 
-    async def _require_subject_in_scope(
-        self, *, scope: str, scope_id: int | None, actor: AuthenticatedUser
-    ) -> None:
-        if scope == "global":
-            if not actor.is_superuser:
-                raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-            return
-        scope_filter = await self._scope(actor)
-        if not await self.repo.subject_in_scope(
-            scope=scope,
-            scope_id=scope_id,
-            scope_filter=scope_filter,
-            actor_id=actor.user_id,
-        ):
+    def _require_global_allowed(self, scope: str, actor: AuthenticatedUser) -> None:
+        """Platform-level ``global`` quota writes/reads are superuser-only."""
+        if scope == "global" and not actor.is_superuser:
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
     async def _require_visible_quota(
         self, quota_id: int, actor: AuthenticatedUser
     ) -> Quota:
         quota = await self._require(quota_id)
-        await self._require_subject_in_scope(
-            scope=quota.scope, scope_id=quota.scope_id, actor=actor
-        )
+        self._require_global_allowed(quota.scope, actor)
         return quota
 
     async def list_quotas(
@@ -86,15 +70,12 @@ class QuotaService:
         actor: AuthenticatedUser,
     ) -> PageResult[Quota]:
         query = query or ListQuery()
-        scope_filter = await self._scope(actor)
         sort = resolve_sort(query, allowed=SORT_COLUMNS, default="created_at")
         total = await self.repo.count_quotas(
             scope=scope,
             scope_id=scope_id,
             logical_model_id=logical_model_id,
             status=status_filter,
-            scope_filter=scope_filter,
-            actor_id=actor.user_id,
             include_global=actor.is_superuser,
         )
         items = await self.repo.list_quotas(
@@ -102,8 +83,6 @@ class QuotaService:
             scope_id=scope_id,
             logical_model_id=logical_model_id,
             status=status_filter,
-            scope_filter=scope_filter,
-            actor_id=actor.user_id,
             include_global=actor.is_superuser,
             sort=sort,
             limit=query.limit,
@@ -120,9 +99,7 @@ class QuotaService:
         self, payload: QuotaCreate, *, actor: AuthenticatedUser
     ) -> Quota:
         self._validate_scope(payload.scope, payload.scope_id)
-        await self._require_subject_in_scope(
-            scope=payload.scope, scope_id=payload.scope_id, actor=actor
-        )
+        self._require_global_allowed(payload.scope, actor)
         if payload.scope == "user" and payload.scope_id is not None:
             if not await self.repo.user_exists(payload.scope_id):
                 raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)

@@ -1,8 +1,8 @@
 """Admin role endpoints (router layer).
 
-CRUD over roles + their menu/dept grants, each gated by a ``system:role:*``
-permission. The service returns a ``(role, menu_ids, dept_ids)`` tuple which
-``_to_read`` assembles into the wire model (ids stringified).
+CRUD over roles + their menu grants, each gated by a ``system:role:*``
+permission. The service returns a ``(role, menu_ids)`` tuple which ``_to_read``
+assembles into the wire model (ids stringified).
 """
 
 from __future__ import annotations
@@ -34,10 +34,9 @@ ServiceDep = Annotated[RoleService, Depends(get_role_service)]
 
 
 def _to_read(detail: RoleDetail) -> RoleRead:
-    role, menu_ids, dept_ids = detail
+    role, menu_ids = detail
     read = RoleRead.model_validate(role)
     read.menu_ids = [str(mid) for mid in menu_ids]
-    read.dept_ids = [str(did) for did in dept_ids]
     return read
 
 

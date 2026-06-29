@@ -15,7 +15,6 @@ from src.db.models.identity import (
     Department,
     Menu,
     Role,
-    RoleDept,
     RoleMenu,
     User,
     UserOAuth,
@@ -41,7 +40,6 @@ __all__ = [
     "Menu",
     "UserRole",
     "RoleMenu",
-    "RoleDept",
     # credential
     "ApiKey",
     # model catalog

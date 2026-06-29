@@ -200,34 +200,21 @@ def upgrade() -> None:
     sa.Column('code', sa.String(length=64), nullable=False, comment='角色标识，如 "platform_admin"'),
     sa.Column('sort_order', sa.Integer(), nullable=False, comment='排序'),
     sa.Column('status', sa.String(length=16), nullable=False, comment='状态 ActiveStatus：active | disabled'),
-    sa.Column('data_scope', sa.String(length=16), nullable=False, comment='数据权限范围 DataScope：all=全部 | custom=自定义(关联 sys_role_dept) | dept=本部门 | dept_and_child=本部门及子 | self=仅本人 | dept_and_child_or_self=部门子树+本人'),
     sa.Column('menu_check_strictly', sa.Boolean(), nullable=False, comment='菜单树父子勾选是否严格关联（纯前端 UI 行为）'),
-    sa.Column('dept_check_strictly', sa.Boolean(), nullable=False, comment='部门树父子勾选是否严格关联（纯前端 UI 行为）'),
     sa.Column('remark', sa.String(length=255), nullable=True, comment='备注'),
     sa.Column('id', sa.BigInteger(), autoincrement=False, nullable=False, comment='主键：雪花 ID，应用层分配（非自增）'),
     sa.Column('is_deleted', sa.Boolean(), nullable=False, comment='软删标记：true=已删除（逻辑删除，不物理删行）'),
     sa.Column('created_by', sa.BigInteger(), nullable=True, comment='创建人 sys_user.id（逻辑引用，无物理外键）；null=系统操作'),
-    sa.Column('create_dept', sa.BigInteger(), nullable=True, comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤'),
+    sa.Column('create_dept', sa.BigInteger(), nullable=True, comment='创建部门 sys_department.id（逻辑引用）；审计留痕，非数据权限过滤'),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False, comment='创建时间（timestamptz，UTC，由数据库 now() 生成）'),
     sa.Column('updated_by', sa.BigInteger(), nullable=True, comment='最后更新人 sys_user.id（逻辑引用）'),
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False, comment='最后更新时间（timestamptz，UTC，更新时自动刷新）'),
     sa.PrimaryKeyConstraint('id'),
-    comment='系统角色：后台角色 + 正交数据权限范围'
+    comment='系统角色：后台 RBAC 角色'
     )
     op.create_index(op.f('ix_sys_role_code'), 'sys_role', ['code'], unique=False)
     op.create_index(op.f('ix_sys_role_create_dept'), 'sys_role', ['create_dept'], unique=False)
     op.create_index('uq_role_code_active', 'sys_role', ['code'], unique=True, postgresql_where=sa.text('is_deleted = false'))
-    op.create_table('sys_role_dept',
-    sa.Column('role_id', sa.BigInteger(), nullable=False, comment='角色 sys_role.id'),
-    sa.Column('dept_id', sa.BigInteger(), nullable=False, comment='部门 sys_department.id（RuoYi 风格短名）'),
-    sa.Column('id', sa.BigInteger(), autoincrement=False, nullable=False, comment='主键：雪花 ID，应用层分配（非自增）'),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False, comment='创建时间（timestamptz，UTC，由数据库 now() 生成）'),
-    sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('role_id', 'dept_id', name='uq_role_dept'),
-    comment='角色-部门关联表（仅 data_scope=custom 时使用）'
-    )
-    op.create_index(op.f('ix_sys_role_dept_dept_id'), 'sys_role_dept', ['dept_id'], unique=False)
-    op.create_index(op.f('ix_sys_role_dept_role_id'), 'sys_role_dept', ['role_id'], unique=False)
     op.create_table('sys_role_menu',
     sa.Column('role_id', sa.BigInteger(), nullable=False, comment='角色 sys_role.id'),
     sa.Column('menu_id', sa.BigInteger(), nullable=False, comment='菜单 sys_menu.id'),
@@ -430,9 +417,6 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_sys_role_menu_role_id'), table_name='sys_role_menu')
     op.drop_index(op.f('ix_sys_role_menu_menu_id'), table_name='sys_role_menu')
     op.drop_table('sys_role_menu')
-    op.drop_index(op.f('ix_sys_role_dept_role_id'), table_name='sys_role_dept')
-    op.drop_index(op.f('ix_sys_role_dept_dept_id'), table_name='sys_role_dept')
-    op.drop_table('sys_role_dept')
     op.drop_index('uq_role_code_active', table_name='sys_role', postgresql_where=sa.text('is_deleted = false'))
     op.drop_index(op.f('ix_sys_role_create_dept'), table_name='sys_role')
     op.drop_index(op.f('ix_sys_role_code'), table_name='sys_role')

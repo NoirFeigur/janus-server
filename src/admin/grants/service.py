@@ -10,7 +10,7 @@ from starlette import status
 
 from src.admin.grants.repository import GrantRepository
 from src.admin.grants.schemas import GrantCreate, GrantUpdate
-from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.auth.service import AuthenticatedUser, AuthService
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.grant import UserModelGrant
@@ -34,34 +34,10 @@ class GrantService:
         self.grants = GrantRepository(session)
         self.auth = AuthService(session)
 
-    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
-        return await self.auth.resolve_data_scope(actor)
-
     async def _require_grant(self, grant_id: int) -> UserModelGrant:
         grant = await self.grants.get(grant_id)
         if grant is None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_404_NOT_FOUND)
-        return grant
-
-    async def _require_subject_in_scope(
-        self, *, scope: str, scope_id: int, actor: AuthenticatedUser
-    ) -> None:
-        scope_filter = await self._scope(actor)
-        if not await self.grants.subject_in_scope(
-            scope=scope,
-            scope_id=scope_id,
-            scope_filter=scope_filter,
-            actor_id=actor.user_id,
-        ):
-            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-
-    async def _require_visible_grant(
-        self, grant_id: int, actor: AuthenticatedUser
-    ) -> UserModelGrant:
-        grant = await self._require_grant(grant_id)
-        await self._require_subject_in_scope(
-            scope=grant.scope, scope_id=grant.scope_id, actor=actor
-        )
         return grant
 
     async def _clear_default(
@@ -88,23 +64,18 @@ class GrantService:
         actor: AuthenticatedUser,
     ) -> PageResult[UserModelGrant]:
         query = query or ListQuery()
-        scope_filter = await self._scope(actor)
         sort = resolve_sort(query, allowed=SORT_COLUMNS, default="created_at")
         total = await self.grants.count_grants(
             keyword=query.keyword,
             scope=scope,
             scope_id=scope_id,
             logical_model_id=logical_model_id,
-            scope_filter=scope_filter,
-            actor_id=actor.user_id,
         )
         items = await self.grants.list_grants(
             keyword=query.keyword,
             scope=scope,
             scope_id=scope_id,
             logical_model_id=logical_model_id,
-            scope_filter=scope_filter,
-            actor_id=actor.user_id,
             sort=sort,
             limit=query.limit,
             offset=query.offset,
@@ -116,7 +87,7 @@ class GrantService:
     async def get_grant(
         self, grant_id: int, *, actor: AuthenticatedUser
     ) -> UserModelGrant:
-        return await self._require_visible_grant(grant_id, actor)
+        return await self._require_grant(grant_id)
 
     async def create_grant(
         self, payload: GrantCreate, *, actor: AuthenticatedUser
@@ -128,10 +99,6 @@ class GrantService:
             payload.scope_id
         ):
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
-
-        await self._require_subject_in_scope(
-            scope=payload.scope, scope_id=payload.scope_id, actor=actor
-        )
 
         if not await self.grants.model_exists(payload.logical_model_id):
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
@@ -173,7 +140,7 @@ class GrantService:
         *,
         actor: AuthenticatedUser,
     ) -> UserModelGrant:
-        grant = await self._require_visible_grant(grant_id, actor)
+        grant = await self._require_grant(grant_id)
         values = payload.model_dump(exclude_unset=True)
         if values.get("is_default") is True and not grant.is_default:
             await self._clear_default(
@@ -189,7 +156,7 @@ class GrantService:
         return grant
 
     async def delete_grant(self, grant_id: int, *, actor: AuthenticatedUser) -> None:
-        grant = await self._require_visible_grant(grant_id, actor)
+        grant = await self._require_grant(grant_id)
         grant.updated_by = actor.user_id
         await self.grants.soft_delete(grant)
         hook = _bump_grant_cache_generation(grant.scope, grant.scope_id)

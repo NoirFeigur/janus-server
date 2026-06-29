@@ -13,7 +13,6 @@ from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.db.models.identity import Role, User, UserRole
 from src.db.models.model_catalog import LogicalModel
-from src.enums import DataScope
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -26,8 +25,8 @@ ACTOR = AuthenticatedUser(
     role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
 )
 
-# Unrestricted data scope (via an all_data role) but NOT superadmin. Sees every
-# department/user quota, yet platform-level `global` quotas must stay hidden — it
+# A non-superadmin actor with the quota list perm. Sees every user/department
+# quota, yet platform-level `global` quotas must stay hidden (superuser-only) — it
 # isolates the M3-5 global-leak gate on the list path.
 UNRESTRICTED_NON_SUPER = AuthenticatedUser(
     user_id=2000,
@@ -39,14 +38,13 @@ UNRESTRICTED_NON_SUPER = AuthenticatedUser(
 
 
 async def _seed_unrestricted_role(session: AsyncSession, *, user_id: int) -> None:
-    """Give ``user_id`` an active all_data role (unrestricted, non-superadmin)."""
+    """Give ``user_id`` an active role (non-superadmin)."""
     session.add(
         Role(
             id=900,
             name="platform-admin",
             code="platform_admin",
             status="active",
-            data_scope=DataScope.all_data.value,
         )
     )
     session.add(
@@ -162,8 +160,8 @@ async def test_delete_quota_soft_deletes(admin_session: AsyncSession) -> None:
 async def test_list_quotas_unrestricted_non_super_excludes_global(
     admin_session: AsyncSession,
 ) -> None:
-    """M3-5: an unrestricted (all_data) non-superuser lists every user/department
-    quota but must NOT see platform-level `global` quotas on the list path."""
+    """M3-5: a non-superuser lists every user/department quota but must NOT see
+    platform-level `global` quotas on the list path."""
     await _seed_user(admin_session)
     await _seed_unrestricted_role(
         admin_session, user_id=UNRESTRICTED_NON_SUPER.user_id

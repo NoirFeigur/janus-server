@@ -1,10 +1,8 @@
 """Admin user business logic (service layer).
 
 Hashes passwords (argon2), enforces FK-less integrity (unique username,
-referenced dept/roles exist), and — the piece the Oracle ruling pinned to the
-user surface — applies the actor's resolved **data scope** on both listing and
-every single-user mutation. An actor who cannot see a target user gets the same
-opaque 403 as a permission failure; there is no "exists but hidden" oracle.
+referenced dept/roles exist), and gates role assignment behind a two-axis
+privilege-escalation guard (permission-code subset + ``superadmin`` marker).
 
 The transaction is owned by the request-level Unit of Work, not here: this
 layer only ``flush()``es, and the single commit happens at the request edge
@@ -37,14 +35,14 @@ from src.admin.users.repository import UserRepository
 from src.admin.users.schemas import UserCreate, UserUpdate
 from src.auth import perm_cache
 from src.auth.constants import SUPERADMIN_ROLE_CODE
-from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.auth.service import AuthenticatedUser, AuthService
 from src.config import get_settings
 from src.core.pagination import PageResult, page_result
 from src.core.query import BatchResult, ListQuery, resolve_sort
 from src.core.security import hash_password_async, password_strength_violations
 from src.db.models.identity import Department, Role, User
 from src.db.session import add_after_commit_hook
-from src.enums import ActiveStatus, DataScope, ErrorCode, UserStatus
+from src.enums import ActiveStatus, ErrorCode, UserStatus
 from src.exceptions import AppError
 
 UserDetail = tuple[User, list[int]]
@@ -65,19 +63,11 @@ class UserService:
         self.repo = UserRepository(session)
         self.auth = AuthService(session)
 
-    async def _scope(self, actor: AuthenticatedUser) -> DataScopeFilter:
-        return await self.auth.resolve_data_scope(actor)
-
-    async def _require_visible(
-        self, user_id: int, actor: AuthenticatedUser
-    ) -> User:
-        """Fetch a user the actor is allowed to see, else opaque 403."""
+    async def _require(self, user_id: int) -> User:
+        """Fetch a user by id, else 404."""
         user = await self.repo.get(user_id)
-        scope = await self._scope(actor)
-        if user is None or not self.repo.is_visible(
-            user, scope, actor_id=actor.user_id
-        ):
-            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
+        if user is None:
+            raise AppError(ErrorCode.request_invalid, status.HTTP_404_NOT_FOUND)
         return user
 
     async def _validate_department(self, department_id: int | None) -> None:
@@ -90,19 +80,6 @@ class UserService:
         )
         if await self.session.scalar(stmt) is None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
-
-    async def _require_department_in_scope(
-        self, department_id: int | None, actor: AuthenticatedUser
-    ) -> None:
-        """A non-unrestricted actor may only place a user in a department they
-        can see. ``department_id IS NULL`` (no department) is allowed only for
-        unrestricted/super-admin actors — a scoped actor cannot create users they
-        would then be unable to see or manage (no write-outside-scope hole)."""
-        scope = await self._scope(actor)
-        if scope.unrestricted:
-            return
-        if department_id is None or department_id not in scope.department_ids:
-            raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
     async def _validate_roles(self, role_ids: Sequence[int]) -> None:
         if not role_ids:
@@ -126,10 +103,8 @@ class UserService:
         self,
         role_ids: Sequence[int],
         actor: AuthenticatedUser,
-        *,
-        holder_department_id: int | None,
     ) -> None:
-        """Privilege-escalation guard for role assignment (three layers).
+        """Privilege-escalation guard for role assignment (two axes).
 
         Super-admin may assign anything; for everyone else a role is assignable
         only if it grants the actor no power the actor lacks along EVERY axis:
@@ -141,14 +116,6 @@ class UserService:
            check is blind to: ``is_superuser`` is *code*-based, so a ``superadmin``
            role with no menus confers an EMPTY perm set that trivially passes the
            subset test — yet assigning it would hand out full super-admin.
-        3. **Data-scope breadth** — the visibility the role would confer on the
-           eventual holder (resolved against ``holder_department_id``) must not
-           exceed the actor's own. ``all`` is refused outright; every other scope
-           is resolved to a concrete department set and required to fall within
-           the actor's visible set. A relative scope like ``dept_and_child`` is
-           NOT waved through: for the holder's department it can resolve to a
-           strictly broader subtree than the actor can see, which is the
-           escalation this guard closes.
         """
         if actor.is_superuser or not role_ids:
             return
@@ -159,96 +126,46 @@ class UserService:
         roles = await self.auth.roles_for_assignment(role_ids)
         if any(role.code == SUPERADMIN_ROLE_CODE for role in roles):
             raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
-        await self._require_roles_within_scope(
-            roles, actor, holder_department_id=holder_department_id
-        )
-
-    async def _require_roles_within_scope(
-        self,
-        roles: Sequence[Role],
-        actor: AuthenticatedUser,
-        *,
-        holder_department_id: int | None,
-    ) -> None:
-        """Reject assigning any role whose resolved scope exceeds the actor's own.
-
-        An unrestricted actor (super-admin or an ``all``-scope role) may assign
-        any scope. For a scoped actor, each role's effective visibility is
-        resolved against the eventual holder's department: ``all`` is broader than
-        the actor and refused; every other scope resolves to a concrete department
-        set (``self_only`` resolves to none) that must be a subset of the actor's
-        own. This is what makes ``dept_and_child`` safe ONLY when the holder's
-        subtree already lies inside the actor's scope — a ``dept_only`` actor
-        granting ``dept_and_child`` to a holder in its department is rejected
-        because the holder's subtree reaches child departments the actor cannot
-        see.
-        """
-        actor_scope = await self._scope(actor)
-        if actor_scope.unrestricted:
-            return
-        custom_dept_ids = await self.auth.role_department_ids(
-            [role.id for role in roles if role.data_scope == DataScope.custom.value]
-        )
-        for role in roles:
-            granted = await self.auth.resolve_role_scope(
-                DataScope(role.data_scope),
-                list(custom_dept_ids)
-                if role.data_scope == DataScope.custom.value
-                else [],
-                holder_department_id=holder_department_id,
-            )
-            if granted.unrestricted or not granted.department_ids.issubset(
-                actor_scope.department_ids
-            ):
-                raise AppError(ErrorCode.auth_forbidden, status.HTTP_403_FORBIDDEN)
 
     async def _require_dominance(
         self, target: User, actor: AuthenticatedUser
     ) -> None:
         """Reject acting on a target who outranks the actor (dominance guard).
 
-        Visibility (``_require_visible``) answers "may the actor SEE this user";
-        it does NOT answer "may the actor MANAGE this user". Without this guard a
-        scoped admin holding ``system:user:resetPwd/edit/remove`` could reset the
-        password of / disable / delete any *higher-privileged* user who merely
-        falls inside their data scope — e.g. a department admin resetting a
-        super-admin's password and taking the account over.
+        Without this guard an admin holding ``system:user:resetPwd/edit/remove``
+        could reset the password of / disable / delete any *higher-privileged*
+        user — e.g. resetting a super-admin's password and taking the account
+        over.
 
         The dominance test is exactly the assignment escalation test applied to
         the target's CURRENT roles: an actor may manage a target only if it could
-        (re)assign that target's role set itself. This reuses the same three-axis
-        guard (perm subset + ``superadmin`` marker + data-scope breadth), so a
-        target holding ``superadmin``, an ``all``-scope role, or any permission
-        the actor lacks is unmanageable. Super-admin actors and role-less targets
-        (zero conferred privilege) pass trivially.
+        (re)assign that target's role set itself. This reuses the same two-axis
+        guard (perm subset + ``superadmin`` marker), so a target holding
+        ``superadmin`` or any permission the actor lacks is unmanageable.
+        Super-admin actors and role-less targets (zero conferred privilege) pass
+        trivially.
         """
         if actor.is_superuser:
             return
         target_role_ids = await self.repo.list_role_ids(target.id)
-        await self._require_assignable_roles(
-            target_role_ids, actor, holder_department_id=target.department_id
-        )
+        await self._require_assignable_roles(target_role_ids, actor)
 
     async def _dominates_roles(
         self,
         role_ids: Sequence[int],
         actor: AuthenticatedUser,
-        *,
-        holder_department_id: int | None,
     ) -> bool:
         """Boolean form of :meth:`_require_dominance` for bulk pre-filtering.
 
-        Same three-axis test (perm subset + ``superadmin`` marker + scope breadth)
-        as the assignment guard, returning a verdict instead of raising — so a
-        batch can quietly *skip* targets the actor cannot manage rather than fail
-        the whole request. Super-admin and role-less targets dominate trivially.
+        Same two-axis test (perm subset + ``superadmin`` marker) as the
+        assignment guard, returning a verdict instead of raising — so a batch can
+        quietly *skip* targets the actor cannot manage rather than fail the whole
+        request. Super-admin and role-less targets dominate trivially.
         """
         if actor.is_superuser or not role_ids:
             return True
         try:
-            await self._require_assignable_roles(
-                role_ids, actor, holder_department_id=holder_department_id
-            )
+            await self._require_assignable_roles(role_ids, actor)
         except AppError:
             return False
         return True
@@ -291,14 +208,9 @@ class UserService:
         query: ListQuery | None = None,
     ) -> UserPage:
         query = query or ListQuery()
-        scope = await self._scope(actor)
         sort = resolve_sort(query, allowed=USER_SORT_COLUMNS, default="id")
-        total = await self.repo.count_in_scope(
-            scope, actor_id=actor.user_id, keyword=query.keyword
-        )
-        users = await self.repo.list_in_scope(
-            scope,
-            actor_id=actor.user_id,
+        total = await self.repo.count_users(keyword=query.keyword)
+        users = await self.repo.list_users(
             keyword=query.keyword,
             sort=sort,
             limit=query.limit,
@@ -310,7 +222,7 @@ class UserService:
         return page_result(items, total=total, limit=query.limit, offset=query.offset)
 
     async def get_user(self, user_id: int, actor: AuthenticatedUser) -> UserDetail:
-        return await self._detail(await self._require_visible(user_id, actor))
+        return await self._detail(await self._require(user_id))
 
     async def create_user(
         self, payload: UserCreate, actor: AuthenticatedUser
@@ -319,11 +231,8 @@ class UserService:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
         await self._require_unique_employee_no(payload.employee_no)
         await self._validate_department(payload.department_id)
-        await self._require_department_in_scope(payload.department_id, actor)
         await self._validate_roles(payload.role_ids)
-        await self._require_assignable_roles(
-            payload.role_ids, actor, holder_department_id=payload.department_id
-        )
+        await self._require_assignable_roles(payload.role_ids, actor)
         if payload.password is not None:
             self._require_password_strength(payload.password)
         password_hash = (
@@ -351,7 +260,7 @@ class UserService:
     async def update_user(
         self, user_id: int, payload: UserUpdate, actor: AuthenticatedUser
     ) -> UserDetail:
-        user = await self._require_visible(user_id, actor)
+        user = await self._require(user_id)
         await self._require_dominance(user, actor)
         values = payload.model_dump(
             exclude_unset=True, exclude={"role_ids", "password", "status"}
@@ -364,19 +273,12 @@ class UserService:
             values["status"] = payload.status.value
         if "department_id" in values:
             await self._validate_department(values["department_id"])
-            await self._require_department_in_scope(values["department_id"], actor)
         values["updated_by"] = actor.user_id
         await self.repo.update(user, **values)
 
         if payload.role_ids is not None:
             await self._validate_roles(payload.role_ids)
-            # Resolve the role guard against the holder's department AFTER this
-            # update — moving a user into a child dept while granting a relative
-            # scope would otherwise be evaluated against the stale old dept.
-            new_department_id = values.get("department_id", user.department_id)
-            await self._require_assignable_roles(
-                payload.role_ids, actor, holder_department_id=new_department_id
-            )
+            await self._require_assignable_roles(payload.role_ids, actor)
             await self.repo.replace_roles(user_id, payload.role_ids)
 
         # A role-binding or status change alters this user's cached permission
@@ -419,12 +321,11 @@ class UserService:
     ) -> None:
         """Admin-set a target user's password and force re-login everywhere.
 
-        Visibility-gated like every single-user mutation (an actor who cannot see
-        the target gets the same opaque 403). No old-password check — this is an
-        admin acting on the target's behalf. Strength is enforced server-side
-        (``auth_password_too_weak`` / 400 with machine-readable violation labels).
-        On success **all** of the target's sessions are revoked (B7), so any
-        session standing on the old credential dies immediately.
+        No old-password check — this is an admin acting on the target's behalf.
+        Strength is enforced server-side (``auth_password_too_weak`` / 400 with
+        machine-readable violation labels). On success **all** of the target's
+        sessions are revoked (B7), so any session standing on the old credential
+        dies immediately.
 
         Revocation is SYNCHRONOUS before commit (not an after-commit hook): the
         password write is flushed, then the Redis revoke runs inside the request's
@@ -432,7 +333,7 @@ class UserService:
         password write back — so a Redis blip can never leave "password reset in
         the DB but the target's old sessions still alive".
         """
-        user = await self._require_visible(user_id, actor)
+        user = await self._require(user_id)
         await self._require_dominance(user, actor)
         self._require_password_strength(new_password)
         user.password = await hash_password_async(new_password)
@@ -441,7 +342,7 @@ class UserService:
         await self.auth.sessions.revoke_all_sessions(user_id)
 
     async def delete_user(self, user_id: int, actor: AuthenticatedUser) -> None:
-        user = await self._require_visible(user_id, actor)
+        user = await self._require(user_id)
         await self._require_dominance(user, actor)
         await self.repo.replace_roles(user_id, [])
         user.updated_by = actor.user_id
@@ -463,9 +364,8 @@ class UserService:
         self, ids: Sequence[int], actor: AuthenticatedUser
     ) -> BatchResult:
         requested_ids = list(dict.fromkeys(ids))
-        scope = await self._scope(actor)
 
-        # Dominance pre-filter: a scoped actor may only delete targets it could
+        # Dominance pre-filter: an actor may only delete targets it could
         # (re)assign the roles of — same guard the single-user delete enforces,
         # applied in bulk so an outranking target is skipped, not silently swept
         # out with the rest. Super-admin dominates everything (skip the lookup).
@@ -473,23 +373,15 @@ class UserService:
         deletable_ids = requested_ids
         if not actor.is_superuser:
             role_map = await self.repo.list_role_ids_for_users(requested_ids)
-            dept_map = await self.repo.department_ids_for_users(requested_ids)
             deletable_ids = []
             for user_id in requested_ids:
-                if await self._dominates_roles(
-                    role_map.get(user_id, []),
-                    actor,
-                    holder_department_id=dept_map.get(user_id),
-                ):
+                if await self._dominates_roles(role_map.get(user_id, []), actor):
                     deletable_ids.append(user_id)
                 else:
                     dominance_skipped.append(user_id)
 
-        affected, scope_skipped_ids = await self.repo.soft_delete_many(
-            deletable_ids,
-            scope_predicate=self.repo._scope_predicate(scope, actor_id=actor.user_id),
-        )
-        skipped_ids = scope_skipped_ids + dominance_skipped
+        affected, base_skipped_ids = await self.repo.soft_delete_many(deletable_ids)
+        skipped_ids = base_skipped_ids + dominance_skipped
         skipped = set(skipped_ids)
         for user_id in requested_ids:
             if user_id not in skipped:

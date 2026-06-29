@@ -50,14 +50,14 @@ ACTOR = AuthenticatedUser(
     role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
 )
 
-# Holds catalog wildcard but is NOT superadmin and has no seeded roles, so
-# resolve_data_scope yields a restricted scope (unrestricted=False). Used to
-# prove model/deployment writes enforce scope (M3-1).
-RESTRICTED_ACTOR = AuthenticatedUser(
+# Holds a non-wildcard catalog perm (read-only) but NOT ``ai:catalog:*`` and is
+# not superadmin, so it fails the catalog-wildcard gate on every write. Used to
+# prove model/deployment writes require ``ai:catalog:*``.
+NO_WILDCARD_ACTOR = AuthenticatedUser(
     user_id=2000,
-    username="restricted",
+    username="readonly",
     department_id=20,
-    permissions=frozenset({"ai:catalog:*"}),
+    permissions=frozenset({"ai:catalog:list"}),
     role_codes=frozenset(),
 )
 
@@ -214,18 +214,18 @@ async def test_delete_channel_soft_deletes(admin_session: AsyncSession) -> None:
     assert exc.value.status_code == 404
 
 
-async def test_create_model_restricted_scope_forbidden(
+async def test_create_model_without_wildcard_forbidden(
     admin_session: AsyncSession,
 ) -> None:
     svc = CatalogService(admin_session)
 
     with pytest.raises(AppError) as exc:
-        await svc.create_model(_model_payload(), actor=RESTRICTED_ACTOR)
+        await svc.create_model(_model_payload(), actor=NO_WILDCARD_ACTOR)
 
     assert exc.value.status_code == 403
 
 
-async def test_update_model_restricted_scope_forbidden(
+async def test_update_model_without_wildcard_forbidden(
     admin_session: AsyncSession,
 ) -> None:
     svc = CatalogService(admin_session)
@@ -233,25 +233,25 @@ async def test_update_model_restricted_scope_forbidden(
 
     with pytest.raises(AppError) as exc:
         await svc.update_model(
-            model.id, LogicalModelUpdate(display_name="x"), actor=RESTRICTED_ACTOR
+            model.id, LogicalModelUpdate(display_name="x"), actor=NO_WILDCARD_ACTOR
         )
 
     assert exc.value.status_code == 403
 
 
-async def test_delete_model_restricted_scope_forbidden(
+async def test_delete_model_without_wildcard_forbidden(
     admin_session: AsyncSession,
 ) -> None:
     svc = CatalogService(admin_session)
     model = await svc.create_model(_model_payload(), actor=ACTOR)
 
     with pytest.raises(AppError) as exc:
-        await svc.delete_model(model.id, actor=RESTRICTED_ACTOR)
+        await svc.delete_model(model.id, actor=NO_WILDCARD_ACTOR)
 
     assert exc.value.status_code == 403
 
 
-async def test_create_deployment_restricted_scope_forbidden(
+async def test_create_deployment_without_wildcard_forbidden(
     admin_session: AsyncSession,
 ) -> None:
     svc = CatalogService(admin_session)
@@ -265,13 +265,13 @@ async def test_create_deployment_restricted_scope_forbidden(
                 channel_id=channel.id,
                 upstream_model="claude-3-5-sonnet",
             ),
-            actor=RESTRICTED_ACTOR,
+            actor=NO_WILDCARD_ACTOR,
         )
 
     assert exc.value.status_code == 403
 
 
-async def test_update_deployment_restricted_scope_forbidden(
+async def test_update_deployment_without_wildcard_forbidden(
     admin_session: AsyncSession,
 ) -> None:
     svc = CatalogService(admin_session)
@@ -290,13 +290,13 @@ async def test_update_deployment_restricted_scope_forbidden(
         await svc.update_deployment(
             deployment.id,
             ModelDeploymentUpdate(weight=5),
-            actor=RESTRICTED_ACTOR,
+            actor=NO_WILDCARD_ACTOR,
         )
 
     assert exc.value.status_code == 403
 
 
-async def test_delete_deployment_restricted_scope_forbidden(
+async def test_delete_deployment_without_wildcard_forbidden(
     admin_session: AsyncSession,
 ) -> None:
     svc = CatalogService(admin_session)
@@ -312,6 +312,6 @@ async def test_delete_deployment_restricted_scope_forbidden(
     )
 
     with pytest.raises(AppError) as exc:
-        await svc.delete_deployment(deployment.id, actor=RESTRICTED_ACTOR)
+        await svc.delete_deployment(deployment.id, actor=NO_WILDCARD_ACTOR)
 
     assert exc.value.status_code == 403

@@ -65,7 +65,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('api_key', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('api_key', 'created_at',
@@ -192,7 +192,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('channel_key', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('channel_key', 'created_at',
@@ -277,7 +277,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('logical_model', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('logical_model', 'created_at',
@@ -352,7 +352,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('model_deployment', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('model_deployment', 'created_at',
@@ -492,7 +492,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('quota', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('quota', 'created_at',
@@ -575,7 +575,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('rate_limit_rule', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('rate_limit_rule', 'created_at',
@@ -633,7 +633,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('sys_attach', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('sys_attach', 'created_at',
@@ -691,7 +691,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('sys_config', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('sys_config', 'created_at',
@@ -744,7 +744,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('sys_department', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('sys_department', 'created_at',
@@ -827,7 +827,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('sys_menu', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('sys_menu', 'created_at',
@@ -852,20 +852,10 @@ def upgrade() -> None:
                comment='状态 ActiveStatus',
                existing_comment='状态 ActiveStatus：active | disabled',
                existing_nullable=False)
-    op.alter_column('sys_role', 'data_scope',
-               existing_type=sa.VARCHAR(length=16),
-               comment='数据权限范围 DataScope',
-               existing_comment='数据权限范围 DataScope：all=全部 | custom=自定义(关联 sys_role_dept) | dept=本部门 | dept_and_child=本部门及子 | self=仅本人 | dept_and_child_or_self=部门子树+本人',
-               existing_nullable=False)
     op.alter_column('sys_role', 'menu_check_strictly',
                existing_type=sa.BOOLEAN(),
                comment='菜单树父子勾选是否严格关联',
                existing_comment='菜单树父子勾选是否严格关联（纯前端 UI 行为）',
-               existing_nullable=False)
-    op.alter_column('sys_role', 'dept_check_strictly',
-               existing_type=sa.BOOLEAN(),
-               comment='部门树父子勾选是否严格关联',
-               existing_comment='部门树父子勾选是否严格关联（纯前端 UI 行为）',
                existing_nullable=False)
     op.alter_column('sys_role', 'remark',
                existing_type=sa.VARCHAR(length=255),
@@ -890,7 +880,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('sys_role', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('sys_role', 'created_at',
@@ -908,18 +898,6 @@ def upgrade() -> None:
                existing_type=postgresql.TIMESTAMP(timezone=True),
                comment='最后更新时间',
                existing_comment='最后更新时间（timestamptz，UTC，更新时自动刷新）',
-               existing_nullable=False,
-               existing_server_default=sa.text('now()'))
-    op.alter_column('sys_role_dept', 'id',
-               existing_type=sa.BIGINT(),
-               comment='雪花 ID 主键',
-               existing_comment='主键：雪花 ID，应用层分配（非自增）',
-               existing_nullable=False,
-               autoincrement=False)
-    op.alter_column('sys_role_dept', 'created_at',
-               existing_type=postgresql.TIMESTAMP(timezone=True),
-               comment='创建时间',
-               existing_comment='创建时间（timestamptz，UTC，由数据库 now() 生成）',
                existing_nullable=False,
                existing_server_default=sa.text('now()'))
     op.alter_column('sys_role_menu', 'id',
@@ -998,7 +976,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('sys_user', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('sys_user', 'created_at',
@@ -1066,7 +1044,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('sys_user_oauth', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('sys_user_oauth', 'created_at',
@@ -1146,7 +1124,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('upstream_channel', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('upstream_channel', 'created_at',
@@ -1236,7 +1214,7 @@ def upgrade() -> None:
                existing_nullable=True)
     op.alter_column('user_model_grant', 'create_dept',
                existing_type=sa.BIGINT(),
-               comment='创建部门 sys_department.id（数据权限过滤用）',
+               comment='创建部门 sys_department.id（审计留痕，非数据权限过滤）',
                existing_comment='创建部门 sys_department.id（逻辑引用），用于数据权限过滤',
                existing_nullable=True)
     op.alter_column('user_model_grant', 'created_at',
@@ -1591,18 +1569,6 @@ def downgrade() -> None:
                existing_comment='雪花 ID 主键',
                existing_nullable=False,
                autoincrement=False)
-    op.alter_column('sys_role_dept', 'created_at',
-               existing_type=postgresql.TIMESTAMP(timezone=True),
-               comment='创建时间（timestamptz，UTC，由数据库 now() 生成）',
-               existing_comment='创建时间',
-               existing_nullable=False,
-               existing_server_default=sa.text('now()'))
-    op.alter_column('sys_role_dept', 'id',
-               existing_type=sa.BIGINT(),
-               comment='主键：雪花 ID，应用层分配（非自增）',
-               existing_comment='雪花 ID 主键',
-               existing_nullable=False,
-               autoincrement=False)
     op.alter_column('sys_role', 'updated_at',
                existing_type=postgresql.TIMESTAMP(timezone=True),
                comment='最后更新时间（timestamptz，UTC，更新时自动刷新）',
@@ -1645,20 +1611,10 @@ def downgrade() -> None:
                existing_type=sa.VARCHAR(length=255),
                comment='备注',
                existing_nullable=True)
-    op.alter_column('sys_role', 'dept_check_strictly',
-               existing_type=sa.BOOLEAN(),
-               comment='部门树父子勾选是否严格关联（纯前端 UI 行为）',
-               existing_comment='部门树父子勾选是否严格关联',
-               existing_nullable=False)
     op.alter_column('sys_role', 'menu_check_strictly',
                existing_type=sa.BOOLEAN(),
                comment='菜单树父子勾选是否严格关联（纯前端 UI 行为）',
                existing_comment='菜单树父子勾选是否严格关联',
-               existing_nullable=False)
-    op.alter_column('sys_role', 'data_scope',
-               existing_type=sa.VARCHAR(length=16),
-               comment='数据权限范围 DataScope：all=全部 | custom=自定义(关联 sys_role_dept) | dept=本部门 | dept_and_child=本部门及子 | self=仅本人 | dept_and_child_or_self=部门子树+本人',
-               existing_comment='数据权限范围 DataScope',
                existing_nullable=False)
     op.alter_column('sys_role', 'status',
                existing_type=sa.VARCHAR(length=16),

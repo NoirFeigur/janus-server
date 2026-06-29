@@ -28,7 +28,7 @@ from src.core.security import hash_password
 from src.db.base import Base
 from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
-from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
+from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
 from src.db.session import get_session, unit_of_work
 from src.main import create_app
 
@@ -36,7 +36,7 @@ pytestmark = pytest.mark.asyncio
 
 _TABLES = [
     Base.metadata.tables[m.__tablename__]
-    for m in (User, Department, Role, Menu, UserRole, RoleMenu, RoleDept, ApiKey, LoginLog)
+    for m in (User, Department, Role, Menu, UserRole, RoleMenu, ApiKey, LoginLog)
 ]
 
 

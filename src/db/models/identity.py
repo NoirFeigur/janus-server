@@ -2,7 +2,7 @@
 
 Two orthogonal permission axes live here:
 - Identity: ``User`` / ``Department`` / ``UserOAuth`` — who the principal is.
-- RBAC: ``Role`` / ``Menu`` + 3 link tables — admin-console operation rights.
+- RBAC: ``Role`` / ``Menu`` + 2 link tables — admin-console operation rights.
 
 AI-resource consumption rights (``UserModelGrant``) are a *separate* axis and
 live in ``grant.py``.
@@ -209,7 +209,7 @@ class UserOAuth(BaseEntity):
 
 
 class Role(BaseEntity):
-    """Admin-console role with orthogonal data-scope (§1.5.1)."""
+    """Admin-console role: a named bundle of menu/operation permissions (§1.5.1)."""
 
     __tablename__ = "sys_role"
     __table_args__ = (
@@ -219,7 +219,7 @@ class Role(BaseEntity):
             unique=True,
             postgresql_where=text("is_deleted = false"),
         ),
-        {"comment": "系统角色：后台角色 + 正交数据权限范围"},
+        {"comment": "系统角色：后台角色（菜单/操作权限集合）"},
     )
 
     name: Mapped[str] = mapped_column(
@@ -237,19 +237,9 @@ class Role(BaseEntity):
         comment="状态 ActiveStatus",
     )
 
-    # Data-permission scope (orthogonal axis) — RuoYi 6-tier.
-    data_scope: Mapped[str] = mapped_column(
-        String(16),
-        default="self",
-        comment="数据权限范围 DataScope",
-    )
-
-    # Frontend tree-checkbox linkage toggles (pure UI behavior).
+    # Frontend tree-checkbox linkage toggle (pure UI behavior).
     menu_check_strictly: Mapped[bool] = mapped_column(
         default=True, comment="菜单树父子勾选是否严格关联"
-    )
-    dept_check_strictly: Mapped[bool] = mapped_column(
-        default=True, comment="部门树父子勾选是否严格关联"
     )
 
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -342,27 +332,4 @@ class RoleMenu(LinkEntity):
     )
     menu_id: Mapped[int] = mapped_column(
         BigInteger, index=True, comment="菜单 sys_menu.id"
-    )
-
-
-class RoleDept(LinkEntity):
-    """Role <-> Department, only for data_scope=custom (§1.5.5).
-
-    Column named ``dept_id`` (not ``department_id``) by deliberate exception:
-    RBAC data-scope terminology follows RuoYi convention (§1.5 naming note).
-    """
-
-    __tablename__ = "sys_role_dept"
-    __table_args__ = (
-        UniqueConstraint("role_id", "dept_id", name="uq_role_dept"),
-        {"comment": "角色-部门关联表（仅 data_scope=custom 时使用）"},
-    )
-
-    role_id: Mapped[int] = mapped_column(
-        BigInteger, index=True, comment="角色 sys_role.id"
-    )
-    dept_id: Mapped[int] = mapped_column(
-        BigInteger,
-        index=True,
-        comment="部门 sys_department.id（RuoYi 风格短名）",
     )

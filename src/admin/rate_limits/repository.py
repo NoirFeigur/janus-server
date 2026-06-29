@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -11,7 +11,6 @@ from src.core.query import ListQuery, resolve_sort
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Department, User
 from src.db.models.rate_limit import RateLimitRule
-from src.db.scope import DataScope
 
 SORT_COLUMNS = {
     "id": RateLimitRule.id,
@@ -27,52 +26,17 @@ class RateLimitRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    def _scope_predicate(
-        self, scope_filter: DataScope, *, actor_id: int, include_global: bool
-    ) -> ColumnElement[bool] | None:
-        if scope_filter.unrestricted:
-            if include_global:
-                return None
-            return RateLimitRule.subject_type != "global"
+    def _global_predicate(self, *, include_global: bool) -> ColumnElement[bool] | None:
+        """Platform-level ``global`` rate-limit rules are superuser-only.
 
-        clauses: list[ColumnElement[bool]] = []
+        ``include_global`` is set iff the actor is a superuser. Non-superuser
+        admins manage every department/user/api_key rule but never the
+        platform-level ``global`` rows (write/get paths already gate global on
+        is_superuser; this closes the list-path leak).
+        """
         if include_global:
-            clauses.append(RateLimitRule.subject_type == "global")
-        if scope_filter.department_ids:
-            visible_users = select(User.id).where(
-                User.is_deleted == False,  # noqa: E712
-                User.department_id.in_(scope_filter.department_ids),
-            )
-            visible_keys = select(ApiKey.id).where(
-                ApiKey.is_deleted == False,  # noqa: E712
-                ApiKey.user_id.in_(visible_users),
-            )
-            clauses.extend(
-                [
-                    (RateLimitRule.subject_type == "department")
-                    & RateLimitRule.subject_id.in_(scope_filter.department_ids),
-                    (RateLimitRule.subject_type == "user")
-                    & RateLimitRule.subject_id.in_(visible_users),
-                    (RateLimitRule.subject_type == "api_key")
-                    & RateLimitRule.subject_id.in_(visible_keys),
-                ]
-            )
-        if scope_filter.include_self:
-            own_keys = select(ApiKey.id).where(
-                ApiKey.is_deleted == False,  # noqa: E712
-                ApiKey.user_id == actor_id,
-            )
-            clauses.extend(
-                [
-                    (RateLimitRule.subject_type == "user")
-                    & (RateLimitRule.subject_id == actor_id),
-                    (RateLimitRule.subject_type == "api_key")
-                    & RateLimitRule.subject_id.in_(own_keys),
-                ]
-            )
-        if not clauses:
-            return RateLimitRule.id == -1
-        return or_(*clauses)
+            return None
+        return RateLimitRule.subject_type != "global"
 
     def _filters(
         self,
@@ -81,17 +45,12 @@ class RateLimitRepository:
         subject_id: int | None,
         logical_model_id: int | None,
         status: str | None,
-        scope_filter: DataScope | None = None,
-        actor_id: int | None = None,
         include_global: bool = False,
     ) -> list[ColumnElement[bool]]:
         filters: list[ColumnElement[bool]] = [RateLimitRule.is_deleted == False]  # noqa: E712
-        if scope_filter is not None and actor_id is not None:
-            predicate = self._scope_predicate(
-                scope_filter, actor_id=actor_id, include_global=include_global
-            )
-            if predicate is not None:
-                filters.append(predicate)
+        predicate = self._global_predicate(include_global=include_global)
+        if predicate is not None:
+            filters.append(predicate)
         if subject_type is not None:
             filters.append(RateLimitRule.subject_type == subject_type)
         if subject_id is not None:
@@ -110,8 +69,6 @@ class RateLimitRepository:
         subject_id: int | None = None,
         logical_model_id: int | None = None,
         status: str | None = None,
-        scope_filter: DataScope | None = None,
-        actor_id: int | None = None,
         include_global: bool = False,
     ) -> PageResult[RateLimitRule]:
         filters = self._filters(
@@ -119,8 +76,6 @@ class RateLimitRepository:
             subject_id=subject_id,
             logical_model_id=logical_model_id,
             status=status,
-            scope_filter=scope_filter,
-            actor_id=actor_id,
             include_global=include_global,
         )
         stmt = select(RateLimitRule)
@@ -170,56 +125,6 @@ class RateLimitRepository:
             ApiKey.id == key_id, ApiKey.is_deleted == False  # noqa: E712
         )
         return await self.session.scalar(stmt) is not None
-
-    async def subject_in_scope(
-        self,
-        *,
-        subject_type: str,
-        subject_id: int | None,
-        scope_filter: DataScope,
-        actor_id: int,
-    ) -> bool:
-        if subject_type == "global":
-            return False
-        if scope_filter.unrestricted:
-            return True
-        if subject_id is None:
-            return False
-        if subject_type == "department":
-            return subject_id in scope_filter.department_ids
-        if subject_type == "user":
-            clauses: list[ColumnElement[bool]] = []
-            if scope_filter.department_ids:
-                clauses.append(User.department_id.in_(scope_filter.department_ids))
-            if scope_filter.include_self:
-                clauses.append(User.id == actor_id)
-            if not clauses:
-                return False
-            stmt = select(User.id).where(
-                User.id == subject_id,
-                User.is_deleted == False,  # noqa: E712
-                or_(*clauses),
-            )
-            return await self.session.scalar(stmt) is not None
-        if subject_type == "api_key":
-            clauses = []
-            if scope_filter.department_ids:
-                owner_ids = select(User.id).where(
-                    User.is_deleted == False,  # noqa: E712
-                    User.department_id.in_(scope_filter.department_ids),
-                )
-                clauses.append(ApiKey.user_id.in_(owner_ids))
-            if scope_filter.include_self:
-                clauses.append(ApiKey.user_id == actor_id)
-            if not clauses:
-                return False
-            stmt = select(ApiKey.id).where(
-                ApiKey.id == subject_id,
-                ApiKey.is_deleted == False,  # noqa: E712
-                or_(*clauses),
-            )
-            return await self.session.scalar(stmt) is not None
-        return False
 
     async def create(self, rule: RateLimitRule) -> RateLimitRule:
         self.session.add(rule)

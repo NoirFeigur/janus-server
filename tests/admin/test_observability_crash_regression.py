@@ -43,11 +43,11 @@ SUPER_ACTOR = AuthenticatedUser(
     role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
 )
 
-# No roles → resolve_data_scope yields self-only (include_self, no dept). Sees
-# only its own gateway logs (M3-3).
-SELF_ONLY_ACTOR = AuthenticatedUser(
+# A non-super actor with the observability list perm. Data-scope filtering was
+# removed, so this actor now sees every user's logs (endpoints are perm-gated).
+NON_SUPER_ACTOR = AuthenticatedUser(
     user_id=2,
-    username="restricted",
+    username="ops",
     department_id=20,
     permissions=frozenset({"ai:observability:list"}),
     role_codes=frozenset(),
@@ -120,23 +120,23 @@ async def test_list_logs_honours_desc_sort(db_session: AsyncSession) -> None:
     assert desc_ids == sorted(desc_ids, reverse=True)
 
 
-async def test_list_logs_restricted_actor_sees_only_own(
+async def test_list_logs_non_super_actor_sees_all(
     db_session: AsyncSession,
 ) -> None:
-    """M3-3: a self-only actor must not see other users' gateway logs."""
+    """Data-scope filtering was removed: a non-super actor sees every log."""
     service = ObservabilityService(db_session)
-    _seed(db_session, "mine", user_id=SELF_ONLY_ACTOR.user_id)
+    _seed(db_session, "mine", user_id=NON_SUPER_ACTOR.user_id)
     _seed(db_session, "theirs", user_id=999)
     await db_session.flush()
 
-    result = await service.list_logs(ListQuery(), actor=SELF_ONLY_ACTOR)
+    result = await service.list_logs(ListQuery(), actor=NON_SUPER_ACTOR)
 
-    assert result.total == 1
-    assert [r.request_id for r in result.items] == ["mine"]
+    assert result.total == 2
+    assert {r.request_id for r in result.items} == {"mine", "theirs"}
 
 
 async def test_list_logs_superadmin_sees_all(db_session: AsyncSession) -> None:
-    """M3-3: an unrestricted actor still sees every user's logs."""
+    """A superadmin actor still sees every user's logs."""
     service = ObservabilityService(db_session)
     _seed(db_session, "u1", user_id=1)
     _seed(db_session, "u2", user_id=999)
@@ -147,28 +147,28 @@ async def test_list_logs_superadmin_sees_all(db_session: AsyncSession) -> None:
     assert result.total == 2
 
 
-async def test_get_log_by_request_id_restricted_actor_cannot_read_others(
+async def test_get_log_by_request_id_non_super_actor_reads_others(
     db_session: AsyncSession,
 ) -> None:
-    """M3-3: detail lookup must also enforce scope (no cross-user read)."""
+    """Data-scope filtering was removed: detail lookup is no longer scoped."""
     service = ObservabilityService(db_session)
     _seed(db_session, "theirs", user_id=999)
     await db_session.flush()
 
-    log = await service.get_log_by_request_id("theirs", actor=SELF_ONLY_ACTOR)
+    log = await service.get_log_by_request_id("theirs", actor=NON_SUPER_ACTOR)
 
-    assert log is None
+    assert log is not None
 
 
-async def test_get_log_by_request_id_restricted_actor_reads_own(
+async def test_get_log_by_request_id_non_super_actor_reads_own(
     db_session: AsyncSession,
 ) -> None:
-    """M3-3: detail lookup returns the actor's own log."""
+    """Detail lookup returns the actor's own log."""
     service = ObservabilityService(db_session)
-    _seed(db_session, "mine", user_id=SELF_ONLY_ACTOR.user_id)
+    _seed(db_session, "mine", user_id=NON_SUPER_ACTOR.user_id)
     await db_session.flush()
 
-    log = await service.get_log_by_request_id("mine", actor=SELF_ONLY_ACTOR)
+    log = await service.get_log_by_request_id("mine", actor=NON_SUPER_ACTOR)
 
     assert log is not None
     assert log.request_id == "mine"

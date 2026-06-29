@@ -11,7 +11,6 @@ from src.auth.constants import SUPERADMIN_ROLE_CODE
 from src.auth.service import AuthenticatedUser
 from src.core.query import ListQuery
 from src.db.models.identity import Role, User, UserRole
-from src.enums import DataScope
 from src.exceptions import AppError
 
 pytestmark = pytest.mark.asyncio
@@ -24,9 +23,9 @@ ACTOR = AuthenticatedUser(
     role_codes=frozenset({SUPERADMIN_ROLE_CODE}),
 )
 
-# Unrestricted data scope (via an all_data role) but NOT superadmin and WITHOUT
-# the dedicated ai:credential:issue grant. Passes _require_owner_in_scope for any
-# target user, so it isolates the M3-2 cross-user issuance gate.
+# A non-superadmin actor WITHOUT the dedicated ai:credential:issue grant, used to
+# isolate the cross-user issuance gate (M3-2): it may mint its OWN key but must
+# not mint for another user.
 UNRESTRICTED_NON_SUPER = AuthenticatedUser(
     user_id=2000,
     username="scoped-admin",
@@ -66,14 +65,13 @@ async def _seed_users(session: AsyncSession) -> None:
 
 
 async def _seed_unrestricted_role(session: AsyncSession, *, user_id: int) -> None:
-    """Give ``user_id`` an active all_data role (unrestricted, non-superadmin)."""
+    """Give ``user_id`` an active role (non-superadmin)."""
     session.add(
         Role(
             id=900,
             name="平台管理员",
             code="platform_admin",
             status="active",
-            data_scope=DataScope.all_data.value,
         )
     )
     session.add(
@@ -154,8 +152,7 @@ async def test_delete_key_soft_deletes(admin_session: AsyncSession) -> None:
 async def test_create_key_for_other_user_without_issue_perm_forbidden(
     admin_session: AsyncSession,
 ) -> None:
-    # Actor has unrestricted scope (all_data role) so it passes the owner-in-scope
-    # check, but is neither superadmin nor holds ai:credential:issue. Minting a key
+    # Actor is neither superadmin nor holds ai:credential:issue. Minting a key
     # for another user (alice, id=1) must be rejected (M3-2).
     await _seed_users(admin_session)
     await _seed_unrestricted_role(admin_session, user_id=UNRESTRICTED_NON_SUPER.user_id)
@@ -172,8 +169,7 @@ async def test_create_key_for_other_user_without_issue_perm_forbidden(
 async def test_create_key_for_self_allowed_without_issue_perm(
     admin_session: AsyncSession,
 ) -> None:
-    # Issuing one's OWN key needs no dedicated grant — only the base add perm and
-    # in-scope ownership (self is always in scope here via all_data).
+    # Issuing one's OWN key needs no dedicated grant — only the base add perm.
     await _seed_unrestricted_role(admin_session, user_id=UNRESTRICTED_NON_SUPER.user_id)
     svc = CredentialService(admin_session)
 

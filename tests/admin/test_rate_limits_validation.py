@@ -13,7 +13,6 @@ rule against a non-existent subject. These tests pin the hardened contract:
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -23,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from src.admin.rate_limits.schemas import RateLimitRuleCreate, RateLimitRuleUpdate
 from src.admin.rate_limits.service import RateLimitService
 from src.auth.constants import SUPERADMIN_ROLE_CODE
-from src.auth.service import AuthenticatedUser, DataScopeFilter
+from src.auth.service import AuthenticatedUser
 from src.core.query import ListQuery
 from src.db.base import Base
 from src.db.models.credential import ApiKey
@@ -54,18 +53,6 @@ SCOPED_ACTOR = AuthenticatedUser(
     permissions=frozenset({"ai:rate_limit:add"}),
     role_codes=frozenset(),
 )
-
-
-def _scoped_service(session: AsyncSession) -> RateLimitService:
-    service = RateLimitService(session)
-    service.auth.resolve_data_scope = AsyncMock(
-        return_value=DataScopeFilter(
-            unrestricted=False,
-            department_ids=frozenset({20}),
-            include_self=True,
-        )
-    )
-    return service
 
 
 @pytest_asyncio.fixture
@@ -210,25 +197,28 @@ async def test_api_key_rule_existing_subject_created(
 
 
 @pytest.mark.asyncio
-async def test_scoped_actor_cannot_create_out_of_scope_user_rule(
+async def test_non_super_actor_can_create_scoped_user_rule(
     db_session: AsyncSession,
 ) -> None:
+    """Data-scope filtering was removed: a non-super actor may create a rule for
+    any existing user subject (only ``global`` rules stay superuser-only)."""
     await _seed_subjects(db_session)
     db_session.add(User(id=2, username="bob", employee_no="E002", department_id=99))
     await db_session.flush()
-    service = _scoped_service(db_session)
+    service = RateLimitService(db_session)
     payload = RateLimitRuleCreate(subject_type="user", subject_id=2, rpm_limit=60)
 
-    with pytest.raises(AppError) as exc:
-        await service.create_rule(payload, actor=SCOPED_ACTOR)
+    rule = await service.create_rule(payload, actor=SCOPED_ACTOR)
 
-    assert exc.value.status_code == 403
+    assert rule.subject_type == "user"
+    assert rule.subject_id == 2
 
 
 @pytest.mark.asyncio
-async def test_scoped_actor_lists_only_visible_rate_limit_rules(
+async def test_non_super_actor_lists_all_non_global_rules(
     db_session: AsyncSession,
 ) -> None:
+    """A non-super actor sees every non-``global`` rule (global stays hidden)."""
     await _seed_subjects(db_session)
     db_session.add(User(id=2, username="bob", employee_no="E002", department_id=99))
     db_session.add_all(
@@ -239,17 +229,19 @@ async def test_scoped_actor_lists_only_visible_rate_limit_rules(
         ]
     )
     await db_session.flush()
-    service = _scoped_service(db_session)
+    service = RateLimitService(db_session)
 
     page = await service.list_rules(ListQuery(limit=50), actor=SCOPED_ACTOR)
 
-    assert [rule.subject_id for rule in page.items] == [2000]
+    assert sorted(rule.subject_id for rule in page.items) == [2, 2000]
 
 
 @pytest.mark.asyncio
-async def test_scoped_actor_cannot_update_out_of_scope_api_key_rule(
+async def test_non_super_actor_can_update_non_global_rule(
     db_session: AsyncSession,
 ) -> None:
+    """Data-scope filtering was removed: a non-super actor may update any
+    non-``global`` rule."""
     await _seed_subjects(db_session)
     db_session.add(User(id=2, username="bob", employee_no="E002", department_id=99))
     db_session.add(
@@ -265,9 +257,10 @@ async def test_scoped_actor_cannot_update_out_of_scope_api_key_rule(
     rule = RateLimitRule(subject_type="api_key", subject_id=101, rpm_limit=10)
     db_session.add(rule)
     await db_session.flush()
-    service = _scoped_service(db_session)
+    service = RateLimitService(db_session)
 
-    with pytest.raises(AppError) as exc:
-        await service.update_rule(rule.id, RateLimitRuleUpdate(rpm_limit=20), actor=SCOPED_ACTOR)
+    updated = await service.update_rule(
+        rule.id, RateLimitRuleUpdate(rpm_limit=20), actor=SCOPED_ACTOR
+    )
 
-    assert exc.value.status_code == 403
+    assert updated.rpm_limit == 20

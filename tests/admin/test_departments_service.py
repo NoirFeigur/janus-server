@@ -6,10 +6,6 @@ honest, measurable coverage of the service body (the ``ASGITransport`` route
 path corrupts coverage.py's C tracer on CPython 3.11) and pin branch invariants:
 parent-exists validation, the delete guards (active children / members), and the
 reparent cycle guard's multi-hop ancestor walk.
-
-The ``fake_redis`` autouse fixture (conftest) backs ``invalidate_department_tree``
-so the post-commit cache invalidation each mutation performs hits the in-process
-double, not the shared Redis instance.
 """
 
 from __future__ import annotations
@@ -74,9 +70,8 @@ async def test_get_department_not_found_raises(admin_session: AsyncSession) -> N
     svc = DepartmentService(admin_session)
     with pytest.raises(AppError) as exc:
         await svc.get_department(123456, actor=ACTOR)
-    # Missing department → opaque 403 (no exists-but-hidden oracle; same as the
-    # user surface). The scope guard fires before any 404 path.
-    assert exc.value.status_code == 403
+    # Missing department → 404.
+    assert exc.value.status_code == 404
 
 
 async def test_update_department_name(admin_session: AsyncSession) -> None:
@@ -96,8 +91,8 @@ async def test_update_department_not_found_raises(
         await svc.update_department(
             555555, DepartmentUpdate(name="X"), actor=ACTOR
         )
-    # Missing department → opaque 403 (scope guard fires before the 404 path).
-    assert exc.value.status_code == 403
+    # Missing department → 404.
+    assert exc.value.status_code == 404
 
 
 async def test_reparent_to_valid_parent(admin_session: AsyncSession) -> None:
@@ -193,8 +188,8 @@ async def test_delete_department_not_found_raises(
     svc = DepartmentService(admin_session)
     with pytest.raises(AppError) as exc:
         await svc.delete_department(777777, actor=ACTOR)
-    # Missing department → opaque 403 (scope guard fires before the 404 path).
-    assert exc.value.status_code == 403
+    # Missing department → 404.
+    assert exc.value.status_code == 404
 
 
 async def test_delete_department_with_child_blocked(
@@ -240,26 +235,6 @@ async def test_list_keyword_no_match_returns_empty(
     await svc.create_department(DepartmentCreate(name="Engineering"), actor=ACTOR)
     result = await svc.list_departments(ACTOR, keyword="zzzzz")
     assert len(result) == 0
-
-
-async def test_batch_delete_skips_out_of_scope(admin_session: AsyncSession) -> None:
-    """Batch delete skips departments not in the actor's data scope."""
-    svc = DepartmentService(admin_session)
-    dept = await svc.create_department(DepartmentCreate(name="Dept"), actor=ACTOR)
-    await admin_session.commit()
-
-    # Scoped actor whose department_ids does NOT include dept.id → skip.
-    scoped_actor = AuthenticatedUser(
-        user_id=2000,
-        username="scoped",
-        department_id=9999,
-        permissions=frozenset({"system:dept:remove"}),
-        role_codes=frozenset(),
-    )
-    # The actor has scope=self (not unrestricted) and dept.id is not in their depts.
-    result = await svc.batch_delete_departments([dept.id], actor=scoped_actor)
-    assert result.affected == 0
-    assert len(result.skipped_ids) == 1
 
 
 async def test_batch_delete_skips_with_children(admin_session: AsyncSession) -> None:

@@ -4,8 +4,8 @@ Drives the service with a plain ``await`` against an in-memory SQLite session.
 Route tests (``test_users.py``) prove behaviour end-to-end; these give honest,
 measurable coverage of the service body (the ``ASGITransport`` route path
 corrupts coverage.py's C tracer on CPython 3.11) and pin branch invariants:
-the uniqueness guards, data-scope visibility on mutation, the
-department-in-scope rule, and the privilege-escalation guard on role assignment.
+the uniqueness guards, the active-role assignment gate, and the two-axis
+privilege-escalation / dominance guards on role assignment.
 """
 
 from __future__ import annotations
@@ -46,17 +46,6 @@ def _scoped_actor(user_id: int, *, dept: int | None, perms: set[str]) -> Authent
         department_id=dept,
         permissions=frozenset(perms),
     )
-
-
-async def _seed_dept_scoped_role(
-    session: AsyncSession, actor_id: int, *, code: str
-) -> None:
-    """Give ``actor_id`` a ``dept``-scope role so resolve_data_scope restricts them."""
-    role = Role(name=code, code=code, data_scope="dept", status="active")
-    session.add(role)
-    await session.flush()
-    session.add(UserRole(user_id=actor_id, role_id=role.id))
-    await session.commit()
 
 
 async def test_create_user_hashes_password(admin_session: AsyncSession) -> None:
@@ -166,7 +155,7 @@ async def test_create_user_unknown_role_rejected(admin_session: AsyncSession) ->
 
 
 async def test_create_user_with_roles(admin_session: AsyncSession) -> None:
-    role = Role(name="member", code="member", data_scope="self", status="active")
+    role = Role(name="member", code="member", status="active")
     admin_session.add(role)
     await admin_session.commit()
     svc = UserService(admin_session)
@@ -183,7 +172,7 @@ async def test_create_user_disabled_role_rejected(
     """M3-6: assigning a *disabled* role is rejected (400). A disabled role
     confers nothing now but would silently re-activate its grants the moment an
     admin re-enables it — only an active role is a valid assignment target."""
-    role = Role(name="dis", code="dis-role", data_scope="self", status="disabled")
+    role = Role(name="dis", code="dis-role", status="disabled")
     admin_session.add(role)
     await admin_session.commit()
     svc = UserService(admin_session)
@@ -204,8 +193,8 @@ async def test_update_user_assign_disabled_role_rejected(
     admin_session: AsyncSession,
 ) -> None:
     """M3-6: the same active-role gate applies on update_user role replacement."""
-    active = Role(name="act", code="act-role", data_scope="self", status="active")
-    disabled = Role(name="dis2", code="dis-role2", data_scope="self", status="disabled")
+    active = Role(name="act", code="act-role", status="active")
+    disabled = Role(name="dis2", code="dis-role2", status="disabled")
     admin_session.add_all([active, disabled])
     await admin_session.commit()
     svc = UserService(admin_session)
@@ -218,11 +207,11 @@ async def test_update_user_assign_disabled_role_rejected(
     assert exc.value.status_code == 400
 
 
-async def test_get_user_not_visible_raises(admin_session: AsyncSession) -> None:
+async def test_get_user_not_found_raises(admin_session: AsyncSession) -> None:
     svc = UserService(admin_session)
     with pytest.raises(AppError) as exc:
         await svc.get_user(999999, _superuser())
-    assert exc.value.status_code == 403  # opaque: no exists-but-hidden oracle
+    assert exc.value.status_code == 404
 
 
 async def test_update_user_status_and_password(admin_session: AsyncSession) -> None:
@@ -240,8 +229,8 @@ async def test_update_user_status_and_password(admin_session: AsyncSession) -> N
 
 
 async def test_update_user_replaces_roles(admin_session: AsyncSession) -> None:
-    r1 = Role(name="r1", code="ru1", data_scope="self", status="active")
-    r2 = Role(name="r2", code="ru2", data_scope="self", status="active")
+    r1 = Role(name="r1", code="ru1", status="active")
+    r2 = Role(name="r2", code="ru2", status="active")
     admin_session.add_all([r1, r2])
     await admin_session.commit()
     svc = UserService(admin_session)
@@ -271,7 +260,7 @@ async def test_update_user_change_department(admin_session: AsyncSession) -> Non
 async def test_delete_user_soft_deletes_and_clears_roles(
     admin_session: AsyncSession,
 ) -> None:
-    role = Role(name="d", code="del-role", data_scope="self", status="active")
+    role = Role(name="d", code="del-role", status="active")
     admin_session.add(role)
     await admin_session.commit()
     svc = UserService(admin_session)
@@ -281,7 +270,7 @@ async def test_delete_user_soft_deletes_and_clears_roles(
     )
     await svc.delete_user(user.id, _superuser())
 
-    # Soft-deleted → no longer visible.
+    # Soft-deleted → no longer fetchable.
     with pytest.raises(AppError):
         await svc.get_user(user.id, _superuser())
     # Role links cleared.
@@ -291,71 +280,20 @@ async def test_delete_user_soft_deletes_and_clears_roles(
     assert links.all() == []
 
 
-async def test_scoped_actor_cannot_see_out_of_scope_user(
-    admin_session: AsyncSession,
-) -> None:
-    admin_session.add_all(
-        [
-            Department(id=500, name="d500", parent_id=None),
-            User(id=51, username="in500", employee_no="E-51", department_id=500),
-        ]
-    )
-    await admin_session.commit()
-    # Actor scoped to dept 999 (not 500) → target invisible → opaque 403.
-    await _seed_dept_scoped_role(admin_session, 42, code="scope999")
-    actor = _scoped_actor(42, dept=999, perms={"system:user:edit"})
-    svc = UserService(admin_session)
-    with pytest.raises(AppError) as exc:
-        await svc.update_user(51, UserUpdate(status=UserStatus.disabled), actor)
-    assert exc.value.status_code == 403
-
-
-async def test_scoped_actor_cannot_create_out_of_scope_user(
-    admin_session: AsyncSession,
-) -> None:
-    admin_session.add_all(
-        [
-            Department(id=800, name="d800", parent_id=None),
-            Department(id=801, name="d801", parent_id=None),
-        ]
-    )
-    await admin_session.commit()
-    await _seed_dept_scoped_role(admin_session, 43, code="scope800")
-    actor = _scoped_actor(43, dept=800, perms={"system:user:add"})
-    svc = UserService(admin_session)
-
-    # Out-of-scope department → forbidden.
-    with pytest.raises(AppError) as exc:
-        await svc.create_user(
-            UserCreate(username="x1", employee_no="E-x1", department_id=801), actor
-        )
-    assert exc.value.status_code == 403
-
-    # No department under a restricted scope → forbidden.
-    with pytest.raises(AppError):
-        await svc.create_user(
-            UserCreate(username="x2", employee_no="E-x2"), actor
-        )
-
-    # In-scope department → allowed.
-    user, _ = await svc.create_user(
-        UserCreate(username="x3", employee_no="E-x3", department_id=800), actor
-    )
-    assert user.department_id == 800
+# ---- privilege-escalation guard (role assignment) --------------------------
 
 
 async def test_non_superuser_cannot_assign_unheld_perm_role(
     admin_session: AsyncSession,
 ) -> None:
+    """A scoped actor cannot assign a role conferring a permission it lacks."""
     admin_session.add(Department(id=820, name="d820", parent_id=None))
-    powerful = Role(name="power", code="power", data_scope="all", status="active")
+    powerful = Role(name="power", code="power", status="active")
     menu = Menu(name="m.super", menu_type="button", perms="*:*:*", status="active")
     admin_session.add_all([powerful, menu])
     await admin_session.flush()
     admin_session.add(RoleMenu(role_id=powerful.id, menu_id=menu.id))
-    await _seed_dept_scoped_role(admin_session, 44, code="weak")
-    # Actor is scoped to dept 820 and creates an in-scope user, so the flow
-    # reaches the role-assignment escalation guard (not the dept-scope guard).
+    await admin_session.commit()
     actor = _scoped_actor(44, dept=820, perms={"system:user:add"})
     svc = UserService(admin_session)
     with pytest.raises(AppError) as exc:
@@ -383,11 +321,9 @@ async def test_non_superuser_cannot_assign_superadmin_role(
     """
     admin_session.add(Department(id=830, name="d830", parent_id=None))
     # A superadmin-coded role with NO menus → confers zero perms.
-    su_role = Role(
-        name="su", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
-    )
+    su_role = Role(name="su", code=SUPERADMIN_ROLE_CODE, status="active")
     admin_session.add(su_role)
-    await _seed_dept_scoped_role(admin_session, 60, code="weak60")
+    await admin_session.commit()
     actor = _scoped_actor(60, dept=830, perms={"system:user:add"})
     svc = UserService(admin_session)
     with pytest.raises(AppError) as exc:
@@ -407,9 +343,7 @@ async def test_superuser_may_assign_superadmin_role(
     admin_session: AsyncSession,
 ) -> None:
     """The superadmin-code guard must not block an actual super-admin."""
-    su_role = Role(
-        name="su2", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
-    )
+    su_role = Role(name="su2", code=SUPERADMIN_ROLE_CODE, status="active")
     admin_session.add(su_role)
     await admin_session.commit()
     svc = UserService(admin_session)
@@ -420,32 +354,7 @@ async def test_superuser_may_assign_superadmin_role(
     assert role_ids == [su_role.id]
 
 
-async def test_non_superuser_cannot_assign_all_scope_role(
-    admin_session: AsyncSession,
-) -> None:
-    """A scoped actor cannot assign an ``all``-scope role — even with zero menus.
-
-    Perms-light but scope-heavy: an ``all``-data role with no menus confers no
-    perm code (passes the subset check) yet grants unrestricted visibility. The
-    data-scope breadth layer of the guard must reject it.
-    """
-    admin_session.add(Department(id=840, name="d840", parent_id=None))
-    all_role = Role(name="allr", code="allr", data_scope="all", status="active")
-    admin_session.add(all_role)
-    await _seed_dept_scoped_role(admin_session, 61, code="weak61")
-    actor = _scoped_actor(61, dept=840, perms={"system:user:add"})
-    svc = UserService(admin_session)
-    with pytest.raises(AppError) as exc:
-        await svc.create_user(
-            UserCreate(
-                username="escalate-all",
-                employee_no="E-eall",
-                department_id=840,
-                role_ids=[all_role.id],
-            ),
-            actor,
-        )
-    assert exc.value.status_code == 403
+# ---- session revocation on credential / status change ----------------------
 
 
 async def test_update_user_disable_revokes_sessions(
@@ -500,7 +409,7 @@ async def test_delete_user_revokes_sessions(
 
 
 async def test_list_users_bulk_roles(admin_session: AsyncSession) -> None:
-    role = Role(name="m", code="lrole", data_scope="self", status="active")
+    role = Role(name="m", code="lrole", status="active")
     admin_session.add(role)
     await admin_session.commit()
     svc = UserService(admin_session)
@@ -577,29 +486,10 @@ async def test_reset_password_revokes_target_sessions(
     assert exc.value.code is ErrorCode.auth_token_revoked
 
 
-async def test_reset_password_not_visible_raises(
-    admin_session: AsyncSession,
-) -> None:
-    """A scoped actor who cannot see the target gets an opaque 403."""
-    admin_session.add(Department(id=900, name="d900", parent_id=None))
-    await admin_session.flush()
-    svc = UserService(admin_session)
-    # Target in a department the scoped actor cannot see.
-    target, _ = await svc.create_user(
-        UserCreate(
-            username="hidden", employee_no="E-hid", department_id=900, password="pw123456"
-        ),
-        _superuser(),
-    )
-    await _seed_dept_scoped_role(admin_session, 55, code="weakr")
-    actor = _scoped_actor(55, dept=None, perms={"system:user:resetPwd"})
-
-    with pytest.raises(AppError) as exc:
-        await svc.reset_password(target.id, "new12345", actor)
-    assert exc.value.status_code == 403
+# ---- dominance guards (VISIBLE ≠ MANAGEABLE) -------------------------------
 
 
-async def _seed_visible_target_with_role(
+async def _seed_target_with_role(
     session: AsyncSession,
     *,
     dept_id: int,
@@ -607,7 +497,7 @@ async def _seed_visible_target_with_role(
     username: str,
     employee_no: str,
 ) -> User:
-    """A user in ``dept_id`` holding ``role`` — visible to a dept-``dept_id`` actor."""
+    """A user in ``dept_id`` holding ``role``."""
     session.add(role)
     await session.flush()
     user = User(
@@ -626,27 +516,16 @@ async def _seed_visible_target_with_role(
 async def test_scoped_actor_cannot_reset_password_of_superadmin_target(
     admin_session: AsyncSession,
 ) -> None:
-    """Dominance guard: VISIBLE ≠ MANAGEABLE.
-
-    A dept admin with ``system:user:resetPwd`` who can SEE a super-admin user
-    (same department) must still be refused — resetting that password would be
-    a full account takeover. The target's ``superadmin`` role makes it
-    un-dominatable even though it is in scope.
-    """
-    admin_session.add(Department(id=700, name="d700", parent_id=None))
-    await admin_session.flush()
-    su_role = Role(
-        name="su-tgt", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
-    )
-    target = await _seed_visible_target_with_role(
+    """Dominance guard: a non-super actor with ``system:user:resetPwd`` cannot
+    reset a super-admin's password — that would be a full account takeover. The
+    target's ``superadmin`` role makes it un-dominatable along the marker axis."""
+    su_role = Role(name="su-tgt", code=SUPERADMIN_ROLE_CODE, status="active")
+    target = await _seed_target_with_role(
         admin_session, dept_id=700, role=su_role, username="su-victim", employee_no="E-suv"
     )
-    await _seed_dept_scoped_role(admin_session, 70, code="deptadmin70")
     actor = _scoped_actor(70, dept=700, perms={"system:user:resetPwd"})
     svc = UserService(admin_session)
 
-    # Target IS visible (same dept) — prove the block is dominance, not visibility.
-    assert (await svc._require_visible(target.id, actor)).id == target.id
     with pytest.raises(AppError) as exc:
         await svc.reset_password(target.id, "new12345", actor)
     assert exc.value.status_code == 403
@@ -655,15 +534,19 @@ async def test_scoped_actor_cannot_reset_password_of_superadmin_target(
 async def test_scoped_actor_cannot_delete_higher_privileged_target(
     admin_session: AsyncSession,
 ) -> None:
-    """Dominance guard on delete: a target holding an ``all``-scope role (broader
-    visibility than the actor) is un-deletable by a dept-scoped actor."""
-    admin_session.add(Department(id=710, name="d710", parent_id=None))
-    await admin_session.flush()
-    all_role = Role(name="all710", code="all710", data_scope="all", status="active")
-    target = await _seed_visible_target_with_role(
-        admin_session, dept_id=710, role=all_role, username="powtgt", employee_no="E-pow"
+    """Dominance guard on delete: a target holding a role that confers a
+    permission the actor lacks is un-deletable (the actor could never have
+    assigned that role itself)."""
+    menu = Menu(
+        name="m.del", menu_type="button", perms="system:user:delete", status="active"
     )
-    await _seed_dept_scoped_role(admin_session, 71, code="deptadmin71")
+    power_role = Role(name="power", code="power-del", status="active")
+    admin_session.add_all([menu, power_role])
+    await admin_session.flush()
+    admin_session.add(RoleMenu(role_id=power_role.id, menu_id=menu.id))
+    target = await _seed_target_with_role(
+        admin_session, dept_id=710, role=power_role, username="powtgt", employee_no="E-pow"
+    )
     actor = _scoped_actor(71, dept=710, perms={"system:user:remove"})
     svc = UserService(admin_session)
 
@@ -674,19 +557,16 @@ async def test_scoped_actor_cannot_delete_higher_privileged_target(
     assert (await admin_session.get(User, target.id)).is_deleted is False
 
 
-async def test_scoped_actor_can_manage_peer_level_target(
+async def test_scoped_actor_can_manage_role_less_target(
     admin_session: AsyncSession,
 ) -> None:
     """Dominance allows managing a target whose roles the actor COULD assign —
-    a role-less (zero-privilege) target in scope is freely manageable."""
-    admin_session.add(Department(id=720, name="d720", parent_id=None))
-    await admin_session.flush()
+    a role-less (zero-privilege) target is freely manageable."""
     target = User(
         username="peer", employee_no="E-peer", department_id=720, password="x"
     )
     admin_session.add(target)
     await admin_session.flush()
-    await _seed_dept_scoped_role(admin_session, 72, code="deptadmin72")
     target_id = target.id
     await admin_session.commit()
     actor = _scoped_actor(72, dept=720, perms={"system:user:resetPwd"})
@@ -700,10 +580,8 @@ async def test_scoped_actor_can_manage_peer_level_target(
 async def test_superuser_bypasses_dominance(admin_session: AsyncSession) -> None:
     """A super-admin may reset even another super-admin's password (regression:
     the dominance guard must not block the unrestricted actor)."""
-    su_role = Role(
-        name="su-b", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
-    )
-    target = await _seed_visible_target_with_role(
+    su_role = Role(name="su-b", code=SUPERADMIN_ROLE_CODE, status="active")
+    target = await _seed_target_with_role(
         admin_session, dept_id=0, role=su_role, username="su-b-tgt", employee_no="E-sub"
     )
     svc = UserService(admin_session)
@@ -716,13 +594,9 @@ async def test_batch_delete_skips_undominated_targets(
 ) -> None:
     """Batch delete skips (does not sweep) targets the actor cannot dominate.
 
-    A dept admin batch-deleting [role-less peer, super-admin] removes only the
-    peer; the super-admin is reported skipped, not deleted."""
-    admin_session.add(Department(id=730, name="d730", parent_id=None))
-    await admin_session.flush()
-    su_role = Role(
-        name="su-bd", code=SUPERADMIN_ROLE_CODE, data_scope="self", status="active"
-    )
+    A non-super actor batch-deleting [role-less peer, super-admin] removes only
+    the peer; the super-admin is reported skipped, not deleted."""
+    su_role = Role(name="su-bd", code=SUPERADMIN_ROLE_CODE, status="active")
     admin_session.add(su_role)
     await admin_session.flush()
     peer = User(username="peer-bd", employee_no="E-pbd", department_id=730, password="x")
@@ -730,7 +604,6 @@ async def test_batch_delete_skips_undominated_targets(
     admin_session.add_all([peer, su_tgt])
     await admin_session.flush()
     admin_session.add(UserRole(user_id=su_tgt.id, role_id=su_role.id))
-    await _seed_dept_scoped_role(admin_session, 73, code="deptadmin73")
     peer_id, su_id = peer.id, su_tgt.id
     await admin_session.commit()
     actor = _scoped_actor(73, dept=730, perms={"system:user:remove"})

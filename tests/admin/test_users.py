@@ -1,4 +1,4 @@
-"""Route-level tests for admin user CRUD + role assignment + data scope."""
+"""Route-level tests for admin user CRUD + role assignment + PII masking."""
 
 from __future__ import annotations
 
@@ -14,31 +14,22 @@ from tests.admin.conftest import ADMIN_ID, AdminCtx
 pytestmark = pytest.mark.asyncio
 
 
-async def _set_dept_scoped_actor(
-    admin_ctx: AdminCtx, *, department_id: int, perms: set[str]
-) -> None:
-    await admin_ctx.session.execute(
-        UserRole.__table__.delete().where(UserRole.user_id == ADMIN_ID)
-    )
-    scoped = Role(
-        name=f"d{department_id}role",
-        code=f"d{department_id}role",
-        data_scope="dept",
-        status="active",
-    )
-    admin_ctx.session.add(scoped)
-    await admin_ctx.session.flush()
-    admin_ctx.session.add(UserRole(user_id=ADMIN_ID, role_id=scoped.id))
-    await admin_ctx.session.commit()
-    admin_ctx.state.department_id = department_id
+def _set_non_super_actor(admin_ctx: AdminCtx, *, perms: set[str]) -> None:
+    """Drop the default super-admin actor to a permissioned non-superuser.
+
+    Super-admin is code-based: the conftest override marks the actor superuser
+    iff its perms contain ``*:*:*``. Setting a concrete perm set (without the
+    wildcard) makes ``is_superuser`` False, which is all the masking + dominance
+    paths key off — there is no data-scope axis any more.
+    """
     admin_ctx.state.perms = perms
 
 
-def _non_super_actor(*, department_id: int, perms: set[str]) -> AuthenticatedUser:
+def _non_super_actor(*, perms: set[str]) -> AuthenticatedUser:
     return AuthenticatedUser(
         user_id=ADMIN_ID,
         username="admin",
-        department_id=department_id,
+        department_id=None,
         permissions=frozenset(perms),
     )
 
@@ -99,7 +90,7 @@ async def test_create_user_duplicate_employee_no_rejected(admin_ctx: AdminCtx) -
 
 
 async def test_create_user_with_roles(admin_ctx: AdminCtx) -> None:
-    role = Role(name="member", code="member", data_scope="self", status="active")
+    role = Role(name="member", code="member", status="active")
     admin_ctx.session.add(role)
     await admin_ctx.session.commit()
     resp = await admin_ctx.client.post(
@@ -143,43 +134,6 @@ async def test_user_endpoints_require_permission(admin_ctx: AdminCtx) -> None:
     admin_ctx.state.perms = {"system:dept:list"}  # lacks user perms
     resp = await admin_ctx.client.get("/admin/users")
     assert resp.status_code == 403
-
-
-async def test_list_users_respects_data_scope(admin_ctx: AdminCtx) -> None:
-    # Two departments; users in each. Actor scoped to dept 500 only.
-    admin_ctx.session.add_all(
-        [
-            Department(id=500, name="d500", parent_id=None),
-            Department(id=600, name="d600", parent_id=None),
-            User(id=51, username="in500", employee_no="E-51", department_id=500),
-            User(id=61, username="in600", employee_no="E-61", department_id=600),
-        ]
-    )
-    # Replace the admin actor's role with a dept-scoped one (dept 500).
-    await admin_ctx.session.execute(
-        UserRole.__table__.delete().where(UserRole.user_id == ADMIN_ID)
-    )
-    scoped = Role(name="d500role", code="d500role", data_scope="dept", status="active")
-    admin_ctx.session.add(scoped)
-    await admin_ctx.session.flush()
-    admin_ctx.session.add(UserRole(user_id=ADMIN_ID, role_id=scoped.id))
-    await admin_ctx.session.commit()
-
-    admin_ctx.state.department_id = 500  # actor's own department
-    admin_ctx.state.perms = {"system:user:list"}  # non-superuser → scope applies
-
-    resp = await admin_ctx.client.get("/admin/users")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["success"] is True
-    assert "items" not in body
-    assert "total" not in body
-    page = body["data"]
-    assert {"items", "total", "limit", "offset"} <= page.keys()
-    usernames = {u["username"] for u in page["items"]}
-    assert page["total"] >= 1
-    assert "in500" in usernames
-    assert "in600" not in usernames  # out of scope
 
 
 async def test_list_users_keyword_filters_by_username(admin_ctx: AdminCtx) -> None:
@@ -236,18 +190,14 @@ async def test_list_users_masks_pii_for_non_superuser(admin_ctx: AdminCtx) -> No
     )
     assert created.status_code == 200, created.text
     created_read = UserRead.model_validate(created.json()["data"])
-    await _set_dept_scoped_actor(
-        admin_ctx, department_id=2120, perms={"system:user:list"}
-    )
+    _set_non_super_actor(admin_ctx, perms={"system:user:list"})
 
     resp = await admin_ctx.client.get("/admin/users?keyword=pii-scoped")
     assert resp.status_code == 200, resp.text
     listed = resp.json()["data"]["items"][0]
     expected = mask_fields(
         created_read,
-        actor=_non_super_actor(
-            department_id=2120, perms={"system:user:list"}
-        ),
+        actor=_non_super_actor(perms={"system:user:list"}),
         sensitive=("mobile", "email"),
     )
     assert listed["mobile"] == expected.mobile
@@ -257,13 +207,11 @@ async def test_list_users_masks_pii_for_non_superuser(admin_ctx: AdminCtx) -> No
 async def test_create_user_readback_masks_pii_for_non_superuser(
     admin_ctx: AdminCtx,
 ) -> None:
-    """A scoped (non-super) creator must see masked contacts in the readback too,
+    """A non-super creator must see masked contacts in the readback too,
     exactly like the list endpoint — not unmasked raw email/mobile."""
     admin_ctx.session.add(Department(id=2160, name="d2160", parent_id=None))
     await admin_ctx.session.commit()
-    await _set_dept_scoped_actor(
-        admin_ctx, department_id=2160, perms={"system:user:add"}
-    )
+    _set_non_super_actor(admin_ctx, perms={"system:user:add"})
 
     resp = await admin_ctx.client.post(
         "/admin/users",
@@ -284,8 +232,8 @@ async def test_create_user_readback_masks_pii_for_non_superuser(
 async def test_update_user_readback_masks_pii_for_non_superuser(
     admin_ctx: AdminCtx,
 ) -> None:
-    """The update readback must mask contacts for a scoped editor — a no-op edit
-    must not leak unmasked email/mobile of a visible user."""
+    """The update readback must mask contacts for a non-super editor — a no-op
+    edit must not leak unmasked email/mobile of a user."""
     admin_ctx.session.add_all(
         [
             Department(id=2170, name="d2170", parent_id=None),
@@ -300,9 +248,7 @@ async def test_update_user_readback_masks_pii_for_non_superuser(
         ]
     )
     await admin_ctx.session.commit()
-    await _set_dept_scoped_actor(
-        admin_ctx, department_id=2170, perms={"system:user:edit"}
-    )
+    _set_non_super_actor(admin_ctx, perms={"system:user:edit"})
 
     resp = await admin_ctx.client.put(
         "/admin/users/2171", json={"real_name": "Bob R."}
@@ -332,152 +278,81 @@ async def test_list_users_superuser_sees_unmasked_pii(admin_ctx: AdminCtx) -> No
     assert listed["email"] == "bob@example.com"
 
 
-async def test_batch_delete_users_skips_out_of_scope(admin_ctx: AdminCtx) -> None:
-    role = Role(name="batch-member", code="batch-member", data_scope="self", status="active")
-    in_scope = User(id=2141, username="batch-in", employee_no="E-2141", department_id=2140)
-    out_scope = User(
+async def test_batch_delete_users_skips_undominated(admin_ctx: AdminCtx) -> None:
+    """Batch delete skips targets the actor cannot dominate (one holding a role
+    that confers a permission the actor lacks), deleting only the dominated one
+    and clearing links only for it."""
+    menu = Menu(name="m.esc", menu_type="button", perms="*:*:*", status="active")
+    power_role = Role(name="power-bd", code="power-bd", status="active")
+    dominated = User(
+        id=2141, username="batch-in", employee_no="E-2141", department_id=2140
+    )
+    undominated = User(
         id=2142, username="batch-out", employee_no="E-2142", department_id=2142
     )
-    admin_ctx.session.add_all(
-        [
-            Department(id=2140, name="d2140", parent_id=None),
-            Department(id=2142, name="d2142", parent_id=None),
-            role,
-            in_scope,
-            out_scope,
-        ]
-    )
+    admin_ctx.session.add_all([menu, power_role, dominated, undominated])
     await admin_ctx.session.flush()
     admin_ctx.session.add_all(
         [
-            UserRole(user_id=in_scope.id, role_id=role.id),
-            UserRole(user_id=out_scope.id, role_id=role.id),
+            RoleMenu(role_id=power_role.id, menu_id=menu.id),
+            UserRole(user_id=undominated.id, role_id=power_role.id),
         ]
     )
-    await _set_dept_scoped_actor(
-        admin_ctx, department_id=2140, perms={"system:user:remove"}
-    )
+    await admin_ctx.session.commit()
+    _set_non_super_actor(admin_ctx, perms={"system:user:remove"})
 
     resp = await admin_ctx.client.post(
         "/admin/users/batch-delete",
-        json={"ids": [str(in_scope.id), str(out_scope.id)]},
+        json={"ids": [str(dominated.id), str(undominated.id)]},
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
     assert data == {
         "requested": 2,
         "affected": 1,
-        "skipped_ids": [str(out_scope.id)],
+        "skipped_ids": [str(undominated.id)],
     }
 
-    await admin_ctx.session.refresh(in_scope)
-    await admin_ctx.session.refresh(out_scope)
-    assert in_scope.is_deleted is True
-    assert out_scope.is_deleted is False
+    await admin_ctx.session.refresh(dominated)
+    await admin_ctx.session.refresh(undominated)
+    assert dominated.is_deleted is True
+    assert undominated.is_deleted is False
     links = await admin_ctx.session.scalars(
         select(UserRole.user_id)
-        .where(UserRole.user_id.in_([in_scope.id, out_scope.id]))
+        .where(UserRole.user_id.in_([dominated.id, undominated.id]))
         .order_by(UserRole.user_id)
     )
-    assert list(links.all()) == [out_scope.id]
+    assert list(links.all()) == [undominated.id]
 
 
-async def test_batch_delete_users_empty_or_all_skipped(admin_ctx: AdminCtx) -> None:
-    out_scope = User(
+async def test_batch_delete_users_all_skipped(admin_ctx: AdminCtx) -> None:
+    menu = Menu(name="m.esc2", menu_type="button", perms="*:*:*", status="active")
+    power_role = Role(name="power-as", code="power-as", status="active")
+    undominated = User(
         id=2152, username="batch-all-skip", employee_no="E-2152", department_id=2152
     )
+    admin_ctx.session.add_all([menu, power_role, undominated])
+    await admin_ctx.session.flush()
     admin_ctx.session.add_all(
         [
-            Department(id=2150, name="d2150", parent_id=None),
-            Department(id=2152, name="d2152", parent_id=None),
-            out_scope,
+            RoleMenu(role_id=power_role.id, menu_id=menu.id),
+            UserRole(user_id=undominated.id, role_id=power_role.id),
         ]
     )
-    await _set_dept_scoped_actor(
-        admin_ctx, department_id=2150, perms={"system:user:remove"}
-    )
+    await admin_ctx.session.commit()
+    _set_non_super_actor(admin_ctx, perms={"system:user:remove"})
 
     resp = await admin_ctx.client.post(
-        "/admin/users/batch-delete", json={"ids": [str(out_scope.id)]}
+        "/admin/users/batch-delete", json={"ids": [str(undominated.id)]}
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"] == {
         "requested": 1,
         "affected": 0,
-        "skipped_ids": [str(out_scope.id)],
+        "skipped_ids": [str(undominated.id)],
     }
-    await admin_ctx.session.refresh(out_scope)
-    assert out_scope.is_deleted is False
-
-
-async def test_mutation_out_of_scope_forbidden(admin_ctx: AdminCtx) -> None:
-    admin_ctx.session.add_all(
-        [
-            Department(id=700, name="d700", parent_id=None),
-            User(id=71, username="in700", employee_no="E-71", department_id=700),
-        ]
-    )
-    await admin_ctx.session.execute(
-        UserRole.__table__.delete().where(UserRole.user_id == ADMIN_ID)
-    )
-    scoped = Role(name="d999role", code="d999role", data_scope="dept", status="active")
-    admin_ctx.session.add(scoped)
-    await admin_ctx.session.flush()
-    admin_ctx.session.add(UserRole(user_id=ADMIN_ID, role_id=scoped.id))
-    await admin_ctx.session.commit()
-
-    admin_ctx.state.department_id = 999  # actor sees only dept 999, not 700
-    admin_ctx.state.perms = {"system:user:edit"}  # non-superuser → scope applies
-
-    resp = await admin_ctx.client.put(
-        "/admin/users/71", json={"status": "disabled"}
-    )
-    assert resp.status_code == 403
-    assert resp.json()["code"] == "auth.forbidden"
-
-
-async def test_scoped_admin_cannot_create_out_of_scope_user(
-    admin_ctx: AdminCtx,
-) -> None:
-    """CRITICAL-1: a dept-scoped admin must not create users outside their scope."""
-    admin_ctx.session.add_all(
-        [
-            Department(id=800, name="d800", parent_id=None),
-            Department(id=801, name="d801", parent_id=None),
-        ]
-    )
-    await admin_ctx.session.execute(
-        UserRole.__table__.delete().where(UserRole.user_id == ADMIN_ID)
-    )
-    scoped = Role(name="d800role", code="d800role", data_scope="dept", status="active")
-    admin_ctx.session.add(scoped)
-    await admin_ctx.session.flush()
-    admin_ctx.session.add(UserRole(user_id=ADMIN_ID, role_id=scoped.id))
-    await admin_ctx.session.commit()
-
-    admin_ctx.state.department_id = 800
-    admin_ctx.state.perms = {"system:user:add"}
-
-    # Out-of-scope department → forbidden.
-    out = await admin_ctx.client.post(
-        "/admin/users",
-        json={"username": "x1", "employee_no": "E-x1", "department_id": "801"},
-    )
-    assert out.status_code == 403
-
-    # No department (null) under a restricted scope → forbidden.
-    nodept = await admin_ctx.client.post(
-        "/admin/users",
-        json={"username": "x2", "employee_no": "E-x2"},
-    )
-    assert nodept.status_code == 403
-
-    # In-scope department → allowed.
-    ok = await admin_ctx.client.post(
-        "/admin/users",
-        json={"username": "x3", "employee_no": "E-x3", "department_id": "800"},
-    )
-    assert ok.status_code == 200, ok.text
+    await admin_ctx.session.refresh(undominated)
+    assert undominated.is_deleted is False
 
 
 async def test_non_superuser_cannot_assign_role_granting_unheld_perms(
@@ -485,7 +360,7 @@ async def test_non_superuser_cannot_assign_role_granting_unheld_perms(
 ) -> None:
     """CRITICAL-2: privilege-escalation guard on role assignment."""
     # A powerful role granting a permission the actor does NOT hold.
-    powerful = Role(name="power", code="power", data_scope="all", status="active")
+    powerful = Role(name="power", code="power", status="active")
     menu = Menu(
         name="m.super", menu_type="button", perms="*:*:*", status="active"
     )
@@ -511,7 +386,7 @@ async def test_non_superuser_cannot_assign_role_granting_unheld_perms(
 
 async def test_superuser_can_assign_any_role(admin_ctx: AdminCtx) -> None:
     """Counterpart: a super-admin (``*:*:*``) may assign a powerful role."""
-    powerful = Role(name="power2", code="power2", data_scope="all", status="active")
+    powerful = Role(name="power2", code="power2", status="active")
     menu = Menu(name="m.s2", menu_type="button", perms="*:*:*", status="active")
     admin_ctx.session.add_all([powerful, menu])
     await admin_ctx.session.flush()

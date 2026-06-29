@@ -15,7 +15,7 @@ from src.core.security import generate_api_key, hash_password
 from src.db.base import Base
 from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
-from src.db.models.identity import Department, Menu, Role, RoleDept, RoleMenu, User, UserRole
+from src.db.models.identity import Department, Menu, Role, RoleMenu, User, UserRole
 
 pytestmark = pytest.mark.asyncio
 
@@ -47,7 +47,7 @@ class TestStripApiPrefix:
 
 _TABLES = [
     Base.metadata.tables[m.__tablename__]
-    for m in (User, Department, Role, Menu, UserRole, RoleMenu, RoleDept, ApiKey, LoginLog)
+    for m in (User, Department, Role, Menu, UserRole, RoleMenu, ApiKey, LoginLog)
 ]
 
 

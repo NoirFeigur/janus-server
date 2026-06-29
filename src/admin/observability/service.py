@@ -4,15 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql.elements import ColumnElement
 
-from src.auth.service import AuthenticatedUser, AuthService, DataScopeFilter
+from src.auth.service import AuthenticatedUser, AuthService
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
 from src.db.models.gateway_observability import GatewayRequestLog
-from src.db.models.identity import User
 from src.gateway.events import (
     LOG_DLQ_KEY,
     LOG_INFLIGHT_KEY,
@@ -40,33 +38,6 @@ class ObservabilityService:
         self.session = session
         self.auth = AuthService(session)
 
-    def _scope_predicate(
-        self, scope: DataScopeFilter, *, actor_id: int
-    ) -> ColumnElement[bool] | None:
-        """WHERE predicate limiting logs to users visible under ``scope``.
-
-        Gateway logs carry only ``user_id`` (a ``LogEntity`` with no audit
-        columns), so visibility keys off the log owner's department / identity —
-        the same shape as the credential scope predicate. ``user_id`` is nullable
-        (system / unauthenticated requests); those rows are intentionally hidden
-        from restricted actors because they have no owner to attribute them to.
-        """
-        if scope.unrestricted:
-            return None
-        clauses: list[ColumnElement[bool]] = []
-        if scope.department_ids:
-            visible_users = select(User.id).where(
-                User.is_deleted.is_(False),
-                User.department_id.in_(scope.department_ids),
-            )
-            clauses.append(GatewayRequestLog.user_id.in_(visible_users))
-        if scope.include_self:
-            clauses.append(GatewayRequestLog.user_id == actor_id)
-        if not clauses:
-            # Restricted actor with neither dept nor self visibility sees nothing.
-            return GatewayRequestLog.id == -1
-        return or_(*clauses)
-
     async def list_logs(
         self,
         query: ListQuery,
@@ -81,10 +52,6 @@ class ObservabilityService:
     ) -> PageResult[GatewayRequestLog]:
         stmt = select(GatewayRequestLog)
 
-        scope = await self.auth.resolve_data_scope(actor)
-        scope_predicate = self._scope_predicate(scope, actor_id=actor.user_id)
-        if scope_predicate is not None:
-            stmt = stmt.where(scope_predicate)
         if user_id is not None:
             stmt = stmt.where(GatewayRequestLog.user_id == user_id)
         if model is not None:
@@ -120,10 +87,6 @@ class ObservabilityService:
         stmt = select(GatewayRequestLog).where(
             GatewayRequestLog.request_id == request_id
         )
-        scope = await self.auth.resolve_data_scope(actor)
-        scope_predicate = self._scope_predicate(scope, actor_id=actor.user_id)
-        if scope_predicate is not None:
-            stmt = stmt.where(scope_predicate)
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
