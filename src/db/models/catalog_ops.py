@@ -25,7 +25,7 @@ class CatalogChangeLog(LogEntity):
     __table_args__ = {"comment": "目录配置变更日志：每次渠道/模型/部署/密钥变更的前后快照"}
 
     actor_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, index=True, comment="操作人 sys_user.id"
+        BigInteger, nullable=True, index=True, comment="操作人 users.id"
     )
     resource_type: Mapped[str] = mapped_column(
         String(32), index=True, comment="变更资源类型：channel | key | model | deployment"
@@ -60,7 +60,7 @@ class CatalogConfigSnapshot(LogEntity):
     __table_args__ = {"comment": "目录配置快照：用于 dry-run 校验和回滚"}
 
     actor_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="创建快照的操作人 sys_user.id"
+        BigInteger, nullable=True, comment="创建快照的操作人 users.id"
     )
     reason: Mapped[str] = mapped_column(
         String(32),

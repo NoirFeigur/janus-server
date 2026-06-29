@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer
 from src.enums import ConfigValueType
 
 
-class SysConfigCreate(BaseModel):
+class ConfigCreate(BaseModel):
     """Create a platform config entry."""
 
     config_key: str = Field(min_length=1, max_length=128)
@@ -25,7 +25,7 @@ class SysConfigCreate(BaseModel):
     remark: str | None = Field(default=None, max_length=255)
 
 
-class SysConfigUpdate(BaseModel):
+class ConfigUpdate(BaseModel):
     """Partial config update; unset fields are left unchanged.
 
     ``config_key`` and ``is_builtin`` are intentionally not updatable: the key is
@@ -39,7 +39,7 @@ class SysConfigUpdate(BaseModel):
     remark: str | None = Field(default=None, max_length=255)
 
 
-class SysConfigRead(BaseModel):
+class ConfigRead(BaseModel):
     """Config read model."""
 
     model_config = ConfigDict(from_attributes=True)

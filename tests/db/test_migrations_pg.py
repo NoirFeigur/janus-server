@@ -86,7 +86,7 @@ def test_migrations_upgrade_downgrade_reupgrade_are_reversible(
         tables_after_upgrade = set(inspect(conn).get_table_names())
     # Core tables from the initial schema must exist (sample a few load-bearing
     # ones rather than asserting an exact set — that would be a change-detector).
-    assert {"sys_user", "sys_role", "channel_key", "upstream_channel"} <= (
+    assert {"users", "role", "channel_key", "upstream_channel"} <= (
         tables_after_upgrade
     )
     assert "alembic_version" in tables_after_upgrade
@@ -95,14 +95,14 @@ def test_migrations_upgrade_downgrade_reupgrade_are_reversible(
     command.downgrade(alembic_config, "base")
     with sync_engine.connect() as conn:
         tables_after_downgrade = set(inspect(conn).get_table_names())
-    assert "sys_user" not in tables_after_downgrade
+    assert "users" not in tables_after_downgrade
     assert "channel_key" not in tables_after_downgrade
 
     # 3) Re-upgrade — proves downgrade left no residue that blocks a clean re-apply.
     command.upgrade(alembic_config, "head")
     with sync_engine.connect() as conn:
         tables_after_reupgrade = set(inspect(conn).get_table_names())
-    assert {"sys_user", "channel_key"} <= tables_after_reupgrade
+    assert {"users", "channel_key"} <= tables_after_reupgrade
 
     sync_engine.dispose()
 

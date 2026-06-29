@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src.auth.service import AuthenticatedUser
 from src.db.base import Base
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.enums import AttachBizType, ErrorCode
 from src.exceptions import AppError
 from src.files.service import AttachService
@@ -68,7 +68,7 @@ async def session(
     sqlite_engine: AsyncEngine,
     sqlite_session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[AsyncSession]:
-    tables = [Base.metadata.tables[SysAttach.__tablename__]]
+    tables = [Base.metadata.tables[Attach.__tablename__]]
     async with sqlite_engine.begin() as conn:
         await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=tables))
     s = sqlite_session_factory()

@@ -5,7 +5,7 @@
 dependency)翻译成带 ``ErrorCode`` 的 ``AppError``。
 
 三类原语,各按其熵选哈希(数据模型 §484 已定):
-- ``sys_user.password``:低熵人造密码 → **argon2**(慢哈希,抗暴力)。
+- ``users.password``:低熵人造密码 → **argon2**(慢哈希,抗暴力)。
 - ``api_key`` 的 sk-key:高熵随机串 → **sha256**(快哈希,可建唯一索引等值查表)。
 - 平台 JWT:本地账密登录换发,**RS256**——签发权(私钥)与热路径验签(公钥)分离,
   副本只需公钥即可验签(对齐'无状态副本'横向扩前提)。
@@ -140,7 +140,7 @@ class PlatformAccessClaims(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    sub: str  # sys_user.id (stringified)
+    sub: str  # users.id (stringified)
     jti: str  # token 唯一 id（UUID4 hex）；会话吊销/登出按 jti 在 Redis 标记
     iat: int  # 签发时刻(unix 秒)
     exp: int  # 过期时刻(unix 秒)

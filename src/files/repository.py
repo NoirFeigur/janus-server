@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.db.repository import BaseRepository
 
 
-class SysAttachRepository(BaseRepository[SysAttach]):
-    model = SysAttach
+class AttachRepository(BaseRepository[Attach]):
+    model = Attach

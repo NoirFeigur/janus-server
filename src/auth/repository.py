@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
 from src.db.models.identity import Menu, Role, RoleMenu, User, UserRole
@@ -68,7 +68,7 @@ class AuthRepository:
         api_key: ApiKey | None = await self.session.scalar(stmt)
         return api_key
 
-    async def get_owned_avatar(self, attach_id: int, owner_id: int) -> SysAttach | None:
+    async def get_owned_avatar(self, attach_id: int, owner_id: int) -> Attach | None:
         """An avatar attachment owned by ``owner_id`` (None if absent/not owned).
 
         Self-service avatar binding may only point at an attachment the caller
@@ -76,13 +76,13 @@ class AuthRepository:
         binding someone else's object or a non-avatar file as a profile picture.
         """
         stmt = (
-            select(SysAttach)
-            .where(SysAttach.id == attach_id)
-            .where(SysAttach.is_deleted.is_(False))
-            .where(SysAttach.biz_type == AttachBizType.avatar.value)
-            .where(SysAttach.created_by == owner_id)
+            select(Attach)
+            .where(Attach.id == attach_id)
+            .where(Attach.is_deleted.is_(False))
+            .where(Attach.biz_type == AttachBizType.avatar.value)
+            .where(Attach.created_by == owner_id)
         )
-        attach: SysAttach | None = await self.session.scalar(stmt)
+        attach: Attach | None = await self.session.scalar(stmt)
         return attach
 
     async def get_attach_object_key(self, attach_id: int) -> str | None:
@@ -93,9 +93,9 @@ class AuthRepository:
         key (no owner filter). Soft-deleted rows return ``None`` (avatar cleared).
         """
         stmt = (
-            select(SysAttach.object_key)
-            .where(SysAttach.id == attach_id)
-            .where(SysAttach.is_deleted.is_(False))
+            select(Attach.object_key)
+            .where(Attach.id == attach_id)
+            .where(Attach.is_deleted.is_(False))
         )
         object_key: str | None = await self.session.scalar(stmt)
         return object_key

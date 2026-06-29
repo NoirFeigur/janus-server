@@ -1,4 +1,4 @@
-"""Platform configuration aggregate (Wave D, table sys_config).
+"""Platform configuration aggregate (Wave D, table config).
 
 RuoYi-style key-value platform configuration. Each row holds one runtime
 parameter as a typed string: ``value_type`` tells the typed accessor how to
@@ -20,13 +20,13 @@ from src.db.base import BaseEntity
 from src.enums import ConfigValueType
 
 
-class SysConfig(BaseEntity):
+class Config(BaseEntity):
     """Platform runtime configuration as typed key-value rows (Wave D)."""
 
-    __tablename__ = "sys_config"
+    __tablename__ = "config"
     __table_args__ = (
         Index(
-            "uq_sysconfig_key", "config_key", unique=True
+            "uq_config_key", "config_key", unique=True
         ),  # Global key uniqueness (no is_deleted filter: one row per logical key).
         {"comment": "平台配置：键值型运行时参数（typed），内置项可改不可删"},
     )

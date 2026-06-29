@@ -45,13 +45,13 @@ class BaseEntity(Base):
     created_by: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
-        comment="创建人 sys_user.id；null=系统操作",
+        comment="创建人 users.id；null=系统操作",
     )
     create_dept: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
         index=True,
-        comment="创建部门 sys_department.id（审计留痕；非数据权限过滤）",
+        comment="创建部门 department.id（审计留痕；非数据权限过滤）",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -59,7 +59,7 @@ class BaseEntity(Base):
         comment="创建时间",
     )
     updated_by: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="最后更新人 sys_user.id"
+        BigInteger, nullable=True, comment="最后更新人 users.id"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

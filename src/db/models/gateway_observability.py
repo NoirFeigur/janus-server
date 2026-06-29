@@ -31,7 +31,7 @@ class GatewayRequestLog(LogEntity):
         String(64), unique=True, comment="请求唯一标识（关联 usage_record.request_id）"
     )
     user_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, index=True, comment="调用者 sys_user.id"
+        BigInteger, nullable=True, index=True, comment="调用者 users.id"
     )
     api_key_id: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="调用者 api_key.id"

@@ -8,7 +8,7 @@
   不解码不转码)→ object key ``attachment/{YYYY}/{MM}/{id}{ext}``。
 
 **上传顺序**:先上传对象、再落库。若请求边界提交失败,桶里至多留个孤儿对象(可后续按
-``sys_attach`` 元数据扫未引用对象清理);反过来(先落库后上传)会留下指向不存在对象的
+``attach`` 元数据扫未引用对象清理);反过来(先落库后上传)会留下指向不存在对象的
 悬空行,体验更差。故选「对象优先」。
 
 事务边界由请求级 Unit of Work 持有,本层只 ``flush()``;凭据校验在 ``ObjectStorage``
@@ -28,10 +28,10 @@ from src.auth.service import AuthenticatedUser
 from src.core.image import ImageTooLargeError, InvalidImageError, to_webp_avatar
 from src.core.oss import ObjectStorage
 from src.core.snowflake import next_id
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.enums import AttachBizType, ErrorCode
 from src.exceptions import AppError
-from src.files.repository import SysAttachRepository
+from src.files.repository import AttachRepository
 
 # 通用附件回退 content-type(客户端未声明时)。
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
@@ -61,7 +61,7 @@ def _safe_extension(original_name: str | None) -> str:
 class AttachService:
     def __init__(self, session: AsyncSession, storage: ObjectStorage) -> None:
         self.session = session
-        self.repo = SysAttachRepository(session)
+        self.repo = AttachRepository(session)
         self.storage = storage
 
     async def upload_avatar(
@@ -71,8 +71,8 @@ class AttachService:
         original_name: str | None,
         actor: AuthenticatedUser,
         max_bytes: int,
-    ) -> tuple[SysAttach, str]:
-        """校验+转 webp,上传桶并落 ``sys_attach`` 行,返回 (行, 预签名 URL)。
+    ) -> tuple[Attach, str]:
+        """校验+转 webp,上传桶并落 ``attach`` 行,返回 (行, 预签名 URL)。
 
         ``core.image`` 的 web-agnostic 异常在此翻译成 ``AppError``(与 ``AuthService``
         翻译 ``TokenError`` 同构):超限 → ``attach_too_large``、非图片 →
@@ -114,8 +114,8 @@ class AttachService:
         content_type: str | None,
         actor: AuthenticatedUser,
         max_bytes: int,
-    ) -> tuple[SysAttach, str]:
-        """校验大小,原样上传桶并落 ``sys_attach`` 行,返回 (行, 预签名 URL)。
+    ) -> tuple[Attach, str]:
+        """校验大小,原样上传桶并落 ``attach`` 行,返回 (行, 预签名 URL)。
 
         通用附件不解码不转码:保留客户端声明的 ``content_type``(缺省回退
         ``application/octet-stream``)与原始扩展名。超限 → ``attach_too_large`` (400)。
@@ -150,11 +150,11 @@ class AttachService:
         biz_type: AttachBizType,
         actor: AuthenticatedUser,
         force_download: bool = False,
-    ) -> tuple[SysAttach, str]:
+    ) -> tuple[Attach, str]:
         """对象优先持久化:上传桶 → 落行(flush)→ 现算预签名 URL。
 
         事务由请求级 Unit of Work 在边界提交;本层只 flush 让行物化。失败的提交至多在
-        桶里留个孤儿对象(可按 ``sys_attach`` 元数据清理),绝不会留下指向不存在对象的
+        桶里留个孤儿对象(可按 ``attach`` 元数据清理),绝不会留下指向不存在对象的
         悬空行。预签名 URL 仅按 object key 现算,不依赖行已落库,故 flush 后即可生成。
         两条上传链路共用此收口,保证顺序与事务边界一致。``force_download`` 透传给预签名:
         通用附件强制 ``Content-Disposition: attachment`` 防内联渲染(stored-XSS),头像不强制。
@@ -165,7 +165,7 @@ class AttachService:
             content_type=content_type,
         )
 
-        attach = SysAttach(
+        attach = Attach(
             id=attach_id,
             object_key=object_key,
             bucket=self.storage.bucket,

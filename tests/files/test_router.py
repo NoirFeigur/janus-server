@@ -14,7 +14,7 @@ from PIL import Image
 from sqlalchemy import select
 
 from src.config import get_settings
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from tests.files.conftest import AttachCtx
 
 pytestmark = pytest.mark.asyncio
@@ -125,6 +125,6 @@ async def test_upload_rejects_oversized_body_before_buffering(
 
 async def _object_key(attach_ctx: AttachCtx) -> str:
     """The single persisted attachment's object key (for URL assertions)."""
-    row = (await attach_ctx.session.scalars(select(SysAttach))).first()
+    row = (await attach_ctx.session.scalars(select(Attach))).first()
     assert row is not None
     return row.object_key

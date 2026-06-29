@@ -1,7 +1,7 @@
 """Attachment endpoints (router layer).
 
 ``POST /attach/upload`` — backend-proxied multipart upload. Any authenticated
-JWT user may upload; the file is stored in the private bucket and a ``sys_attach``
+JWT user may upload; the file is stored in the private bucket and a ``attach``
 row is created. Returns the attachment id + a freshly presigned URL.
 
 Dispatches on ``biz_type``:
@@ -22,7 +22,7 @@ from starlette import status
 from src.auth.dependencies import CurrentJwtUser, TraceId
 from src.config import get_settings
 from src.core.oss import ObjectStorageDep
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.db.session import get_session
 from src.enums import AttachBizType, ErrorCode
 from src.exceptions import AppError
@@ -93,7 +93,7 @@ async def upload_attachment(
     )
     raw = await _read_capped(file, max_bytes=max_bytes)
 
-    attach: SysAttach
+    attach: Attach
     url: str
     if biz_type is AttachBizType.avatar:
         attach, url = await service.upload_avatar(

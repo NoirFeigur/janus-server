@@ -56,7 +56,7 @@ def _build_app() -> FastAPI:
         # Simulate a DB uniqueness/FK violation surfacing from flush/commit. The
         # orig carries a driver message that must NOT leak into the response.
         raise IntegrityError(
-            statement="INSERT INTO sys_user ...",
+            statement="INSERT INTO users ...",
             params={},
             orig=Exception("duplicate key value violates unique constraint uq_x"),
         )
@@ -145,7 +145,7 @@ def test_integrity_error_maps_to_409_conflict_without_db_leak() -> None:
     serialized = resp.text
     assert "unique constraint" not in serialized
     assert "uq_x" not in serialized
-    assert "sys_user" not in serialized
+    assert "users" not in serialized
 
 
 def _request_with_trace(trace_id: str = "trace-direct") -> Request:

@@ -32,7 +32,7 @@ class OperLog(LogEntity):
         BigInteger,
         nullable=True,
         index=True,
-        comment="操作人 sys_user.id；null=系统操作",
+        comment="操作人 users.id；null=系统操作",
     )
     actor_name: Mapped[str | None] = mapped_column(
         String(64),
@@ -109,7 +109,7 @@ class LoginLog(LogEntity):
         BigInteger,
         nullable=True,
         index=True,
-        comment="命中的 sys_user.id；用户名无法解析时为空",
+        comment="命中的 users.id；用户名无法解析时为空",
     )
     username: Mapped[str] = mapped_column(
         String(64), index=True, comment="尝试登录的用户名"

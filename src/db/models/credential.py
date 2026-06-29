@@ -28,7 +28,7 @@ class ApiKey(BaseEntity):
     )
 
     user_id: Mapped[int] = mapped_column(
-        BigInteger, index=True, comment="key 所属用户 sys_user.id"
+        BigInteger, index=True, comment="key 所属用户 users.id"
     )
     name: Mapped[str] = mapped_column(
         String(64),

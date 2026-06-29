@@ -24,7 +24,7 @@ def test_base_entity_has_softdelete_and_audit_columns() -> None:
         BaseEntity, "__table__"
     ) else set()
     # BaseEntity is abstract; inspect a concrete subclass instead.
-    user = Base.metadata.tables["sys_user"]
+    user = Base.metadata.tables["users"]
     names = set(user.columns.keys())
     for required in {
         "id",
@@ -35,7 +35,7 @@ def test_base_entity_has_softdelete_and_audit_columns() -> None:
         "updated_by",
         "updated_at",
     }:
-        assert required in names, f"sys_user missing {required}"
+        assert required in names, f"users missing {required}"
     assert not cols  # abstract base has no table of its own
 
 
@@ -51,8 +51,8 @@ def test_log_entity_is_append_only_shape() -> None:
 
 
 def test_link_entity_is_physical_delete_shape() -> None:
-    """sys_user_role (LinkEntity) has id + created_at, no soft-delete/audit cols."""
-    link = Base.metadata.tables["sys_user_role"]
+    """user_role (LinkEntity) has id + created_at, no soft-delete/audit cols."""
+    link = Base.metadata.tables["user_role"]
     names = set(link.columns.keys())
     assert {"id", "created_at", "user_id", "role_id"} <= names
     assert "is_deleted" not in names
@@ -68,6 +68,6 @@ def test_entity_base_classes_are_abstract() -> None:
 
 def test_timestamp_columns_are_timezone_aware() -> None:
     """created_at must be timestamptz (timezone=True), per §0.3."""
-    user = Base.metadata.tables["sys_user"]
+    user = Base.metadata.tables["users"]
     created_at = user.columns["created_at"]
     assert getattr(created_at.type, "timezone", False) is True

@@ -1,4 +1,4 @@
-"""Attachment aggregate (table sys_attach).
+"""Attachment aggregate (table attach).
 
 Generic object-storage attachment registry. Each row is the metadata for one
 object stored in the private MinIO/S3 bucket: the bucket-relative ``object_key``
@@ -7,7 +7,7 @@ presigned URL computed at read time (a private bucket has no public URL, so a
 permanent URL is never stored).
 
 Business tables reference an attachment by its snowflake id (e.g.
-``sys_user.avatar``), a logical reference with no physical FK (§0.7). The
+``users.avatar``), a logical reference with no physical FK (§0.7). The
 ``biz_type`` column classifies the usage (avatar / generic attachment) so future
 features (exports, business uploads) reuse this one table.
 """
@@ -21,10 +21,10 @@ from src.db.base import BaseEntity
 from src.enums import AttachBizType
 
 
-class SysAttach(BaseEntity):
+class Attach(BaseEntity):
     """Object-storage attachment metadata (one row per stored object)."""
 
-    __tablename__ = "sys_attach"
+    __tablename__ = "attach"
     __table_args__ = (
         Index(
             "uq_sysattach_object_key", "object_key", unique=True

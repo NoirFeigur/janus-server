@@ -37,6 +37,7 @@ from src.core.session_store import SessionStore
 from src.db.base import Base
 from src.db.models.audit import LoginLog, OperLog
 from src.db.models.catalog_ops import CatalogChangeLog
+from src.db.models.config import Config
 from src.db.models.credential import ApiKey
 from src.db.models.grant import UserModelGrant
 from src.db.models.identity import (
@@ -54,7 +55,6 @@ from src.db.models.model_catalog import (
     UpstreamChannel,
 )
 from src.db.models.quota import Quota
-from src.db.models.sys_config import SysConfig
 from src.db.models.usage import UsageRecord
 from src.db.session import get_session
 from src.main import create_app
@@ -92,7 +92,7 @@ _TABLES = [
         UsageRecord,
         OperLog,
         LoginLog,
-        SysConfig,
+        Config,
         CatalogChangeLog,
     )
 ]

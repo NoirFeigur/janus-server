@@ -26,7 +26,7 @@ from src.db.base import BaseEntity, LinkEntity
 class User(BaseEntity):
     """Authoritative employee profile, synced from HR (§1.1)."""
 
-    __tablename__ = "sys_user"
+    __tablename__ = "users"
     __table_args__ = (
         Index(
             "uq_user_username_active",
@@ -91,13 +91,13 @@ class User(BaseEntity):
         BigInteger,
         nullable=True,
         index=True,
-        comment="所属部门 sys_department.id",
+        comment="所属部门 department.id",
     )
 
     avatar: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
-        comment="头像附件 sys_attach.id",
+        comment="头像附件 attach.id",
     )
 
     status: Mapped[str] = mapped_column(
@@ -121,7 +121,7 @@ class User(BaseEntity):
 class Department(BaseEntity):
     """Organization department tree (adjacency list, §1.2)."""
 
-    __tablename__ = "sys_department"
+    __tablename__ = "department"
     __table_args__ = (
         Index(
             "uq_dept_external_active",
@@ -152,7 +152,7 @@ class Department(BaseEntity):
 class UserOAuth(BaseEntity):
     """Third-party login identity snapshot (WeCom etc., §1.3)."""
 
-    __tablename__ = "sys_user_oauth"
+    __tablename__ = "user_oauth"
     __table_args__ = (
         Index(
             "uq_oauth_source_uuid_active",
@@ -174,7 +174,7 @@ class UserOAuth(BaseEntity):
     user_id: Mapped[int] = mapped_column(
         BigInteger,
         index=True,
-        comment="用户 sys_user.id（仅硬匹配命中时落库）",
+        comment="用户 users.id（仅硬匹配命中时落库）",
     )
     source: Mapped[str] = mapped_column(
         String(32),
@@ -211,7 +211,7 @@ class UserOAuth(BaseEntity):
 class Role(BaseEntity):
     """Admin-console role: a named bundle of menu/operation permissions (§1.5.1)."""
 
-    __tablename__ = "sys_role"
+    __tablename__ = "role"
     __table_args__ = (
         Index(
             "uq_role_code_active",
@@ -248,7 +248,7 @@ class Role(BaseEntity):
 class Menu(BaseEntity):
     """Unified menu/button/API permission node (§1.5.2)."""
 
-    __tablename__ = "sys_menu"
+    __tablename__ = "menu"
     __table_args__ = ({"comment": "系统菜单：统一的菜单/按钮/API 权限节点"},)
 
     name: Mapped[str] = mapped_column(
@@ -304,32 +304,32 @@ class Menu(BaseEntity):
 class UserRole(LinkEntity):
     """User <-> Role (§1.5.3)."""
 
-    __tablename__ = "sys_user_role"
+    __tablename__ = "user_role"
     __table_args__ = (
         UniqueConstraint("user_id", "role_id", name="uq_user_role"),
         {"comment": "用户-角色关联表"},
     )
 
     user_id: Mapped[int] = mapped_column(
-        BigInteger, index=True, comment="用户 sys_user.id"
+        BigInteger, index=True, comment="用户 users.id"
     )
     role_id: Mapped[int] = mapped_column(
-        BigInteger, index=True, comment="角色 sys_role.id"
+        BigInteger, index=True, comment="角色 role.id"
     )
 
 
 class RoleMenu(LinkEntity):
     """Role <-> Menu permission (§1.5.4)."""
 
-    __tablename__ = "sys_role_menu"
+    __tablename__ = "role_menu"
     __table_args__ = (
         UniqueConstraint("role_id", "menu_id", name="uq_role_menu"),
         {"comment": "角色-菜单权限关联表"},
     )
 
     role_id: Mapped[int] = mapped_column(
-        BigInteger, index=True, comment="角色 sys_role.id"
+        BigInteger, index=True, comment="角色 role.id"
     )
     menu_id: Mapped[int] = mapped_column(
-        BigInteger, index=True, comment="菜单 sys_menu.id"
+        BigInteger, index=True, comment="菜单 menu.id"
     )

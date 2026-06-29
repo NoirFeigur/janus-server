@@ -14,7 +14,7 @@ from src.auth.service import (
 )
 from src.core.security import decode_access_token, generate_api_key, verify_password_async
 from src.core.snowflake import next_id
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.db.models.credential import ApiKey
 from src.enums import AttachBizType, ErrorCode
 from src.exceptions import AppError
@@ -133,10 +133,10 @@ async def _seed_avatar(
     *,
     owner_id: int,
     biz_type: AttachBizType = AttachBizType.avatar,
-) -> SysAttach:
+) -> Attach:
     """Insert a stored attachment row (object already 'in the bucket')."""
     attach_id = next_id()
-    attach = SysAttach(
+    attach = Attach(
         id=attach_id,
         object_key=f"avatar/2026/06/{attach_id}.webp",
         bucket="private",

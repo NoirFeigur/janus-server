@@ -45,7 +45,7 @@ class UserModelGrant(BaseEntity):
     scope_id: Mapped[int] = mapped_column(
         BigInteger,
         index=True,
-        comment="scope=user→sys_user.id；scope=department→sys_department.id",
+        comment="scope=user→users.id；scope=department→department.id",
     )
 
     logical_model_id: Mapped[int] = mapped_column(

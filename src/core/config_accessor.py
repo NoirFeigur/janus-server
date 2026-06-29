@@ -1,6 +1,6 @@
 """平台配置的运行时读取器 + 类型解析 —— core 层无业务叶子模块。
 
-``sys_config`` 行以字符串存值,``value_type`` 标注如何解析。本模块提供两件事:
+``config`` 行以字符串存值,``value_type`` 标注如何解析。本模块提供两件事:
 
 - :func:`parse_config_value` —— 把 ``(原始字符串, 值类型)`` 解析成 Python 值;解析
   失败抛 ``ValueError``。写侧(``admin.config`` service)用它做落库前校验,读侧用它
@@ -24,7 +24,7 @@ import json
 from sqlalchemy import select
 
 from src.core import cache
-from src.db.models.sys_config import SysConfig
+from src.db.models.config import Config
 from src.db.session import async_session_factory
 from src.enums import ConfigValueType
 
@@ -67,9 +67,9 @@ async def _load_raw(config_key: str) -> str | None:
     """查库取单个配置的原始字符串值(未命中/软删返回 None)。"""
     async with async_session_factory() as session:
         stmt = (
-            select(SysConfig.config_value)
-            .where(SysConfig.config_key == config_key)
-            .where(SysConfig.is_deleted.is_(False))
+            select(Config.config_value)
+            .where(Config.config_key == config_key)
+            .where(Config.is_deleted.is_(False))
         )
         raw: str | None = await session.scalar(stmt)
         return raw

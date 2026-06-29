@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src.core.security import hash_password
 from src.db.base import Base
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
 from src.db.models.identity import (
@@ -37,7 +37,7 @@ _AUTH_TABLES = [
         RoleMenu,
         ApiKey,
         LoginLog,
-        SysAttach,
+        Attach,
     )
 ]
 

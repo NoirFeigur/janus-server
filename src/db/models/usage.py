@@ -29,7 +29,7 @@ class UsageRecord(LogEntity):
 
     # —— Principal (who it is billed to) ——
     user_id: Mapped[int] = mapped_column(
-        BigInteger, index=True, comment="计费主体用户 sys_user.id"
+        BigInteger, index=True, comment="计费主体用户 users.id"
     )
     api_key_id: Mapped[int | None] = mapped_column(
         BigInteger,

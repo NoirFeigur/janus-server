@@ -21,32 +21,32 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette import status
 
-from src.admin.config.repository import SysConfigRepository
-from src.admin.config.schemas import SysConfigCreate, SysConfigUpdate
+from src.admin.config.repository import ConfigRepository
+from src.admin.config.schemas import ConfigCreate, ConfigUpdate
 from src.auth.service import AuthenticatedUser
 from src.core.config_accessor import invalidate_config, parse_config_value
 from src.core.pagination import PageResult, page_result
 from src.core.query import ListQuery, resolve_sort
-from src.db.models.sys_config import SysConfig
+from src.db.models.config import Config
 from src.db.session import add_after_commit_hook
 from src.enums import ConfigValueType, ErrorCode
 from src.exceptions import AppError
 
 SORT_COLUMNS = {
-    "id": SysConfig.id,
-    "config_key": SysConfig.config_key,
-    "config_name": SysConfig.config_name,
-    "created_at": SysConfig.created_at,
-    "updated_at": SysConfig.updated_at,
+    "id": Config.id,
+    "config_key": Config.config_key,
+    "config_name": Config.config_name,
+    "created_at": Config.created_at,
+    "updated_at": Config.updated_at,
 }
 
 
-class SysConfigService:
+class ConfigService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
-        self.repo = SysConfigRepository(session)
+        self.repo = ConfigRepository(session)
 
-    async def _require(self, config_id: int) -> SysConfig:
+    async def _require(self, config_id: int) -> Config:
         config = await self.repo.get(config_id)
         if config is None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_404_NOT_FOUND)
@@ -65,7 +65,7 @@ class SysConfigService:
 
     async def list_configs(
         self, *, query: ListQuery | None = None
-    ) -> PageResult[SysConfig]:
+    ) -> PageResult[Config]:
         query = query or ListQuery()
         sort = resolve_sort(query, allowed=SORT_COLUMNS, default="config_key")
         total = await self.repo.count_configs(keyword=query.keyword)
@@ -79,16 +79,16 @@ class SysConfigService:
             list(items), total=total, limit=query.limit, offset=query.offset
         )
 
-    async def get_config(self, config_id: int) -> SysConfig:
+    async def get_config(self, config_id: int) -> Config:
         return await self._require(config_id)
 
     async def create_config(
-        self, payload: SysConfigCreate, *, actor: AuthenticatedUser
-    ) -> SysConfig:
+        self, payload: ConfigCreate, *, actor: AuthenticatedUser
+    ) -> Config:
         if await self.repo.get_by_key(payload.config_key) is not None:
             raise AppError(ErrorCode.request_invalid, status.HTTP_400_BAD_REQUEST)
         self._validate_value(payload.config_value, payload.value_type)
-        config = SysConfig(
+        config = Config(
             config_key=payload.config_key,
             config_value=payload.config_value,
             value_type=payload.value_type,
@@ -106,8 +106,8 @@ class SysConfigService:
         return config
 
     async def update_config(
-        self, config_id: int, payload: SysConfigUpdate, *, actor: AuthenticatedUser
-    ) -> SysConfig:
+        self, config_id: int, payload: ConfigUpdate, *, actor: AuthenticatedUser
+    ) -> Config:
         config = await self._require(config_id)
         values = payload.model_dump(exclude_unset=True)
         # The effective (value, type) after this update must parse together: a

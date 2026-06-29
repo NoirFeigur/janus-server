@@ -3,7 +3,7 @@
 Boots the real app via ``create_app`` and exercises the upload endpoint over
 httpx ``ASGITransport``, overriding three dependencies:
 
-- ``get_session`` → the in-memory SQLite session (so ``sys_attach`` rows persist).
+- ``get_session`` → the in-memory SQLite session (so ``attach`` rows persist).
 - ``get_current_jwt_user`` → a fixed authenticated principal (auth is proven
   elsewhere; here we focus on the upload contract).
 - ``get_object_storage`` → a fake recording storage (no real bucket; uploads are
@@ -31,7 +31,7 @@ from src.core.redis import get_redis
 from src.core.security import issue_access_token
 from src.core.session_store import SessionStore
 from src.db.base import Base
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.db.models.audit import LoginLog
 from src.db.models.credential import ApiKey
 from src.db.models.identity import (
@@ -61,7 +61,7 @@ _TABLES = [
         RoleMenu,
         ApiKey,
         LoginLog,
-        SysAttach,
+        Attach,
     )
 ]
 

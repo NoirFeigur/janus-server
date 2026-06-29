@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, field_serializer
 
-from src.db.models.attach import SysAttach
+from src.db.models.attach import Attach
 from src.enums import AttachBizType
 
 
@@ -26,7 +26,7 @@ class AttachRead(BaseModel):
     biz_type: AttachBizType
 
     @classmethod
-    def from_attach(cls, attach: SysAttach, *, url: str) -> AttachRead:
+    def from_attach(cls, attach: Attach, *, url: str) -> AttachRead:
         """Build the read model from a persisted row + its freshly presigned URL.
 
         ``url`` is not a column (a private bucket has no permanent URL — it is

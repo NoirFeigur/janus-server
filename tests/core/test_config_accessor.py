@@ -3,7 +3,7 @@
 Two surfaces:
 - ``parse_config_value`` — pure type parsing (string/int/bool/json + rejects).
 - ``get_str``/``get_int``/``get_bool``/``get_json`` — cache-aside typed reads over
-  a seeded ``sys_config`` table, backed by the in-memory SQLite engine + the
+  a seeded ``config`` table, backed by the in-memory SQLite engine + the
   autouse Redis double. The accessor opens its own session via the module-level
   ``async_session_factory``; tests monkeypatch it onto the SQLite factory so no
   shared instance is touched.
@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src.core import config_accessor
 from src.db.base import Base
-from src.db.models.sys_config import SysConfig
+from src.db.models.config import Config
 from src.enums import ConfigValueType
 from tests._async_redis_double import AsyncRedisDouble
 
@@ -78,8 +78,8 @@ async def seeded_factory(
     sqlite_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Create the sys_config table, patch the accessor's session factory onto it."""
-    table = Base.metadata.tables[SysConfig.__tablename__]
+    """Create the config table, patch the accessor's session factory onto it."""
+    table = Base.metadata.tables[Config.__tablename__]
     async with sqlite_engine.begin() as conn:
         await conn.run_sync(lambda sync_conn: table.create(sync_conn))
     monkeypatch.setattr(config_accessor, "async_session_factory", sqlite_session_factory)
@@ -95,7 +95,7 @@ async def _seed(
 ) -> None:
     async with factory() as session:
         session.add(
-            SysConfig(
+            Config(
                 config_key=key,
                 config_value=value,
                 value_type=value_type,
@@ -170,8 +170,8 @@ async def test_value_is_cached_loader_runs_once(
     # Mutate the underlying row directly, bypassing invalidate_config().
     async with seeded_factory() as session:
         await session.execute(
-            SysConfig.__table__.update()
-            .where(SysConfig.config_key == "cached.key")
+            Config.__table__.update()
+            .where(Config.config_key == "cached.key")
             .values(config_value="second")
         )
         await session.commit()
@@ -189,8 +189,8 @@ async def test_invalidate_forces_reload(
     # Update the row, then invalidate → next read reflects the new value.
     async with seeded_factory() as session:
         await session.execute(
-            SysConfig.__table__.update()
-            .where(SysConfig.config_key == "inv.key")
+            Config.__table__.update()
+            .where(Config.config_key == "inv.key")
             .values(config_value="new")
         )
         await session.commit()
