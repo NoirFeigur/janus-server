@@ -13,7 +13,7 @@
 配置值,不该为此 import 整个 admin service(那会把 core→admin 的反向依赖拉进来)。
 本模块只依赖 ``core.cache`` + ``db``,谁都能安全 import。
 
-**一致性**:与 ``dept_tree_cache`` 同构——短 TTL 兜跨副本陈旧,写副本 commit 后主动
+**一致性**:短 TTL 兜跨副本陈旧,写副本 commit 后主动
 失效(:func:`invalidate_config`)。配置值有显式写/失效通道,适合缓存(区别于权限码)。
 """
 
