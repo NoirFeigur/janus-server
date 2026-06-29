@@ -64,7 +64,7 @@ Hermes / Claude Code / OA系统 / 脚本 / 其他应用
 | G2 | build / buy | **自建**：控制面与前端全部自研；**不引入任何独立开源网关服务**（不要 one-api / 不要 LiteLLM Proxy） |
 | G3 | 上游适配方式 | **`import litellm` 当库**用于「上游协议格式翻译 + 韧性（Router）」；**绝不 fork / vendor 其源码** |
 | G4 | 技术栈 | **Python / FastAPI**（生态成熟，异步流式契合 500 并发场景，MCP SDK 生态好） |
-| G5 | 身份模型 | 主体只有一种：**用户主体（`sys_user.id` / `user_id`）**；凭据分层：后台管理面与资源管理 API 只接受 JWT，LLM 推理协议端点与 MCP 协议端点额外接受 **`sk-xxxx` 静态 key**。JWT 与 sk-key 都归因到同一个 `user_id` / 配额桶，但 sk-key 不等同后台登录态 |
+| G5 | 身份模型 | 主体只有一种：**用户主体（`users.id` / `user_id`）**；凭据分层：后台管理面与资源管理 API 只接受 JWT，LLM 推理协议端点与 MCP 协议端点额外接受 **`sk-xxxx` 静态 key**。JWT 与 sk-key 都归因到同一个 `user_id` / 配额桶，但 sk-key 不等同后台登录态 |
 | G6 | 两层归因 | **暂不做**（服务账号代调用时，只算调用方用户的账，不追溯背后员工） |
 | G7 | 部署形态 | **模块化单体**：一个 repo，按领域分包。**默认起步 = N 个全功能副本 + nginx 做 HA/扩容**（同一产物复制多份）；**角色拆分**（auth+admin / llm-gateway / mcp-gateway）为后续触发式演进选项，切换只改启动方式不动代码。共享 Postgres + Redis |
 | G8 | 编排基础设施 | **Docker Compose**（2000 员工 / 峰值 500 并发，**不上 k8s**；容器将来可无缝迁 k8s） |
@@ -499,7 +499,7 @@ MCP 模块对核心数据模型增量为 **0**，全部复用现有设施：
 
 | 能力 | 复用 |
 |---|---|
-| 鉴权 | 第 1 批 `sys_user` + `api_key`（JWT/sk-key，同 LLM 网关 G5） |
+| 鉴权 | 第 1 批 `users` + `api_key`（JWT/sk-key，同 LLM 网关 G5） |
 | 调用审计 | **平台侧不留痕**——MCP 工具调用无 token/cost，不进 `usage_record`；下游第三方系统（OA/HR 等）是业务行为的真相源（「张三提了什么流程」记在下游，不在本平台） |
 | 工具内 LLM 调用计费 | 工具直调自有 LLM 网关，复用网关的配额/记账（`usage_record` / `quota`），无独立机制 |
 
@@ -511,7 +511,7 @@ MCP 模块对核心数据模型增量为 **0**，全部复用现有设施：
 
 ### 两个正交的轴
 
-- **主体（principal）= 配额 / 账单算在谁头上**：只有一种 —— **`sys_user.id`（代码/API 命名 `user_id`）**。
+- **主体（principal）= 配额 / 账单算在谁头上**：只有一种 —— **`users.id`（代码/API 命名 `user_id`）**。
 - **凭据（credential）= 拿什么证明自己是这个用户主体**：后台 JWT 与程序调用 sk-key 分层。
 
 | 凭据 | 主体 | 签发方式 | 用途 |
@@ -533,7 +533,7 @@ Authorization: Bearer xxx
 - **真人用户**：员工，企微扫码登录，可在自助门户生成自己的 `sk-key`。
 - **服务用户**：管理员创建的非真人用户（如 `oa-system`、`batch-jobs`），无人扫码，仅持有 `sk-key` 和配额。OA 系统、批处理等系统级调用方挂在服务用户名下。
 
-> 一张 `sys_user` 表搞定所有 principal，**不需要独立的「应用注册」子系统**。这是相对早期设想的简化（去掉了「应用」作为独立主体类型）。
+> 一张 `users` 表搞定所有 principal，**不需要独立的「应用注册」子系统**。这是相对早期设想的简化（去掉了「应用」作为独立主体类型）。
 
 ### `sk-xxxx` 安全硬要求
 
@@ -737,7 +737,7 @@ proxy_read_timeout 600s;    # 长连接别被默认 60s 掐断
 
 ### 6.12 国际化（i18n）策略（G16）
 
-> **决策（G16）：展示与逻辑分离，按文本产生位置三七开。** 后端是语言无关的逻辑层，前端是展示语言层——但业内实践不是「后端全程不碰语言」，而是按文本的**产生位置**和**消费者**做三七开。本节给出完整策略，下游 schema 影响（`sys_user.preferred_locale` + `sys_menu` i18n key）落在数据模型设计文档。
+> **决策（G16）：展示与逻辑分离，按文本产生位置三七开。** 后端是语言无关的逻辑层，前端是展示语言层——但业内实践不是「后端全程不碰语言」，而是按文本的**产生位置**和**消费者**做三七开。本节给出完整策略，下游 schema 影响（`users.preferred_locale` + `menu` i18n key）落在数据模型设计文档。
 
 #### 6.12.1 核心判定规则
 
@@ -764,7 +764,7 @@ proxy_read_timeout 600s;    # 长连接别被默认 60s 掐断
 显式 query 参数 (?lang=en)              # 调试/强制覆盖
   → Cookie (lang=en)                    # 前端持久化选择
   → Accept-Language 头                  # 浏览器默认
-  → 登录用户 sys_user.preferred_locale   # 用户偏好(已认证时)
+  → 登录用户 users.preferred_locale   # 用户偏好(已认证时)
   → 系统默认 "zh-CN"
 ```
 
@@ -860,7 +860,7 @@ async def validation_handler(request, exc):
 
 #### 6.12.4 后端外发消息（后端译的例外）
 
-邮件、企微/IM 推送、短信通知没有前端那层，后端必须渲染本地化正文。locale 取自**收件人** `sys_user.preferred_locale`（**不是请求发起者**）：
+邮件、企微/IM 推送、短信通知没有前端那层，后端必须渲染本地化正文。  locale 取自**收件人** `users.preferred_locale`（**不是请求发起者**）：
 
 ```python
 def send_quota_alert(user: User, used: int, limit: int):
@@ -890,7 +890,7 @@ const statusEnum = useMemo(() => ({
 
 > **枚举 label 译文来自 codegen,不手写**：`status.active` 等枚举 label key 由后端 `locales/{lang}/enums.json` 单源定义,经 codegen 生成到前端 locale 文件(见 6.12.1 反字典表声明)。前端只**消费**(`valueEnum` 渲染),不维护枚举译文——与服务端导出共享同一份,零漂移。字段/菜单 label 仍前端手写(见 ⑥)。
 
-**② 动态菜单 i18n**——后端 `sys_menu` 返回 i18n key，前端路由 `name` 经 `formatMessage` 译：
+**② 动态菜单 i18n**——后端 `menu` 返回 i18n key，前端路由 `name` 经 `formatMessage` 译：
 
 ```tsx
 menuDataRender: (menus) => menus.map(m => ({
@@ -927,7 +927,7 @@ const columns = useMemo(() => [
 
 > 业内最高频生产事故：顶层调用导致「切了语言但表头/枚举不变」。
 
-**⑤ locale 传递**——前端选定语言后：① 存 Cookie/localStorage 持久化；② 每个请求带 `Accept-Language`（或 `?lang=`），让后端外发消息/校验错误对齐；③ 登录后同步到 `sys_user.preferred_locale`。
+**⑤ locale 传递**——前端选定语言后：① 存 Cookie/localStorage 持久化；② 每个请求带 `Accept-Language`（或 `?lang=`），让后端外发消息/校验错误对齐；③ 登录后同步到 `users.preferred_locale`。
 
 **⑥ i18n key 组织约定（防 key 爆炸）**——字段/表单 label 全在前端，`name`/`status`/`createdAt` 这类字段在几十张表反复出现，若每表每字段都建独立 key 会 key 爆炸 + 译文重复。业内一致解法是**两层命名空间**，既不全共享也不全独立：
 
@@ -938,7 +938,7 @@ const columns = useMemo(() => [
 
 **反直觉点（关键）**：直觉是「`name` 到处都有 → 全共享一个 key」（DRY），**但业内明确反对过度共享**。FormatJS 官方：「消息是高度上下文相关的」。屈折语（法/德）里同词按语境译文不同——`name` 作人名 vs 模型名 vs 主机名，法语分别是 `Nom` / `Nom de modèle` / `Nom d'hôte`，共享一个 key 会逼译者只能选一个、其余皆错。故 react-admin 的**阈值规则**：一个 key 只有在 **3+ 个不相关模块**都用到才提升到 `common.*`，否则留模块内。
 
-**对本平台的校准（中文语境可更激进共享）**：① 中文**无性/数/格屈折**，上述屈折语陷阱基本不存在（`name`→恒为「名称」，`status`→恒为「状态」），故通用字段共享比欧语 app 更安全；② 本后台表是**有界的**（约 10 张：`sys_user`/`sys_menu`/`channel_key`/`logical_model`/`quota`…），即便全走 per-module 也不爆炸。
+**对本平台的校准（中文语境可更激进共享）**：① 中文**无性/数/格屈折**，上述屈折语陷阱基本不存在（`name`→恒为「名称」，`status`→恒为「状态」），故通用字段共享比欧语 app 更安全；② 本后台表是**有界的**（约 10 张：`users`/`menu`/`channel_key`/`logical_model`/`quota`…），即便全走 per-module 也不爆炸。
 
 落地规则（前端开发遵此）：
 1. **`dataIndex` 直接 = key 末段**——`dataIndex: 'apiBase'` → `id: 'pages.channel.apiBase'`，无脑映射，免思考。
@@ -951,7 +951,7 @@ const columns = useMemo(() => [
 ```
 src/locales/{lang}/
   common.ts       # 共享 UI 操作 + 无处不在字段(add/edit/delete/status/createdAt/action/remark...)
-  menu.ts         # 路由 name → 菜单 label(对应 sys_menu.name 的 i18n key)
+  menu.ts         # 路由 name → 菜单 label(对应 menu.name 的 i18n key)
   pages/          # 按模块拆领域字段
     user.ts       # pages.user.employeeNo / pages.user.preferredLocale ...
     channel.ts    # pages.channel.apiBase / pages.channel.protocol ...
@@ -963,8 +963,8 @@ src/locales/{lang}/
 
 #### 6.12.6 数据模型影响（仅两处，详见数据模型设计文档）
 
-1. **`sys_user` 加 `preferred_locale`**（`String(16)`，默认 `"zh-CN"`，BCP 47 格式）——后端外发消息译文用 + 登录后前端默认语言。
-2. **`sys_menu.name` 语义锁定为 i18n key**（如 `menu.system.user`，前端必译）+ 新增开发可读 `remark` 列（DB 里也能看懂这菜单是啥，给后端开发者）。
+1. **`users` 加 `preferred_locale`**（`String(16)`，默认 `"zh-CN"`，BCP 47 格式）——后端外发消息译文用 + 登录后前端默认语言。
+2. **`menu.name` 语义锁定为 i18n key**（如 `menu.system.user`，前端必译）+ 新增开发可读 `remark` 列（DB 里也能看懂这菜单是啥，给后端开发者）。
 
 #### 6.12.7 决策摘要
 
@@ -982,7 +982,7 @@ src/locales/{lang}/
 | 菜单存法 | `name` = i18n key + `remark` 开发备注 | ✅ |
 | 字段 label key 组织 | 两层命名空间：`common.*`（通用，中文语境激进共享）+ `pages.{模块}.{字段}`（领域），`dataIndex` = key 末段，3+ 复用才提升 common | ✅ |
 | 前端反模式 | 禁止组件外 `formatMessage` | ✅ |
-| schema 改动 | `sys_user.preferred_locale` + `sys_menu.name` 语义 + `sys_menu.remark` | ✅ |
+| schema 改动 | `users.preferred_locale` + `menu.name` 语义 + `menu.remark` | ✅ |
 
 ---
 

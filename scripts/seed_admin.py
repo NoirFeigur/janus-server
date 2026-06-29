@@ -1,13 +1,12 @@
 """Seed a super-admin account (role + user + link), idempotent.
 
 Creates, if absent:
-- a ``sys_role`` with code ``superadmin`` — this code IS the super-admin marker
+- a ``role`` with code ``superadmin`` — this code IS the super-admin marker
   the RBAC layer checks (``auth.constants.SUPERADMIN_ROLE_CODE`` →
   ``AuthenticatedUser.is_superuser``). Holding it bypasses every interface-
-  permission gate AND data-scope restriction. ``data_scope=all`` is set too so
-  the role reads sensibly in the admin console, but the code alone is decisive;
-- a ``sys_user`` (default username ``admin``) with an argon2 password hash;
-- the ``sys_user_role`` link binding user to role.
+  permission gate; the code alone is decisive;
+- a ``users`` row (default username ``admin``) with an argon2 password hash;
+- the ``user_role`` link binding user to role.
 
 No menu/permission rows are needed: super-admin is the role identity itself, not
 an aggregated ``menu -> role_menu -> perm`` chain.
@@ -59,10 +58,8 @@ async def _seed(username: str, password: str, real_name: str) -> None:
                 code=SUPERADMIN_ROLE_CODE,
                 sort_order=0,
                 status="active",
-                data_scope="all",  # DataScope.all_data — cosmetic; code is decisive.
                 menu_check_strictly=True,
-                dept_check_strictly=True,
-                remark="系统内置超级管理员角色（code=superadmin，跳过全部接口/数据权限）",
+                remark="系统内置超级管理员角色（code=superadmin，跳过全部接口权限）",
             )
             session.add(role)
             await session.flush()
@@ -133,7 +130,7 @@ async def _seed(username: str, password: str, real_name: str) -> None:
         print(f"  user id  : {user.id}")
         print(
             f"  role     : {SUPERADMIN_ROLE_CODE} id={role.id} "
-            "(code = super-admin marker; 跳过接口+数据权限)"
+            "(code = super-admin marker; 跳过接口权限)"
         )
         print("  请尽快登录后修改默认密码。")
 

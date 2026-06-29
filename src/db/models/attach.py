@@ -27,7 +27,7 @@ class Attach(BaseEntity):
     __tablename__ = "attach"
     __table_args__ = (
         Index(
-            "uq_sysattach_object_key", "object_key", unique=True
+            "uq_attach_object_key", "object_key", unique=True
         ),  # One row per stored object; the key is the file's stable identity.
         {"comment": "附件：对象存储文件元数据；私有桶读取走短期预签名 URL，DB 只存 object key"},
     )

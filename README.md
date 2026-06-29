@@ -84,7 +84,7 @@ LLM 响应是流式，nginx 必须 `proxy_buffering off` + `proxy_read_timeout 6
 
 **领域驱动布局**（参考 [zhanymkanov/fastapi-best-practices](https://github.com/zhanymkanov/fastapi-best-practices)、Netflix Dispatch；网关分协议入口对齐 LiteLLM 的 provider 分组）。每个领域是一个包，自带 `router / schemas / service / dependencies / constants / exceptions`。
 
-> **关键取舍：ORM 模型集中，不按领域散放。** 我们的数据模型是**一张高内聚的 ERD**（雪花主键基类、三类 Entity 基类、`sys_user`/`api_key`/`logical_model`/`usage_record`/`quota` 间交叉外键密布，枚举强制集中在 `enums.py`）。集中放 `db/models/` 让 Alembic autogenerate 扫一处即可、跨聚合关系一目了然。**按域散放也能跑**（SQLAlchemy 用字符串形式的关系引用即可避免 import 顺序问题），是另一种合法流派；这里选集中，是与「数据模型逐表敲定、全局横切约定」的设计取向一致，并非唯一正解。
+> **关键取舍：ORM 模型集中，不按领域散放。** 我们的数据模型是**一张高内聚的 ERD**（雪花主键基类、三类 Entity 基类、`users`/`api_key`/`logical_model`/`usage_record`/`quota` 间交叉外键密布，枚举强制集中在 `enums.py`）。集中放 `db/models/` 让 Alembic autogenerate 扫一处即可、跨聚合关系一目了然。**按域散放也能跑**（SQLAlchemy 用字符串形式的关系引用即可避免 import 顺序问题），是另一种合法流派；这里选集中，是与「数据模型逐表敲定、全局横切约定」的设计取向一致，并非唯一正解。
 
 ```
 janus-server/
@@ -109,7 +109,7 @@ janus-server/
 │   │   ├── repository.py         # BaseRepository[Model]（通用 get/list/create/update/soft_delete）
 │   │   └── models/               # SQLAlchemy 2.0 模型（按聚合分文件，同一声明基下）
 │   │       ├── __init__.py       # 汇总导出（Alembic autogenerate 扫这里）
-│   │       ├── identity.py       # sys_user / sys_role / sys_department / 关联表
+│   │       ├── identity.py       # users / role / department / 关联表
 │   │       ├── credential.py     # api_key
 │   │       ├── model_catalog.py  # logical_model / model_deployment / channel
 │   │       ├── grant.py          # user_model_grant（模型分配）

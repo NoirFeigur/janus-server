@@ -17,7 +17,7 @@ import builtins
 from collections.abc import Sequence
 from typing import Any, Generic, TypeVar
 
-from sqlalchemy import ColumnElement, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.base import BaseEntity
@@ -81,14 +81,12 @@ class BaseRepository(Generic[Model]):
     async def soft_delete_many(
         self,
         ids: Sequence[int],
-        *,
-        scope_predicate: ColumnElement[bool] | None = None,
     ) -> tuple[int, builtins.list[int]]:
-        """Soft-delete rows whose id is in ``ids`` and visible under scope.
+        """Soft-delete rows whose id is in ``ids``.
 
-        ``scope_predicate`` of ``None`` means unrestricted. Already-deleted rows
-        are not re-counted. Returns ``(affected_count, skipped_ids)`` where
-        ``skipped_ids`` are requested ids that were not soft-deleted.
+        Already-deleted rows are not re-counted. Returns
+        ``(affected_count, skipped_ids)`` where ``skipped_ids`` are requested
+        ids that were not soft-deleted (absent or already deleted).
         """
         requested_ids = list(dict.fromkeys(ids))
         if not requested_ids:
@@ -98,8 +96,6 @@ class BaseRepository(Generic[Model]):
             self.model.id.in_(requested_ids),
             self.model.is_deleted.is_(False),
         )
-        if scope_predicate is not None:
-            stmt = stmt.where(scope_predicate)
 
         affected_ids = list(await self.session.scalars(stmt))
         affected_id_set = set(affected_ids)

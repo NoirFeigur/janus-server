@@ -110,27 +110,6 @@ async def test_list_limit_and_offset(session: AsyncSession) -> None:
     assert len(page) == 2
 
 
-async def test_soft_delete_many_skips_out_of_scope_ids(session: AsyncSession) -> None:
-    repo = SampleRepository(session)
-    visible = await repo.create(SampleEntity(name="visible"))
-    hidden = await repo.create(SampleEntity(name="hidden"))
-
-    affected, skipped_ids = await repo.soft_delete_many(
-        [visible.id, hidden.id],
-        scope_predicate=SampleEntity.id == visible.id,
-    )
-
-    assert affected == 1
-    assert skipped_ids == [hidden.id]
-
-    deleted = await repo.get(visible.id, include_deleted=True)
-    skipped = await repo.get(hidden.id, include_deleted=True)
-    assert deleted is not None
-    assert skipped is not None
-    assert deleted.is_deleted is True
-    assert skipped.is_deleted is False
-
-
 async def test_soft_delete_many_empty_ids_noop(session: AsyncSession) -> None:
     repo = SampleRepository(session)
     row = await repo.create(SampleEntity(name="keep"))
