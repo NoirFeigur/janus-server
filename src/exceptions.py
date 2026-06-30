@@ -24,6 +24,7 @@ from starlette import status
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.config import get_settings
+from src.core.i18n import I18n, get_i18n, get_locale
 from src.core.logging import get_logger
 from src.enums import ErrorCode
 from src.responses import error_body
@@ -94,11 +95,17 @@ async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
 
 async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
+    # 入参校验文案后端翻译(6.12.3):Pydantic 原始 ``msg`` 恒为英文,zh-CN 用户
+    # 会看到生硬英文字段错误。按 ``validation.{type}`` 取本地化模板并用 Pydantic
+    # 的 ``ctx``(如 min_length/gt)插值;词条缺失则回退原始 ``msg``——保证新出现
+    # 的错误类型不会变成裸 key,而是仍有可读(英文)文案。
+    i18n = get_i18n()
+    locale = get_locale()
     errors = [
         {
             "field": ".".join(str(part) for part in error["loc"][1:]),
             "type": error["type"],
-            "msg": error["msg"],
+            "msg": _translate_validation(i18n, locale, error),
         }
         for error in exc.errors()
     ]
@@ -108,6 +115,17 @@ async def validation_error_handler(request: Request, exc: Exception) -> JSONResp
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         errors=errors,
     )
+
+
+def _translate_validation(i18n: I18n, locale: str, error: Mapping[str, Any]) -> str:
+    """取 ``validation.{type}`` 本地化模板并用 ``ctx`` 插值;缺词条回退原 ``msg``。"""
+    key = f"validation.{error['type']}"
+    ctx = error.get("ctx") or {}
+    translated = i18n.t(key, locale, **ctx)
+    # 未命中:``t`` 原样返回 key —— 退回 Pydantic 原始(英文)msg,绝不外泄裸 key。
+    if translated == key:
+        return str(error["msg"])
+    return translated
 
 
 async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:

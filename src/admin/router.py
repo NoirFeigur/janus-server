@@ -13,6 +13,7 @@ from src.admin.credentials.router import router as credentials_router
 from src.admin.departments.router import router as departments_router
 from src.admin.grants.router import router as grants_router
 from src.admin.menus.router import router as menus_router
+from src.admin.meta.router import router as meta_router
 from src.admin.observability.router import router as observability_router
 from src.admin.online.router import router as online_router
 from src.admin.quota.router import router as quota_router
@@ -30,6 +31,7 @@ router.include_router(credentials_router)
 router.include_router(departments_router)
 router.include_router(grants_router)
 router.include_router(menus_router)
+router.include_router(meta_router)
 router.include_router(observability_router)
 router.include_router(online_router)
 router.include_router(quota_router)
